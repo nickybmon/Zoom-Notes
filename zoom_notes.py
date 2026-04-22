@@ -380,7 +380,7 @@ def build_note_content(
     return f"""---
 title: "{slug}"
 type: meeting
-source: local-app
+source: zoom-notes
 date: {date_str}
 created: {created_iso}
 attendees:
@@ -401,7 +401,7 @@ def build_transcript_content(transcript: str, meeting_title: str, date_str: str)
     return f"""---
 title: "{slug} — transcript"
 type: transcript
-source: local-app
+source: zoom-notes
 date: {date_str}
 note: "{note_link}"
 ---
