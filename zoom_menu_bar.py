@@ -76,6 +76,7 @@ class ZoomNotesApp(rumps.App):
         self._last_wal_mtime: float | None = None
         self._last_wal_size: int | None = None
         self._last_active_time: float | None = None
+        self._processed_wal_path: str | None = None  # prevent re-trigger on same WAL
         self._generating_lock = threading.Lock()
 
         # Cached origin dir (stable for the process lifetime)
@@ -120,6 +121,10 @@ class ZoomNotesApp(rumps.App):
             self._last_wal_mtime = None
             self._last_wal_size = None
             self._last_active_time = None
+            return
+
+        # Never re-trigger on a WAL we already processed this session
+        if str(wal) == self._processed_wal_path:
             return
 
         try:
@@ -248,7 +253,11 @@ class ZoomNotesApp(rumps.App):
 
         finally:
             self._generating_lock.release()
-            # Reset WAL tracking so we don't re-trigger on the same WAL
+            # Mark this WAL as processed so we never trigger on it again
+            if self._origin:
+                wal = find_wal(self._origin, TRANSCRIPT_DB_PREFIX)
+                if wal:
+                    self._processed_wal_path = str(wal)
             self._last_wal_mtime = None
             self._last_wal_size = None
             self._last_active_time = None
