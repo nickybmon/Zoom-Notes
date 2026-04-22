@@ -27,6 +27,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def _load_dotenv():
+    """Load .env file from the project directory into os.environ (stdlib only)."""
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+
+_load_dotenv()
+
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 ZOOM_BASE = Path.home() / "Library/Application Support/zoom.us/data"
@@ -34,8 +47,14 @@ MY_NOTES_ORIGINS = (
     ZOOM_BASE
     / "UnifyWebView_Cache/WebKit/UnSigned/Default/MyNotes/Origins"
 )
-VAULT_NOTES = Path.home() / "Documents/Vault Mind/Meetings/Notes"
-VAULT_TRANSCRIPTS = Path.home() / "Documents/Vault Mind/Meetings/Transcripts"
+VAULT_NOTES = Path(
+    os.environ.get("ZOOM_NOTES_OUTPUT_DIR")
+    or Path.home() / "Desktop/Meeting Notes/Notes"
+)
+VAULT_TRANSCRIPTS = Path(
+    os.environ.get("ZOOM_NOTES_TRANSCRIPTS_DIR")
+    or Path.home() / "Desktop/Meeting Notes/Transcripts"
+)
 
 # Known transcript store prefix (from research)
 TRANSCRIPT_DB_PREFIX = "1CB477F679D6"

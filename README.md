@@ -52,30 +52,29 @@ The menu also has a **Generate Notes Now** item for manual trigger, and a **Quit
 
 ## Output
 
-Two files are written per meeting, matching the same layout used by the Local Meeting Assistant:
+Two files are written per meeting to the configured output directory:
 
 ```
-Vault Mind/
-  Meetings/
-    Notes/
-      YYYY-MM-DD/
-        Meeting Title.md          ← structured notes (processed by Obsidian plugin)
-    Transcripts/
-      YYYY-MM-DD/
-        Meeting Title — transcript.md  ← raw deduplicated transcript
+Meeting Notes/             (default: ~/Desktop/Meeting Notes/)
+  Notes/
+    YYYY-MM-DD/
+      Meeting Title.md          ← structured notes
+  Transcripts/
+    YYYY-MM-DD/
+      Meeting Title — transcript.md  ← raw deduplicated transcript
 ```
 
 **Notes file frontmatter:**
 ```yaml
-title: "WFC Sync"
+title: "Team Sync"
 type: meeting
-source: local-app        ← triggers the Obsidian companion plugin
+source: zoom-notes
 date: 2026-04-21
 created: 2026-04-21T19:01:36
 attendees:
-  - "Anna Punihaole"     ← resolved to [[People/Name]] wikilinks by the plugin
-  - "Nick Blackmon"
-transcript: "[[Meetings/Transcripts/2026-04-21/WFC Sync — transcript.md]]"
+  - "Alice Smith"
+  - "Bob Jones"
+transcript: "[[Meetings/Transcripts/2026-04-21/Team Sync — transcript.md]]"
 daily_note: "[[Daily/2026-04-21]]"
 ```
 
@@ -88,10 +87,14 @@ daily_note: "[[Daily/2026-04-21]]"
 - **Open Questions** — deferred topics (omitted if none)
 - **Notes** — additional context (omitted if none)
 
-**What the Obsidian companion plugin does automatically** (once `source: local-app` is present):
-1. Resolves plain attendee names → `[[People/Name]]` wikilinks
-2. Updates each Person file: `last_contact`, `last_meeting`, `recent_meetings`
-3. Appends a breadcrumb to `Daily/YYYY-MM-DD.md` under the configured section
+### Obsidian integration
+
+If you use Obsidian, the output path and frontmatter format are compatible with an Obsidian companion plugin that can:
+1. Resolve plain attendee names → `[[People/Name]]` wikilinks
+2. Update each Person file: `last_contact`, `last_meeting`, `recent_meetings`
+3. Append a breadcrumb to `Daily/YYYY-MM-DD.md` under a configured section
+
+Point `ZOOM_NOTES_OUTPUT_DIR` and `ZOOM_NOTES_TRANSCRIPTS_DIR` at your vault's meetings folder to use it.
 
 ---
 
@@ -115,9 +118,13 @@ cd Zoom-Meeting-Assistant
 python3 -m venv venv
 ./venv/bin/pip install rumps
 
-# Set your Anthropic API key (add to ~/.zshrc to persist)
-export ANTHROPIC_API_KEY=sk-ant-...
+# Configure your API key and (optionally) output paths
+cp .env.example .env
+# Open .env and paste your Anthropic API key
+# Get a key at: https://console.anthropic.com/
 ```
+
+`.env` is gitignored — your key will never be accidentally committed.
 
 ---
 
@@ -138,15 +145,15 @@ The `●` icon appears in your menu bar. Works automatically from there.
 ./venv/bin/python3 zoom_menu_bar.py --install-login-item
 
 # Activate immediately (no reboot needed)
-launchctl load ~/Library/LaunchAgents/com.nickblackmon.zoom-notes.plist
+launchctl load ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
 ```
 
 Logs go to `~/Library/Logs/zoom-notes.log` and `zoom-notes-error.log`.
 
 To remove:
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.nickblackmon.zoom-notes.plist
-rm ~/Library/LaunchAgents/com.nickblackmon.zoom-notes.plist
+launchctl unload ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
+rm ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
 ```
 
 ### CLI tools (zoom_notes.py)
@@ -163,14 +170,20 @@ rm ~/Library/LaunchAgents/com.nickblackmon.zoom-notes.plist
 
 ## Configuration
 
-All tunable constants are at the top of each file:
+**Via `.env`** (recommended — set once, survives restarts):
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | — | Your Anthropic API key |
+| `ZOOM_NOTES_OUTPUT_DIR` | No | `~/Desktop/Meeting Notes/Notes` | Where note files are saved |
+| `ZOOM_NOTES_TRANSCRIPTS_DIR` | No | `~/Desktop/Meeting Notes/Transcripts` | Where transcript files are saved |
+
+**Code constants** (edit `zoom_notes.py` / `zoom_menu_bar.py` directly):
 
 | File | Constant | Default | Description |
 |------|----------|---------|-------------|
 | `zoom_menu_bar.py` | `POLL_INTERVAL_SECS` | `5` | How often to check the WAL |
 | `zoom_menu_bar.py` | `IDLE_THRESHOLD_SECS` | `30` | Seconds of WAL inactivity before triggering |
-| `zoom_notes.py` | `VAULT_NOTES` | `~/Documents/Vault Mind/Meetings/Notes` | Where note files are saved |
-| `zoom_notes.py` | `VAULT_TRANSCRIPTS` | `~/Documents/Vault Mind/Meetings/Transcripts` | Where transcript files are saved |
 | `zoom_notes.py` | `TRANSCRIPT_DB_PREFIX` | `1CB477F679D6` | IndexedDB folder prefix for transcript store |
 | `zoom_notes.py` | `BLOCKS_DB_PREFIX` | `DDEC8414E29A` | IndexedDB folder prefix for title/blocks store |
 
@@ -190,6 +203,8 @@ All tunable constants are at the top of each file:
 ```
 zoom_notes.py           # Core: WAL discovery, transcript parsing, Claude API, note writing
 zoom_menu_bar.py        # Menu bar app: state machine, WAL poller, rumps UI
+.env.example            # Config template — copy to .env and add your API key
+.env                    # Your local config (gitignored — never committed)
 zoom-transcript-extraction.md  # Original research: how the WAL was discovered and mapped
 venv/                   # Python virtualenv (gitignored)
 ```

@@ -390,7 +390,7 @@ def install_login_item():
     script = str(Path(__file__).resolve())
     plist_dir = Path.home() / "Library/LaunchAgents"
     plist_dir.mkdir(parents=True, exist_ok=True)
-    plist_path = plist_dir / "com.nickblackmon.zoom-notes.plist"
+    plist_path = plist_dir / "com.zoom-notes-assistant.plist"
 
     # Read current ANTHROPIC_API_KEY so launchd inherits it
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -401,7 +401,7 @@ def install_login_item():
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.nickblackmon.zoom-notes</string>
+  <string>com.zoom-notes-assistant</string>
   <key>ProgramArguments</key>
   <array>
     <string>{python}</string>
@@ -427,7 +427,7 @@ def install_login_item():
     print(f"Plist written to: {plist_path}")
     print("To activate now (without rebooting), run:")
     print(f"  launchctl load {plist_path}")
-    print("To remove:")
+    print("To remove the login item:")
     print(f"  launchctl unload {plist_path} && rm {plist_path}")
 
 
