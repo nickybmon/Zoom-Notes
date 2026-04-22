@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -89,7 +90,30 @@ def read_wal_strings(wal_path: Path) -> list[str]:
         tmp.unlink(missing_ok=True)
 
 
-def parse_transcript(wal_path: Path) -> list[dict]:
+def count_meeting_ids(wal_path: Path) -> dict[str, int]:
+    """Return a dict of meetingId → occurrence count for all meetings in the WAL."""
+    lines = read_wal_strings(wal_path)
+    counts: dict[str, int] = {}
+    for i, line in enumerate(lines):
+        if line == "meetingId" and i + 1 < len(lines):
+            mid = lines[i + 1]
+            if mid and len(mid) > 8:
+                counts[mid] = counts.get(mid, 0) + 1
+    return counts
+
+
+def detect_active_meeting_id(wal_path: Path) -> str | None:
+    """Return the meetingId that appears most frequently in the WAL.
+
+    When multiple meetings are stored in the same WAL (e.g. a meeting you were
+    invited to but didn't attend alongside one you did), the one you were
+    actually in will have far more transcript entries.
+    """
+    counts = count_meeting_ids(wal_path)
+    return max(counts, key=lambda k: counts[k]) if counts else None
+
+
+def parse_transcript(wal_path: Path, meeting_id_filter: str | None = None) -> list[dict]:
     """
     Parse transcript entries from WAL strings output.
 
@@ -105,9 +129,14 @@ def parse_transcript(wal_path: Path) -> list[dict]:
       speakerId
       username
       <name>
+      ...
+      meetingId
+      <id>
 
     The WAL stores multiple pages so entries repeat. We deduplicate
     first by messageId (exact copies), then by rolling-update logic.
+
+    If meeting_id_filter is provided, only entries from that meeting are kept.
     """
     lines = read_wal_strings(wal_path)
 
@@ -115,6 +144,13 @@ def parse_transcript(wal_path: Path) -> list[dict]:
     # messageId → best (longest text) entry
     by_id: dict[str, dict] = {}
     id_order: list[str] = []  # preserve first-seen order
+
+    _JUNK_EXACT = {
+        "timeStampContent", "timeStampSeconds", "textLanguage",
+        "startTimeMsec", "endTimeMsec", "messageId", "uniqueUserId",
+        "meetingId", "speaker", "speakerId", "username", "userId",
+        "originalName", "avatarUrl", "avatarName", "message",
+    }
 
     i = 0
     while i < len(lines):
@@ -125,20 +161,17 @@ def parse_transcript(wal_path: Path) -> list[dict]:
                 text = lines[i + 3]
                 timestamp = None
                 speaker = None
+                meeting_id = None
 
-                for j in range(i + 3, min(i + 50, len(lines))):
+                for j in range(i + 3, min(i + 60, len(lines))):
                     if lines[j] == "timeStampContent" and j + 1 < len(lines):
                         timestamp = lines[j + 1]
                     if lines[j] == "username" and j + 1 < len(lines):
                         speaker = lines[j + 1]
+                    if lines[j] == "meetingId" and j + 1 < len(lines):
+                        meeting_id = lines[j + 1]
                         break
 
-                _JUNK_EXACT = {
-                    "timeStampContent", "timeStampSeconds", "textLanguage",
-                    "startTimeMsec", "endTimeMsec", "messageId", "uniqueUserId",
-                    "meetingId", "speaker", "speakerId", "username", "userId",
-                    "originalName", "avatarUrl", "avatarName", "message",
-                }
                 is_real_text = (
                     len(text) > 3
                     and text not in _JUNK_EXACT
@@ -149,6 +182,9 @@ def parse_transcript(wal_path: Path) -> list[dict]:
                 )
 
                 if is_real_text:
+                    if meeting_id_filter and meeting_id and meeting_id != meeting_id_filter:
+                        i += 4
+                        continue
                     if msg_id not in by_id:
                         id_order.append(msg_id)
                         by_id[msg_id] = {
@@ -156,6 +192,7 @@ def parse_transcript(wal_path: Path) -> list[dict]:
                             "text": text,
                             "timestamp": timestamp,
                             "msg_id": msg_id,
+                            "meeting_id": meeting_id,
                         }
                     else:
                         # Keep longest text for this message (rolling word updates)
@@ -166,6 +203,8 @@ def parse_transcript(wal_path: Path) -> list[dict]:
                             existing["speaker"] = speaker
                         if timestamp:
                             existing["timestamp"] = timestamp
+                        if meeting_id:
+                            existing["meeting_id"] = meeting_id
                 i += 4
                 continue
         i += 1
@@ -213,23 +252,66 @@ _TITLE_JUNK = {
     "Zoom Meeting",
 }
 
-def parse_meeting_title(blocks_wal: Path) -> str | None:
-    """Extract the most recent meeting title from the blocks WAL."""
+def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None = None) -> str | None:
+    """Extract the meeting title from the blocks WAL.
+
+    When transcript_entries is provided, matches the title whose embedded
+    Zoom start-time (YYYY-MM-DD HH:MM) is closest to the transcript's own
+    timestamps, so we pick the right meeting when the WAL holds multiple sessions.
+    Falls back to the last title found if no time-based match is possible.
+    """
     lines = read_wal_strings(blocks_wal)
     titles = []
     for i, line in enumerate(lines):
         if line == "title" and i + 1 < len(lines):
             candidate = lines[i + 1]
-            # Meeting titles have patterns like "Name YYYY-MM-DD HH:MM(GMT...)"
             if (
                 len(candidate) > 5
                 and candidate not in _TITLE_JUNK
                 and not candidate.startswith(("http", "{", "BLOCK_", "PRODUCT_"))
-                and " " in candidate          # real titles have spaces
+                and " " in candidate
                 and any(c.isalpha() for c in candidate)
             ):
                 titles.append(candidate)
-    return titles[-1] if titles else None
+
+    if not titles:
+        return None
+
+    if not transcript_entries:
+        return titles[-1]
+
+    # Build a reference time from the transcript: use the earliest HH:MM:SS timestamp
+    # combined with today's date to get a comparable datetime.
+    ts_strings = [e.get("timestamp") for e in transcript_entries if e.get("timestamp")]
+    if not ts_strings:
+        return titles[-1]
+
+    ts_strings.sort()
+    earliest_ts = ts_strings[0]  # HH:MM:SS
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        ref_dt = datetime.strptime(f"{today} {earliest_ts}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return titles[-1]
+
+    # Parse the date+time embedded in each Zoom title: "Name YYYY-MM-DD HH:MM(GMT...)"
+    _zoom_time_re = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})")
+    best_title = titles[-1]
+    best_delta = None
+    for t in titles:
+        m = _zoom_time_re.search(t)
+        if not m:
+            continue
+        try:
+            title_dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        delta = abs((ref_dt - title_dt).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best_title = t
+
+    return best_title
 
 
 # ── Transcript Formatting ──────────────────────────────────────────────────────
@@ -420,7 +502,8 @@ def cmd_list(origin: Path) -> None:
 
     print("Zoom Meeting Notes — Recent Meetings\n")
     if blocks_wal:
-        title = parse_meeting_title(blocks_wal)
+        entries_for_title = parse_transcript(transcript_wal) if transcript_wal else None
+        title = parse_meeting_title(blocks_wal, entries_for_title)
         mtime = datetime.fromtimestamp(blocks_wal.stat().st_mtime)
         print(f"  Meeting title : {title or '(unknown)'}")
         print(f"  Blocks WAL    : {blocks_wal}")
@@ -493,7 +576,7 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
     # Determine meeting title and date
     meeting_title = None
     if blocks_wal:
-        meeting_title = parse_meeting_title(blocks_wal)
+        meeting_title = parse_meeting_title(blocks_wal, entries)
 
     if not meeting_title:
         mtime = transcript_wal.stat().st_mtime

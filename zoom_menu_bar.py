@@ -13,6 +13,7 @@ To launch at login, run this once:
   python3 zoom_menu_bar.py --install-login-item
 """
 
+import logging
 import os
 import re
 import sys
@@ -24,6 +25,16 @@ from pathlib import Path
 
 import rumps
 
+# Log to the same file launchd uses, so it's visible whether running manually or at login
+_log_path = Path.home() / "Library/Logs/zoom-notes.log"
+logging.basicConfig(
+    filename=_log_path,
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("zoom-notes")
+
 # Ensure zoom_notes.py is importable from the same directory
 sys.path.insert(0, str(Path(__file__).parent))
 from zoom_notes import (
@@ -31,6 +42,8 @@ from zoom_notes import (
     TRANSCRIPT_DB_PREFIX,
     build_note_content,
     build_transcript_content,
+    count_meeting_ids,
+    deduplicate,
     find_origin_dir,
     find_wal,
     format_transcript,
@@ -79,8 +92,31 @@ class ZoomNotesApp(rumps.App):
         self._processed_wal_path: str | None = None  # prevent re-trigger on same WAL
         self._generating_lock = threading.Lock()
 
+        # Active meeting tracking
+        self._active_meeting_id: str | None = None  # meetingId we're recording
+        # Accumulated transcript: messageId → best entry dict.
+        # Populated every poll tick so a WAL checkpoint can't lose data.
+        self._accumulated: dict[str, dict] = {}
+
         # Cached origin dir (stable for the process lifetime)
         self._origin = find_origin_dir()
+
+        log.info("App started. Origin: %s", self._origin or "(not found)")
+
+        # Seed WAL state from disk so a restart mid-meeting doesn't reset the
+        # idle clock — first poll will see "unchanged" and start counting idle time.
+        if self._origin:
+            _wal = find_wal(self._origin, TRANSCRIPT_DB_PREFIX)
+            if _wal:
+                try:
+                    _stat = _wal.stat()
+                    self._last_wal_mtime = _stat.st_mtime
+                    self._last_wal_size = _stat.st_size
+                    self._last_active_time = time.monotonic()
+                    self._state = State.ACTIVE
+                    log.info("Seeded WAL state on startup: size=%d mtime=%.0f", _stat.st_size, _stat.st_mtime)
+                except OSError:
+                    pass
 
         # Menu items
         self._status_item = rumps.MenuItem("Status: Idle", callback=None)
@@ -144,6 +180,24 @@ class ZoomNotesApp(rumps.App):
             self._last_wal_mtime = mtime
             self._last_wal_size = size
             self._last_active_time = time.monotonic()
+
+            # On first activity, lock in the dominant meeting ID
+            if self._active_meeting_id is None:
+                counts = count_meeting_ids(wal)
+                self._active_meeting_id = max(counts, key=lambda k: counts[k]) if counts else None
+                log.info(
+                    "Meeting detected. Locking onto meeting_id=%s  (all counts: %s)",
+                    self._active_meeting_id,
+                    {k: v for k, v in sorted(counts.items(), key=lambda x: -x[1])},
+                )
+
+            # Snapshot new entries into accumulator so WAL checkpoints can't lose them
+            before = len(self._accumulated)
+            self._snapshot_wal(wal)
+            after = len(self._accumulated)
+            if after > before:
+                log.info("Snapshot: +%d entries (total %d)", after - before, after)
+
             self._set_state(State.ACTIVE)
             return
 
@@ -152,6 +206,32 @@ class ZoomNotesApp(rumps.App):
             idle_secs = time.monotonic() - self._last_active_time
             if idle_secs >= IDLE_THRESHOLD_SECS:
                 self._trigger_notes()
+
+    # ── WAL snapshot ───────────────────────────────────────────────────────────
+
+    def _snapshot_wal(self, wal: Path):
+        """Parse WAL and merge new entries into the in-memory accumulator.
+
+        Runs on every poll tick where the WAL changed, so even if Zoom
+        checkpoints (shrinks) the WAL at meeting end, we retain everything
+        we've seen. Filtered to self._active_meeting_id if set.
+        """
+        try:
+            fresh = parse_transcript(wal, meeting_id_filter=self._active_meeting_id)
+        except Exception:
+            return
+        for entry in fresh:
+            mid = entry["msg_id"]
+            if mid not in self._accumulated:
+                self._accumulated[mid] = entry
+            else:
+                existing = self._accumulated[mid]
+                if len(entry["text"]) > len(existing["text"]):
+                    existing["text"] = entry["text"]
+                if entry.get("speaker"):
+                    existing["speaker"] = entry["speaker"]
+                if entry.get("timestamp"):
+                    existing["timestamp"] = entry["timestamp"]
 
     # ── State transitions ──────────────────────────────────────────────────────
 
@@ -184,6 +264,7 @@ class ZoomNotesApp(rumps.App):
 
     def _generate_notes_worker(self):
         """Background thread: parse, summarize, save, notify."""
+        log.info("Generation started. accumulated=%d meeting_id=%s", len(self._accumulated), self._active_meeting_id)
         try:
             api_key = os.environ.get("ANTHROPIC_API_KEY")
             if not api_key:
@@ -195,14 +276,23 @@ class ZoomNotesApp(rumps.App):
                 self._notify_error("Zoom MyNotes directory not found.")
                 return
 
-            transcript_wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
             blocks_wal = find_wal(origin, BLOCKS_DB_PREFIX)
+            transcript_wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
 
-            if not transcript_wal:
-                self._notify_error("No transcript WAL found.")
-                return
+            # Prefer the in-memory accumulator (immune to WAL checkpointing).
+            # Do a final WAL snapshot first to catch any last words.
+            if transcript_wal:
+                self._snapshot_wal(transcript_wal)
 
-            entries = parse_transcript(transcript_wal)
+            if self._accumulated:
+                # Reconstruct sorted, deduplicated entries from accumulator
+                raw = sorted(self._accumulated.values(), key=lambda e: e.get("timestamp") or "")
+                entries = deduplicate(raw)
+            elif transcript_wal:
+                entries = parse_transcript(transcript_wal, meeting_id_filter=self._active_meeting_id)
+            else:
+                entries = []
+
             if not entries:
                 self._notify_error("Transcript appears empty.")
                 return
@@ -210,7 +300,7 @@ class ZoomNotesApp(rumps.App):
             # Resolve meeting title
             meeting_title = None
             if blocks_wal:
-                meeting_title = parse_meeting_title(blocks_wal)
+                meeting_title = parse_meeting_title(blocks_wal, entries)
             if not meeting_title:
                 mtime = transcript_wal.stat().st_mtime
                 meeting_title = f"Zoom Meeting {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}"
@@ -241,6 +331,7 @@ class ZoomNotesApp(rumps.App):
 
             short_name = slugify_title(meeting_title)
             rel_path = f"Vault Mind/Meetings/Notes/{date_str}/{note_path.name}"
+            log.info("Notes saved: %s  (%d entries, %d attendees)", note_path.name, len(entries), len(attendees))
             rumps.notification(
                 title="Meeting Notes Saved",
                 subtitle=short_name,
@@ -249,6 +340,7 @@ class ZoomNotesApp(rumps.App):
             )
 
         except Exception as exc:
+            log.error("Generation failed: %s", exc, exc_info=True)
             self._notify_error(str(exc))
 
         finally:
@@ -261,6 +353,8 @@ class ZoomNotesApp(rumps.App):
             self._last_wal_mtime = None
             self._last_wal_size = None
             self._last_active_time = None
+            self._active_meeting_id = None
+            self._accumulated = {}
             self._set_state(State.IDLE)
 
     def _notify_error(self, message: str):
@@ -343,4 +437,8 @@ if __name__ == "__main__":
     if "--install-login-item" in sys.argv:
         install_login_item()
     else:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
         ZoomNotesApp().run()
