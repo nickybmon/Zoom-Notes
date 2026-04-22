@@ -204,6 +204,15 @@ def deduplicate(entries: list[dict]) -> list[dict]:
     return result
 
 
+_TITLE_JUNK = {
+    "fileId", "rootBlockId", "parentId", "nextBlockId", "updatedBy",
+    "createdBy", "version", "type", "content", "title", "style",
+    "productId", "pageIcon", "pageIconUpdateAt", "docTitleUpdateAt",
+    "editorsVisible", "lastUpdatedVisible", "readTimeVisible",
+    "visitsVisible", "updatedAt", "createdAt", "lastUsed", "pageId",
+    "Zoom Meeting",
+}
+
 def parse_meeting_title(blocks_wal: Path) -> str | None:
     """Extract the most recent meeting title from the blocks WAL."""
     lines = read_wal_strings(blocks_wal)
@@ -211,15 +220,15 @@ def parse_meeting_title(blocks_wal: Path) -> str | None:
     for i, line in enumerate(lines):
         if line == "title" and i + 1 < len(lines):
             candidate = lines[i + 1]
-            # Meeting titles have patterns like "Name YYYY-MM-DD HH:MM"
+            # Meeting titles have patterns like "Name YYYY-MM-DD HH:MM(GMT...)"
             if (
                 len(candidate) > 5
+                and candidate not in _TITLE_JUNK
                 and not candidate.startswith(("http", "{", "BLOCK_", "PRODUCT_"))
-                and not candidate in ("Zoom Meeting",)
+                and " " in candidate          # real titles have spaces
                 and any(c.isalpha() for c in candidate)
             ):
                 titles.append(candidate)
-    # Return the last real title (most recent meeting)
     return titles[-1] if titles else None
 
 
