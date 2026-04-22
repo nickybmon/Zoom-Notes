@@ -52,16 +52,46 @@ The menu also has a **Generate Notes Now** item for manual trigger, and a **Quit
 
 ## Output
 
-Notes are saved to `~/Documents/Vault Mind/Meetings/YYYY-MM-DD Meeting Title.md` with:
+Two files are written per meeting, matching the same layout used by the Local Meeting Assistant:
 
-- YAML frontmatter (date, meeting name, tags)
-- **Summary** — 2-3 sentence overview
-- **Attendees** — with role context where detectable
-- **Key Discussion Points** — bulleted topics
-- **Decisions Made** — explicit conclusions (omitted if none)
-- **Action Items** — checkboxes with owner names
-- **Notable Quotes** — 1-2 high-signal direct quotes (optional)
-- **Full Transcript** — deduplicated, speaker-attributed, timestamped
+```
+Vault Mind/
+  Meetings/
+    Notes/
+      YYYY-MM-DD/
+        Meeting Title.md          ← structured notes (processed by Obsidian plugin)
+    Transcripts/
+      YYYY-MM-DD/
+        Meeting Title — transcript.md  ← raw deduplicated transcript
+```
+
+**Notes file frontmatter:**
+```yaml
+title: "WFC Sync"
+type: meeting
+source: local-app        ← triggers the Obsidian companion plugin
+date: 2026-04-21
+created: 2026-04-21T19:01:36
+attendees:
+  - "Anna Punihaole"     ← resolved to [[People/Name]] wikilinks by the plugin
+  - "Nick Blackmon"
+transcript: "[[Meetings/Transcripts/2026-04-21/WFC Sync — transcript.md]]"
+daily_note: "[[Daily/2026-04-21]]"
+```
+
+**Note body sections:**
+- **Overview** — 2-4 sentence purpose and outcome
+- **Attendees** — speaker names from transcript
+- **Topics Discussed** — sequenced, specific bullets per topic
+- **Key Decisions** — explicit decisions made (or "No explicit decisions recorded")
+- **Action Items** — Owner / Task / Due Date table
+- **Open Questions** — deferred topics (omitted if none)
+- **Notes** — additional context (omitted if none)
+
+**What the Obsidian companion plugin does automatically** (once `source: local-app` is present):
+1. Resolves plain attendee names → `[[People/Name]]` wikilinks
+2. Updates each Person file: `last_contact`, `last_meeting`, `recent_meetings`
+3. Appends a breadcrumb to `Daily/YYYY-MM-DD.md` under the configured section
 
 ---
 
@@ -139,7 +169,8 @@ All tunable constants are at the top of each file:
 |------|----------|---------|-------------|
 | `zoom_menu_bar.py` | `POLL_INTERVAL_SECS` | `5` | How often to check the WAL |
 | `zoom_menu_bar.py` | `IDLE_THRESHOLD_SECS` | `30` | Seconds of WAL inactivity before triggering |
-| `zoom_notes.py` | `VAULT_MEETINGS` | `~/Documents/Vault Mind/Meetings` | Where notes are saved |
+| `zoom_notes.py` | `VAULT_NOTES` | `~/Documents/Vault Mind/Meetings/Notes` | Where note files are saved |
+| `zoom_notes.py` | `VAULT_TRANSCRIPTS` | `~/Documents/Vault Mind/Meetings/Transcripts` | Where transcript files are saved |
 | `zoom_notes.py` | `TRANSCRIPT_DB_PREFIX` | `1CB477F679D6` | IndexedDB folder prefix for transcript store |
 | `zoom_notes.py` | `BLOCKS_DB_PREFIX` | `DDEC8414E29A` | IndexedDB folder prefix for title/blocks store |
 

@@ -19,10 +19,14 @@ WAL file (Zoom writes this)
   → parse_transcript() extracts entries via strings(1), deduplicates by messageId
   → parse_meeting_title() reads meeting name from blocks WAL
   → format_transcript() formats speaker-attributed output
-  → summarize_with_claude() calls Claude API (claude-opus-4-5, max_tokens 1500)
-  → build_note_content() assembles frontmatter + summary + transcript
-  → save_note() writes to VAULT_MEETINGS
+  → summarize_with_claude() calls Claude API (claude-opus-4-5, max_tokens 4096)
+  → build_note_content() assembles frontmatter (source: local-app) + summary
+  → build_transcript_content() assembles transcript file with backlink frontmatter
+  → save_note() writes note → VAULT_NOTES/YYYY-MM-DD/Title.md
+                          and transcript → VAULT_TRANSCRIPTS/YYYY-MM-DD/Title — transcript.md
 ```
+
+The `source: local-app` frontmatter field causes the Obsidian companion plugin to pick up the note and run its post-processing pipeline (attendee wikilink resolution, People file updates, daily note breadcrumb).
 
 The menu bar app (`zoom_menu_bar.py`) wraps this in a `rumps.App` subclass with a 5-second `rumps.Timer`. State machine: IDLE → ACTIVE → GENERATING → IDLE.
 
@@ -71,7 +75,8 @@ Note generation runs in a `threading.Thread`. A `threading.Lock` (`_generating_l
 
 | File | Name | Default | Purpose |
 |------|------|---------|---------|
-| `zoom_notes.py` | `VAULT_MEETINGS` | `~/Documents/Vault Mind/Meetings` | Note output directory |
+| `zoom_notes.py` | `VAULT_NOTES` | `~/Documents/Vault Mind/Meetings/Notes` | Notes output directory |
+| `zoom_notes.py` | `VAULT_TRANSCRIPTS` | `~/Documents/Vault Mind/Meetings/Transcripts` | Transcripts output directory |
 | `zoom_notes.py` | `TRANSCRIPT_DB_PREFIX` | `1CB477F679D6` | IndexedDB folder prefix |
 | `zoom_notes.py` | `BLOCKS_DB_PREFIX` | `DDEC8414E29A` | Title/blocks DB prefix |
 | `zoom_menu_bar.py` | `POLL_INTERVAL_SECS` | `5` | WAL poll frequency |
@@ -116,7 +121,7 @@ Zoom updates may change the DB prefix hashes. If detection stops working:
 
 **Change the output format:** Edit `SYSTEM_PROMPT` in `zoom_notes.py` — it's the full Claude instruction for note structure.
 
-**Change the output location:** Change `VAULT_MEETINGS` in `zoom_notes.py`.
+**Change the output location:** Change `VAULT_NOTES` and `VAULT_TRANSCRIPTS` in `zoom_notes.py`.
 
 **Change the Claude model:** Edit `"model"` in `summarize_with_claude()`.
 

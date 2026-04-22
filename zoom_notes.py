@@ -33,7 +33,8 @@ MY_NOTES_ORIGINS = (
     ZOOM_BASE
     / "UnifyWebView_Cache/WebKit/UnSigned/Default/MyNotes/Origins"
 )
-VAULT_MEETINGS = Path.home() / "Documents/Vault Mind/Meetings"
+VAULT_NOTES = Path.home() / "Documents/Vault Mind/Meetings/Notes"
+VAULT_TRANSCRIPTS = Path.home() / "Documents/Vault Mind/Meetings/Transcripts"
 
 # Known transcript store prefix (from research)
 TRANSCRIPT_DB_PREFIX = "1CB477F679D6"
@@ -238,28 +239,44 @@ def format_transcript(entries: list[dict]) -> str:
 
 # ── Claude Summarization ───────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a professional meeting notes assistant. Given a Zoom meeting transcript, produce structured meeting notes in Markdown.
+SYSTEM_PROMPT = """You are a meticulous meeting notetaker. Produce detailed, well-structured meeting notes from the transcript. Be thorough — a reader who wasn't in the meeting should come away with a complete picture of what was discussed, decided, and committed to.
 
-Output format:
-## Summary
-2-3 sentence overview of what the meeting was about.
+Use this structure exactly. Include every section even if brief.
+
+## Overview
+2-4 sentences capturing the purpose and outcome of the meeting. Who was involved, what was the core focus, what was resolved or left open.
 
 ## Attendees
-- Name (role/context if clear from transcript)
+Bullet list of attendee names (use the speaker names from the transcript).
 
-## Key Discussion Points
-- Bullet points of the main topics discussed
+## Topics Discussed
+A sequenced list of the main topics covered. For each topic, 1-3 sentences on what was said — include specific details, numbers, names, and context. Don't collapse important nuance into vague summaries.
 
-## Decisions Made
-- Any explicit decisions or conclusions reached (skip section if none)
+Format:
+- **[Topic name]** — [What was discussed. Be specific.]
+
+## Key Decisions
+Decisions that were explicitly made or agreed upon. If none, write "No explicit decisions recorded."
+
+Format:
+- [Decision] — [Who made it or who it affects, if clear]
 
 ## Action Items
-- [ ] Action item — **Owner** (if named)
+A table of all commitments, tasks, and follow-ups. Include owner, task description, and due date if mentioned.
 
-## Notable Quotes
-1-2 direct quotes that capture the essence of the meeting (optional, only if truly insightful)
+| Owner | Task | Due Date |
+|-------|------|----------|
+| [name] | [what they committed to] | [date or null] |
 
-Be concise. Do not pad with filler. Use the speaker names from the transcript."""
+## Open Questions
+Unresolved questions, decisions deferred, or topics that need follow-up. Omit this section entirely if none.
+
+## Notes
+Any additional context, background, or detail worth capturing that didn't fit above. Omit if nothing relevant.
+
+---
+
+Output only the meeting notes. No preamble, no explanation, no meta-commentary."""
 
 
 def summarize_with_claude(
@@ -270,7 +287,7 @@ def summarize_with_claude(
     """Call Claude API to summarize the transcript."""
     payload = {
         "model": "claude-opus-4-5",
-        "max_tokens": 1500,
+        "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "messages": [
             {
@@ -296,7 +313,7 @@ def summarize_with_claude(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             body = json.loads(resp.read())
             return body["content"][0]["text"]
     except urllib.error.HTTPError as e:
@@ -316,35 +333,71 @@ def slugify_title(title: str) -> str:
     return clean
 
 
-def save_note(content: str, meeting_title: str, date_str: str) -> Path:
-    """Save the generated note to Vault Mind/Meetings."""
-    VAULT_MEETINGS.mkdir(parents=True, exist_ok=True)
+def save_note(
+    note_content: str,
+    transcript_content: str,
+    meeting_title: str,
+    date_str: str,
+) -> Path:
+    """Write note and transcript to their respective dated vault subfolders."""
     slug = slugify_title(meeting_title)
-    filename = f"{date_str} {slug}.md"
-    note_path = VAULT_MEETINGS / filename
-    note_path.write_text(content, encoding="utf-8")
+
+    notes_dir = VAULT_NOTES / date_str
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    note_path = notes_dir / f"{slug}.md"
+    note_path.write_text(note_content, encoding="utf-8")
+
+    transcripts_dir = VAULT_TRANSCRIPTS / date_str
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = transcripts_dir / f"{slug} \u2014 transcript.md"
+    transcript_path.write_text(transcript_content, encoding="utf-8")
+
     return note_path
 
 
 def build_note_content(
     summary: str,
-    transcript: str,
     meeting_title: str,
     date_str: str,
+    attendees: list[str],
+    created_iso: str,
 ) -> str:
+    slug = slugify_title(meeting_title)
+    transcript_link = (
+        f"[[Meetings/Transcripts/{date_str}/{slug} \u2014 transcript.md]]"
+    )
+    daily_link = f"[[Daily/{date_str}]]"
+    attendees_yaml = "\n".join(f'  - "{a}"' for a in attendees)
     return f"""---
+title: "{slug}"
+type: meeting
+source: local-app
 date: {date_str}
-meeting: {meeting_title}
-tags: [meeting-notes, zoom]
+created: {created_iso}
+attendees:
+{attendees_yaml}
+transcript: "{transcript_link}"
+daily_note: "{daily_link}"
 ---
 
-# {slugify_title(meeting_title)}
+# {slug}
 
 {summary}
+"""
 
+
+def build_transcript_content(transcript: str, meeting_title: str, date_str: str) -> str:
+    slug = slugify_title(meeting_title)
+    note_link = f"[[Meetings/Notes/{date_str}/{slug}]]"
+    return f"""---
+title: "{slug} — transcript"
+type: transcript
+source: local-app
+date: {date_str}
+note: "{note_link}"
 ---
 
-## Full Transcript
+# {slug} — Transcript
 
 {transcript}
 """
@@ -409,6 +462,8 @@ def cmd_watch(origin: Path) -> None:
 
 
 def cmd_notes(origin: Path, dry_run: bool = False) -> None:
+    import re
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("Error: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
@@ -432,35 +487,49 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
         meeting_title = parse_meeting_title(blocks_wal)
 
     if not meeting_title:
-        # Fall back to WAL modification time
         mtime = transcript_wal.stat().st_mtime
         meeting_title = f"Zoom Meeting {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}"
 
-    # Extract date from title or fall back to today
-    import re
     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
     date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
 
+    # Extract unique speakers in order of first appearance (exclude Unknown)
+    seen: dict[str, None] = {}
+    for e in entries:
+        s = e["speaker"]
+        if s and s != "Unknown":
+            seen[s] = None
+    attendees = list(seen.keys())
+
+    created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     transcript_text = format_transcript(entries)
 
     print(f"Meeting  : {meeting_title}")
     print(f"Date     : {date_str}")
-    print(f"Speakers : {len({e['speaker'] for e in entries})}")
+    print(f"Speakers : {', '.join(attendees)}")
     print(f"Lines    : {len(entries)}")
     print("\nSummarizing with Claude...")
 
     summary = summarize_with_claude(transcript_text, meeting_title, api_key)
 
-    note_content = build_note_content(summary, transcript_text, meeting_title, date_str)
+    note_content = build_note_content(
+        summary, meeting_title, date_str, attendees, created_iso
+    )
+    transcript_content = build_transcript_content(transcript_text, meeting_title, date_str)
 
     if dry_run:
         print("\n" + "─" * 60)
+        print("── NOTE ──")
         print(note_content)
+        print("\n── TRANSCRIPT ──")
+        print(transcript_content[:800] + "\n... (truncated)")
         print("─" * 60)
-        print("\n(Dry run — note not saved)")
+        print("\n(Dry run — files not saved)")
     else:
-        note_path = save_note(note_content, meeting_title, date_str)
-        print(f"\nNote saved: {note_path}")
+        note_path = save_note(note_content, transcript_content, meeting_title, date_str)
+        slug = slugify_title(meeting_title)
+        print(f"\nNote saved      : {note_path}")
+        print(f"Transcript saved: {VAULT_TRANSCRIPTS / date_str / f'{slug} \u2014 transcript.md'}")
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────

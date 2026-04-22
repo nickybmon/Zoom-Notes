@@ -30,6 +30,7 @@ from zoom_notes import (
     BLOCKS_DB_PREFIX,
     TRANSCRIPT_DB_PREFIX,
     build_note_content,
+    build_transcript_content,
     find_origin_dir,
     find_wal,
     format_transcript,
@@ -214,13 +215,27 @@ class ZoomNotesApp(rumps.App):
                 date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
             )
 
+            # Extract unique speakers in order of first appearance
+            seen: dict[str, None] = {}
+            for e in entries:
+                s = e["speaker"]
+                if s and s != "Unknown":
+                    seen[s] = None
+            attendees = list(seen.keys())
+
+            created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             transcript_text = format_transcript(entries)
             summary = summarize_with_claude(transcript_text, meeting_title, api_key)
-            note_content = build_note_content(summary, transcript_text, meeting_title, date_str)
-            note_path = save_note(note_content, meeting_title, date_str)
+            note_content = build_note_content(
+                summary, meeting_title, date_str, attendees, created_iso
+            )
+            transcript_content = build_transcript_content(
+                transcript_text, meeting_title, date_str
+            )
+            note_path = save_note(note_content, transcript_content, meeting_title, date_str)
 
             short_name = slugify_title(meeting_title)
-            rel_path = f"Vault Mind/Meetings/{note_path.name}"
+            rel_path = f"Vault Mind/Meetings/Notes/{date_str}/{note_path.name}"
             rumps.notification(
                 title="Meeting Notes Saved",
                 subtitle=short_name,
