@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -40,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from zoom_notes import (
     BLOCKS_DB_PREFIX,
     TRANSCRIPT_DB_PREFIX,
+    VAULT_NOTES,
     build_note_content,
     build_transcript_content,
     count_meeting_ids,
@@ -61,9 +63,9 @@ POLL_INTERVAL_SECS = 5
 IDLE_THRESHOLD_SECS = 30
 
 # Menu bar title strings per state
-ICON_IDLE = "●"       # neutral dot — no meeting
-ICON_ACTIVE = "⏺"    # filled circle — meeting in progress
-ICON_GENERATING = "⟳" # spinner — generating notes
+ICON_IDLE = "▶"       # play — ready, waiting for a meeting
+ICON_ACTIVE = "‖"     # pause — meeting in progress / recording
+ICON_GENERATING = "↻" # clockwise arrow — generating notes
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
@@ -89,11 +91,12 @@ class ZoomNotesApp(rumps.App):
         self._last_wal_mtime: float | None = None
         self._last_wal_size: int | None = None
         self._last_active_time: float | None = None
-        self._processed_wal_path: str | None = None  # prevent re-trigger on same WAL
+        self._processed_meeting_ids: set[str] = set()  # prevent re-trigger on same meeting
         self._generating_lock = threading.Lock()
 
         # Active meeting tracking
         self._active_meeting_id: str | None = None  # meetingId we're recording
+        self._meeting_start_time: float | None = None  # monotonic time when meeting activity first seen
         # Accumulated transcript: messageId → best entry dict.
         # Populated every poll tick so a WAL checkpoint can't lose data.
         self._accumulated: dict[str, dict] = {}
@@ -103,18 +106,37 @@ class ZoomNotesApp(rumps.App):
 
         log.info("App started. Origin: %s", self._origin or "(not found)")
 
-        # Seed WAL state from disk so a restart mid-meeting doesn't reset the
-        # idle clock — first poll will see "unchanged" and start counting idle time.
+        # Seed WAL state from disk only if the WAL was recently modified,
+        # indicating an in-progress meeting. A stale WAL (older than 90 seconds)
+        # is left alone — the poller will detect new activity naturally when the
+        # next meeting starts writing to the same file. We must NOT mark stale
+        # WALs as processed here, because Zoom reuses the same WAL path across
+        # meetings and we'd silently skip the next meeting.
         if self._origin:
             _wal = find_wal(self._origin, TRANSCRIPT_DB_PREFIX)
             if _wal:
                 try:
                     _stat = _wal.stat()
-                    self._last_wal_mtime = _stat.st_mtime
-                    self._last_wal_size = _stat.st_size
-                    self._last_active_time = time.monotonic()
-                    self._state = State.ACTIVE
-                    log.info("Seeded WAL state on startup: size=%d mtime=%.0f", _stat.st_size, _stat.st_mtime)
+                    age_secs = time.time() - _stat.st_mtime
+                    if age_secs < 90:
+                        # WAL is fresh — we may be mid-meeting; arm idle detection
+                        self._last_wal_mtime = _stat.st_mtime
+                        self._last_wal_size = _stat.st_size
+                        self._last_active_time = time.monotonic()
+                        log.info(
+                            "Seeded WAL state on startup (fresh, age=%.0fs): size=%d mtime=%.0f",
+                            age_secs, _stat.st_size, _stat.st_mtime,
+                        )
+                    else:
+                        # Stale WAL — seed mtime/size so the poller can detect
+                        # when a new meeting starts changing this file, but do NOT
+                        # mark it processed (that would block the next meeting).
+                        self._last_wal_mtime = _stat.st_mtime
+                        self._last_wal_size = _stat.st_size
+                        log.info(
+                            "Stale WAL on startup (age=%.0fs) — seeded size/mtime, not marking processed.",
+                            age_secs,
+                        )
                 except OSError:
                     pass
 
@@ -159,10 +181,6 @@ class ZoomNotesApp(rumps.App):
             self._last_active_time = None
             return
 
-        # Never re-trigger on a WAL we already processed this session
-        if str(wal) == self._processed_wal_path:
-            return
-
         try:
             stat = wal.stat()
         except OSError:
@@ -181,15 +199,38 @@ class ZoomNotesApp(rumps.App):
             self._last_wal_size = size
             self._last_active_time = time.monotonic()
 
-            # On first activity, lock in the dominant meeting ID
-            if self._active_meeting_id is None:
+            # Re-evaluate the dominant meeting ID for the first 60s of activity.
+            # Locking too early risks picking a ghost meeting (e.g. a double-booked
+            # calendar invite already in the WAL) before enough transcript entries
+            # from the real meeting have accumulated to outvote it.
+            meeting_lock_age = (
+                time.monotonic() - self._meeting_start_time
+                if self._meeting_start_time is not None
+                else 0
+            )
+            if self._meeting_start_time is None:
+                self._meeting_start_time = time.monotonic()
+
+            if self._active_meeting_id is None or meeting_lock_age < 60:
                 counts = count_meeting_ids(wal)
-                self._active_meeting_id = max(counts, key=lambda k: counts[k]) if counts else None
-                log.info(
-                    "Meeting detected. Locking onto meeting_id=%s  (all counts: %s)",
-                    self._active_meeting_id,
-                    {k: v for k, v in sorted(counts.items(), key=lambda x: -x[1])},
-                )
+                new_id = max(counts, key=lambda k: counts[k]) if counts else None
+                if new_id != self._active_meeting_id:
+                    log.info(
+                        "Meeting ID %s -> %s (lock_age=%.0fs, all counts: %s)",
+                        self._active_meeting_id, new_id, meeting_lock_age,
+                        {k: v for k, v in sorted(counts.items(), key=lambda x: -x[1])},
+                    )
+                    self._active_meeting_id = new_id
+                elif self._active_meeting_id and meeting_lock_age >= 60:
+                    log.info(
+                        "Locked onto meeting_id=%s after %.0fs",
+                        self._active_meeting_id, meeting_lock_age,
+                    )
+
+            # Never re-trigger on a meeting we already processed this session.
+            # Check AFTER resolving the meeting ID so we don't block on stale state.
+            if self._active_meeting_id and self._active_meeting_id in self._processed_meeting_ids:
+                return
 
             # Snapshot new entries into accumulator so WAL checkpoints can't lose them
             before = len(self._accumulated)
@@ -266,9 +307,9 @@ class ZoomNotesApp(rumps.App):
         """Background thread: parse, summarize, save, notify."""
         log.info("Generation started. accumulated=%d meeting_id=%s", len(self._accumulated), self._active_meeting_id)
         try:
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                self._notify_error("ANTHROPIC_API_KEY not set in environment.")
+            gemini_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not gemini_key:
+                self._notify_error("No API key found. Set ANTHROPIC_API_KEY in .env.")
                 return
 
             origin = self._origin
@@ -282,6 +323,14 @@ class ZoomNotesApp(rumps.App):
             # Prefer the in-memory accumulator (immune to WAL checkpointing).
             # Do a final WAL snapshot first to catch any last words.
             if transcript_wal:
+                # If we have no active meeting ID yet (e.g. manual trigger right
+                # after startup), detect it from the WAL before snapshotting so
+                # the filter is applied correctly.
+                if self._active_meeting_id is None:
+                    counts = count_meeting_ids(transcript_wal)
+                    if counts:
+                        self._active_meeting_id = max(counts, key=lambda k: counts[k])
+                        log.info("Detected meeting_id from WAL at generation time: %s", self._active_meeting_id)
                 self._snapshot_wal(transcript_wal)
 
             if self._accumulated:
@@ -320,7 +369,7 @@ class ZoomNotesApp(rumps.App):
 
             created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             transcript_text = format_transcript(entries)
-            summary = summarize_with_claude(transcript_text, meeting_title, api_key)
+            summary = summarize_with_claude(transcript_text, meeting_title, gemini_key)
             note_content = build_note_content(
                 summary, meeting_title, date_str, attendees, created_iso
             )
@@ -330,7 +379,8 @@ class ZoomNotesApp(rumps.App):
             note_path = save_note(note_content, transcript_content, meeting_title, date_str)
 
             short_name = slugify_title(meeting_title)
-            rel_path = f"Vault Mind/Meetings/Notes/{date_str}/{note_path.name}"
+            notes_dir = VAULT_NOTES / date_str
+            rel_path = str(notes_dir / note_path.name)
             log.info("Notes saved: %s  (%d entries, %d attendees)", note_path.name, len(entries), len(attendees))
             rumps.notification(
                 title="Meeting Notes Saved",
@@ -345,15 +395,14 @@ class ZoomNotesApp(rumps.App):
 
         finally:
             self._generating_lock.release()
-            # Mark this WAL as processed so we never trigger on it again
-            if self._origin:
-                wal = find_wal(self._origin, TRANSCRIPT_DB_PREFIX)
-                if wal:
-                    self._processed_wal_path = str(wal)
+            # Mark this meeting as processed so we never trigger on it again
+            if self._active_meeting_id:
+                self._processed_meeting_ids.add(self._active_meeting_id)
             self._last_wal_mtime = None
             self._last_wal_size = None
             self._last_active_time = None
             self._active_meeting_id = None
+            self._meeting_start_time = None
             self._accumulated = {}
             self._set_state(State.IDLE)
 
@@ -374,6 +423,8 @@ class ZoomNotesApp(rumps.App):
         self._trigger_notes()
 
     def _on_quit(self, _sender):
+        lock_path = Path(tempfile.gettempdir()) / "zoom-notes.lock"
+        lock_path.unlink(missing_ok=True)
         rumps.quit_application()
 
 
@@ -382,7 +433,7 @@ class ZoomNotesApp(rumps.App):
 def install_login_item():
     """
     Add this script to macOS Login Items using a launchd user agent plist.
-    Creates: ~/Library/LaunchAgents/com.nickblackmon.zoom-notes.plist
+    Creates: ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
     """
     # Use the venv Python directly (preserves venv site-packages with rumps)
     venv_python = Path(__file__).parent / "venv/bin/python3"
@@ -401,13 +452,13 @@ def install_login_item():
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.zoom-notes-assistant</string>
+  <string>com.webflow.zoom-notes-assistant</string>
   <key>ProgramArguments</key>
   <array>
     <string>{python}</string>
     <string>{script}</string>
   </array>
-  <key>EnvironmentVariables</key>
+    <key>EnvironmentVariables</key>
   <dict>
     <key>ANTHROPIC_API_KEY</key>
     <string>{api_key}</string>
@@ -433,10 +484,28 @@ def install_login_item():
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+def _acquire_lock() -> bool:
+    """Write a PID lockfile. Returns False if another instance is already running."""
+    lock_path = Path(tempfile.gettempdir()) / "zoom-notes.lock"
+    if lock_path.exists():
+        try:
+            existing_pid = int(lock_path.read_text().strip())
+            # Check if that process is still alive
+            os.kill(existing_pid, 0)
+            return False  # process exists — another instance is running
+        except (ValueError, OSError):
+            pass  # stale lockfile — safe to overwrite
+    lock_path.write_text(str(os.getpid()))
+    return True
+
+
 if __name__ == "__main__":
     if "--install-login-item" in sys.argv:
         install_login_item()
     else:
+        if not _acquire_lock():
+            print("zoom_menu_bar.py is already running. Exiting.")
+            sys.exit(0)
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory

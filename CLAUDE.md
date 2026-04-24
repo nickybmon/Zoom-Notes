@@ -2,7 +2,7 @@
 
 ## What this project is
 
-A macOS menu bar app that reads Zoom's AI Notetaker WAL file in real time, detects meeting end via idle detection, and auto-generates structured meeting notes via Claude API. Notes are saved to `~/Documents/Vault Mind/Meetings/`.
+A macOS menu bar app that reads Zoom's AI Notetaker WAL file in real time, detects meeting end via idle detection, and auto-generates structured meeting notes via Claude API. Notes are saved to the configured output directory (default: `~/Desktop/Meeting Notes/`).
 
 Two files do everything:
 - `zoom_notes.py` — all core logic: WAL discovery, transcript parsing, Claude API call, note writing
@@ -19,14 +19,14 @@ WAL file (Zoom writes this)
   → parse_transcript() extracts entries via strings(1), deduplicates by messageId
   → parse_meeting_title() reads meeting name from blocks WAL
   → format_transcript() formats speaker-attributed output
-  → summarize_with_claude() calls Claude API (claude-opus-4-5, max_tokens 4096)
-  → build_note_content() assembles frontmatter (source: local-app) + summary
+  → summarize_with_claude() calls Claude API (claude-3-5-haiku, max_tokens 4096)
+  → build_note_content() assembles frontmatter (source: zoom-notes) + summary
   → build_transcript_content() assembles transcript file with backlink frontmatter
   → save_note() writes note → VAULT_NOTES/YYYY-MM-DD/Title.md
                           and transcript → VAULT_TRANSCRIPTS/YYYY-MM-DD/Title — transcript.md
 ```
 
-The `source: local-app` frontmatter field causes the Obsidian companion plugin to pick up the note and run its post-processing pipeline (attendee wikilink resolution, People file updates, daily note breadcrumb).
+The `source: zoom-notes` frontmatter field can be used by Obsidian companion plugins to trigger post-processing (attendee wikilink resolution, People file updates, daily note breadcrumb).
 
 The menu bar app (`zoom_menu_bar.py`) wraps this in a `rumps.App` subclass with a 5-second `rumps.Timer`. State machine: IDLE → ACTIVE → GENERATING → IDLE.
 
@@ -69,14 +69,18 @@ The menu bar poller compares `st_mtime` and `st_size` on each 5-second tick. If 
 ### Thread safety
 Note generation runs in a `threading.Thread`. A `threading.Lock` (`_generating_lock`) prevents double-triggering. The rumps run loop stays unblocked. After generation completes (success or error), the lock is released and state resets to IDLE.
 
+### Proxy support
+`CLAUDE_API_URL` in `zoom_notes.py` defaults to `https://api.anthropic.com/v1/messages` but reads from the `ZOOM_NOTES_API_URL` env var. To route through an internal proxy, users set that var — no code changes needed.
+
 ---
 
 ## Constants to know
 
 | File | Name | Default | Purpose |
 |------|------|---------|---------|
-| `zoom_notes.py` | `VAULT_NOTES` | `~/Documents/Vault Mind/Meetings/Notes` | Notes output directory |
-| `zoom_notes.py` | `VAULT_TRANSCRIPTS` | `~/Documents/Vault Mind/Meetings/Transcripts` | Transcripts output directory |
+| `zoom_notes.py` | `VAULT_NOTES` | `~/Desktop/Meeting Notes/Notes` | Notes output directory |
+| `zoom_notes.py` | `VAULT_TRANSCRIPTS` | `~/Desktop/Meeting Notes/Transcripts` | Transcripts output directory |
+| `zoom_notes.py` | `CLAUDE_API_URL` | `https://api.anthropic.com/v1/messages` | API endpoint (overridable) |
 | `zoom_notes.py` | `TRANSCRIPT_DB_PREFIX` | `1CB477F679D6` | IndexedDB folder prefix |
 | `zoom_notes.py` | `BLOCKS_DB_PREFIX` | `DDEC8414E29A` | Title/blocks DB prefix |
 | `zoom_menu_bar.py` | `POLL_INTERVAL_SECS` | `5` | WAL poll frequency |
@@ -96,10 +100,10 @@ python3 -m venv venv
 
 # Auto-launch at login
 ./venv/bin/python3 zoom_menu_bar.py --install-login-item
-launchctl load ~/Library/LaunchAgents/com.nickblackmon.zoom-notes.plist
+launchctl load ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
 ```
 
-`ANTHROPIC_API_KEY` must be set in the environment. The `--install-login-item` command bakes the current value of the key into the launchd plist.
+`ANTHROPIC_API_KEY` must be set in the environment (or in a `.env` file in the project directory). The `--install-login-item` command bakes the current value of the key into the launchd plist.
 
 ---
 
@@ -119,11 +123,11 @@ Zoom updates may change the DB prefix hashes. If detection stops working:
 
 ## Extending this
 
-**Change the output format:** Edit `SYSTEM_PROMPT` in `zoom_notes.py` — it's the full Claude instruction for note structure.
+**Change the output format:** Edit `SYSTEM_PROMPT` in `zoom_notes.py` — it's the full instruction for note structure.
 
-**Change the output location:** Change `VAULT_NOTES` and `VAULT_TRANSCRIPTS` in `zoom_notes.py`.
+**Change the output location:** Set `ZOOM_NOTES_OUTPUT_DIR` and `ZOOM_NOTES_TRANSCRIPTS_DIR` in `.env`, or change `VAULT_NOTES` and `VAULT_TRANSCRIPTS` defaults in `zoom_notes.py`.
 
-**Change the Claude model:** Edit `"model"` in `summarize_with_claude()`.
+**Change the Claude model:** Edit the `"model"` field in `summarize_with_claude()`.
 
 **Add a second trigger condition:** Modify `_poll()` in `zoom_menu_bar.py` — all state logic lives there.
 

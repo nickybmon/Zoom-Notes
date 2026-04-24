@@ -1,6 +1,6 @@
 # Zoom Meeting Notes Assistant
 
-A macOS menu bar app that watches Zoom's AI Notetaker in real time, detects when a meeting ends, and automatically generates structured meeting notes via Claude — saved directly to your Obsidian vault.
+A macOS menu bar app that watches Zoom's AI Notetaker in real time, detects when a meeting ends, and automatically generates structured meeting notes via Claude — saved directly to your configured output directory (Obsidian vault, Desktop folder, or anywhere you like).
 
 No screen scraping. No network interception. Reads a local file Zoom already writes to your disk.
 
@@ -25,15 +25,15 @@ The WAL stores UTF-8 strings readable with `strings(1)` — no special permissio
 ```
 Zoom meeting starts
   → WAL file appears and grows
-  → Menu bar icon switches to ⏺ (In Meeting)
+  → Menu bar icon switches to ‖ (In Meeting)
 
 Meeting ends
   → WAL stops changing
-  → After 30 seconds idle: icon switches to ⟳ (Generating)
+  → After 30 seconds idle: icon switches to ↻ (Generating)
   → Transcript is parsed, deduplicated, sent to Claude
-  → Structured notes saved to Vault Mind/Meetings/
+  → Structured notes saved to configured output directory
   → macOS notification fires
-  → Icon returns to ● (Idle)
+  → Icon returns to ▶ (Idle)
 ```
 
 ---
@@ -42,9 +42,9 @@ Meeting ends
 
 | Icon | State | Meaning |
 |------|-------|---------|
-| `●` | Idle | No active meeting detected |
-| `⏺` | In Meeting | WAL is actively changing |
-| `⟳` | Generating | Claude summarization in flight |
+| `▶` | Idle | No active meeting detected |
+| `‖` | In Meeting | WAL is actively changing |
+| `↻` | Generating | Claude summarization in flight |
 
 The menu also has a **Generate Notes Now** item for manual trigger, and a **Quit** item.
 
@@ -89,12 +89,9 @@ daily_note: "[[Daily/2026-04-21]]"
 
 ### Obsidian integration
 
-If you use Obsidian, the output path and frontmatter format are compatible with an Obsidian companion plugin that can:
-1. Resolve plain attendee names → `[[People/Name]]` wikilinks
-2. Update each Person file: `last_contact`, `last_meeting`, `recent_meetings`
-3. Append a breadcrumb to `Daily/YYYY-MM-DD.md` under a configured section
+If you use Obsidian, point `ZOOM_NOTES_OUTPUT_DIR` and `ZOOM_NOTES_TRANSCRIPTS_DIR` at your vault's meetings folder. The frontmatter format (`source: zoom-notes`, wikilink-style `transcript` and `daily_note` fields) is compatible with Obsidian companion plugins for attendee resolution and daily note breadcrumbs.
 
-Point `ZOOM_NOTES_OUTPUT_DIR` and `ZOOM_NOTES_TRANSCRIPTS_DIR` at your vault's meetings folder to use it.
+A common setup: clone this repo into `YourVault/Scripts/zoom-notes/` and set the output dirs to `YourVault/Meetings/Notes` and `YourVault/Meetings/Transcripts`.
 
 ---
 
@@ -103,16 +100,25 @@ Point `ZOOM_NOTES_OUTPUT_DIR` and `ZOOM_NOTES_TRANSCRIPTS_DIR` at your vault's m
 - macOS (Apple Silicon or Intel)
 - Python 3.10+
 - Zoom desktop app with **My Notes** (AI Notetaker) enabled
-- Anthropic API key
+- Anthropic API key (see below)
+
+---
+
+## Getting the API key
+
+This tool uses Claude (Anthropic) to summarize transcripts. You need an `ANTHROPIC_API_KEY` to run it.
+
+- **Webflow team members:** get the shared key from the team 1Password vault (search "Zoom Notes Assistant").
+- **External users:** create your own key at [console.anthropic.com](https://console.anthropic.com/). A spend limit is recommended.
 
 ---
 
 ## Setup
 
 ```bash
-# Clone
-git clone https://github.com/nickybmon/Zoom-Meeting-Assistant.git
-cd Zoom-Meeting-Assistant
+# Clone the repo (or drop it into your Obsidian vault's Scripts folder)
+git clone https://github.com/YOUR_ORG/zoom-notes-assistant.git
+cd zoom-notes-assistant
 
 # Create virtualenv and install the one dependency
 python3 -m venv venv
@@ -121,7 +127,6 @@ python3 -m venv venv
 # Configure your API key and (optionally) output paths
 cp .env.example .env
 # Open .env and paste your Anthropic API key
-# Get a key at: https://console.anthropic.com/
 ```
 
 `.env` is gitignored — your key will never be accidentally committed.
@@ -136,7 +141,7 @@ cp .env.example .env
 ./venv/bin/python3 zoom_menu_bar.py
 ```
 
-The `●` icon appears in your menu bar. Works automatically from there.
+The `▶` icon appears in your menu bar. Works automatically from there.
 
 ### Auto-launch at login
 
@@ -145,15 +150,15 @@ The `●` icon appears in your menu bar. Works automatically from there.
 ./venv/bin/python3 zoom_menu_bar.py --install-login-item
 
 # Activate immediately (no reboot needed)
-launchctl load ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
+launchctl load ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
 ```
 
 Logs go to `~/Library/Logs/zoom-notes.log` and `zoom-notes-error.log`.
 
 To remove:
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
-rm ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
+launchctl unload ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
+rm ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
 ```
 
 ### CLI tools (zoom_notes.py)
@@ -177,6 +182,7 @@ rm ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
 | `ANTHROPIC_API_KEY` | Yes | — | Your Anthropic API key |
 | `ZOOM_NOTES_OUTPUT_DIR` | No | `~/Desktop/Meeting Notes/Notes` | Where note files are saved |
 | `ZOOM_NOTES_TRANSCRIPTS_DIR` | No | `~/Desktop/Meeting Notes/Transcripts` | Where transcript files are saved |
+| `ZOOM_NOTES_API_URL` | No | Anthropic direct | Override to route through a proxy (see below) |
 
 **Code constants** (edit `zoom_notes.py` / `zoom_menu_bar.py` directly):
 
@@ -186,6 +192,10 @@ rm ~/Library/LaunchAgents/com.zoom-notes-assistant.plist
 | `zoom_menu_bar.py` | `IDLE_THRESHOLD_SECS` | `30` | Seconds of WAL inactivity before triggering |
 | `zoom_notes.py` | `TRANSCRIPT_DB_PREFIX` | `1CB477F679D6` | IndexedDB folder prefix for transcript store |
 | `zoom_notes.py` | `BLOCKS_DB_PREFIX` | `DDEC8414E29A` | IndexedDB folder prefix for title/blocks store |
+
+### Proxy support (future)
+
+The API call is designed to be routable through an internal proxy. When a proxy endpoint is available, set `ZOOM_NOTES_API_URL` in `.env` to your proxy URL — nothing else changes. The proxy receives the transcript and title, calls Claude server-side with a key that never touches user machines, and returns the summary. See the open issue for implementation details.
 
 ---
 
@@ -205,6 +215,5 @@ zoom_notes.py           # Core: WAL discovery, transcript parsing, Claude API, n
 zoom_menu_bar.py        # Menu bar app: state machine, WAL poller, rumps UI
 .env.example            # Config template — copy to .env and add your API key
 .env                    # Your local config (gitignored — never committed)
-zoom-transcript-extraction.md  # Original research: how the WAL was discovered and mapped
-venv/                   # Python virtualenv (gitignored)
+zoom-transcript-extraction.md  # Research: how the WAL was discovered and mapped
 ```

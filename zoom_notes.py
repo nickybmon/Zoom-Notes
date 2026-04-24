@@ -2,13 +2,13 @@
 """
 Zoom Meeting Notes Assistant
 Reads Zoom's live AI Notetaker WAL files to extract transcripts,
-then summarizes them via Claude API and saves to Vault Mind.
+then summarizes them via Claude API and saves to your configured output directory.
 
 Usage:
   python zoom_notes.py --list          # List recent meetings found in WAL
   python zoom_notes.py --dump          # Print current transcript to stdout
   python zoom_notes.py --watch         # Live-follow transcript during a meeting
-  python zoom_notes.py --notes         # Generate and save Claude meeting notes
+  python zoom_notes.py --notes         # Generate and save meeting notes
   python zoom_notes.py --notes --dry-run  # Preview notes without saving
 """
 
@@ -54,6 +54,14 @@ VAULT_NOTES = Path(
 VAULT_TRANSCRIPTS = Path(
     os.environ.get("ZOOM_NOTES_TRANSCRIPTS_DIR")
     or Path.home() / "Desktop/Meeting Notes/Transcripts"
+)
+
+# API endpoint — override with ZOOM_NOTES_API_URL to route through a proxy.
+# When a proxy is available, set this to your internal endpoint and remove
+# ANTHROPIC_API_KEY from .env (the proxy holds the key server-side).
+CLAUDE_API_URL = os.environ.get(
+    "ZOOM_NOTES_API_URL",
+    "https://api.anthropic.com/v1/messages",
 )
 
 # Known transcript store prefix (from research)
@@ -314,8 +322,10 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
         return titles[-1]
 
     # Parse the date+time embedded in each Zoom title: "Name YYYY-MM-DD HH:MM(GMT...)"
+    # Only accept titles whose embedded start time is within 2 hours of the transcript.
     _zoom_time_re = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})")
-    best_title = titles[-1]
+    _MAX_TITLE_DELTA_SECS = 2 * 3600
+    best_title = None
     best_delta = None
     for t in titles:
         m = _zoom_time_re.search(t)
@@ -326,9 +336,17 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
         except ValueError:
             continue
         delta = abs((ref_dt - title_dt).total_seconds())
-        if best_delta is None or delta < best_delta:
+        if delta <= _MAX_TITLE_DELTA_SECS and (best_delta is None or delta < best_delta):
             best_delta = delta
             best_title = t
+
+    # If no title matched within the time window, fall back to the last title
+    # only if it has no parseable timestamp (i.e. a custom/renamed meeting title).
+    if best_title is None:
+        for t in reversed(titles):
+            if not _zoom_time_re.search(t):
+                return t
+        return None
 
     return best_title
 
@@ -347,7 +365,7 @@ def format_transcript(entries: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
-# ── Claude Summarization ───────────────────────────────────────────────────────
+# ── Claude Summarization ──────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a meticulous meeting notetaker. Produce detailed, well-structured meeting notes from the transcript. Be thorough — a reader who wasn't in the meeting should come away with a complete picture of what was discussed, decided, and committed to.
 
@@ -394,9 +412,9 @@ def summarize_with_claude(
     meeting_title: str,
     api_key: str,
 ) -> str:
-    """Call Claude API to summarize the transcript."""
+    """Call Claude API (or a configured proxy) to summarize the transcript."""
     payload = {
-        "model": "claude-opus-4-5",
+        "model": "claude-3-5-haiku-20241022",
         "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "messages": [
@@ -412,7 +430,7 @@ def summarize_with_claude(
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
+        CLAUDE_API_URL,
         data=data,
         headers={
             "x-api-key": api_key,
@@ -422,13 +440,24 @@ def summarize_with_claude(
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = json.loads(resp.read())
-            return body["content"][0]["text"]
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Claude API error {e.code}: {error_body}") from e
+    _RETRYABLE = {429, 500, 502, 503, 504}
+    last_exc = None
+    for attempt in range(4):
+        if attempt:
+            time.sleep(15 * (2 ** (attempt - 1)))  # 15s, 30s, 60s
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read())
+                return body["content"][0]["text"]
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            last_exc = RuntimeError(f"Claude API error {e.code}: {error_body}")
+            if e.code not in _RETRYABLE:
+                raise last_exc from e
+        except OSError as e:
+            last_exc = RuntimeError(f"Claude network error: {e}")
+    raise last_exc
+
 
 
 # ── Note Writing ───────────────────────────────────────────────────────────────
@@ -576,8 +605,12 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
     import re
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
+
     if not api_key:
-        print("Error: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
+        print(
+            "Error: No API key found. Set ANTHROPIC_API_KEY in .env.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     transcript_wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
@@ -587,7 +620,8 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
         print("No transcript WAL found.", file=sys.stderr)
         sys.exit(1)
 
-    entries = parse_transcript(transcript_wal)
+    active_meeting_id = detect_active_meeting_id(transcript_wal)
+    entries = parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
     if not entries:
         print("No transcript entries found.", file=sys.stderr)
         sys.exit(1)
@@ -619,8 +653,8 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
     print(f"Date     : {date_str}")
     print(f"Speakers : {', '.join(attendees)}")
     print(f"Lines    : {len(entries)}")
-    print("\nSummarizing with Claude...")
 
+    print("\nSummarizing with Claude...")
     summary = summarize_with_claude(transcript_text, meeting_title, api_key)
 
     note_content = build_note_content(
