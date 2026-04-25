@@ -40,18 +40,22 @@ log = logging.getLogger("zoom-notes")
 sys.path.insert(0, str(Path(__file__).parent))
 from zoom_notes import (
     BLOCKS_DB_PREFIX,
+    CACHE_DIR,
     TRANSCRIPT_DB_PREFIX,
     VAULT_NOTES,
     build_note_content,
     build_transcript_content,
-    count_meeting_ids,
     deduplicate,
+    delete_persisted_accumulator,
     find_origin_dir,
     find_wal,
     format_transcript,
+    load_persisted_accumulator,
     parse_meeting_title,
     parse_transcript,
+    persist_accumulator,
     save_note,
+    score_meeting_ids,
     slugify_title,
     summarize_with_claude,
 )
@@ -100,6 +104,9 @@ class ZoomNotesApp(rumps.App):
         # Accumulated transcript: messageId → best entry dict.
         # Populated every poll tick so a WAL checkpoint can't lose data.
         self._accumulated: dict[str, dict] = {}
+        # Monotonic timestamp of when the WAL was last seen to exist while ACTIVE.
+        # Used to fire note generation when Zoom checkpoints (deletes) the WAL.
+        self._wal_gone_since: float | None = None
 
         # Cached origin dir (stable for the process lifetime)
         self._origin = find_origin_dir()
@@ -140,6 +147,21 @@ class ZoomNotesApp(rumps.App):
                 except OSError:
                     pass
 
+        # Clean up stale in-progress cache files (older than 4 hours).
+        # These are left over from process crashes during a past meeting.
+        _stale_threshold = 4 * 3600
+        if CACHE_DIR.exists():
+            for _f in CACHE_DIR.glob("in-progress-*.json"):
+                try:
+                    age = time.time() - _f.stat().st_mtime
+                    if age > _stale_threshold:
+                        _f.unlink(missing_ok=True)
+                        log.info("Deleted stale cache file: %s (age=%.0fs)", _f.name, age)
+                    else:
+                        log.info("Found recent in-progress cache: %s (age=%.0fs)", _f.name, age)
+                except OSError:
+                    pass
+
         # Menu items
         self._status_item = rumps.MenuItem("Status: Idle", callback=None)
         self._status_item.set_callback(None)  # non-clickable label
@@ -175,11 +197,30 @@ class ZoomNotesApp(rumps.App):
 
         wal = find_wal(self._origin, TRANSCRIPT_DB_PREFIX)
         if not wal:
+            if self._state == State.ACTIVE and self._accumulated:
+                # WAL disappeared mid-meeting (Zoom checkpoint). Keep state ACTIVE
+                # and let the idle threshold fire naturally from _wal_gone_since.
+                if self._wal_gone_since is None:
+                    self._wal_gone_since = time.monotonic()
+                    log.info(
+                        "WAL disappeared while ACTIVE (%d entries); starting gone timer",
+                        len(self._accumulated),
+                    )
+                idle_secs = time.monotonic() - self._wal_gone_since
+                if idle_secs >= IDLE_THRESHOLD_SECS:
+                    log.info("WAL gone for %.0fs — triggering generation", idle_secs)
+                    self._trigger_notes()
+                return
+            # No active meeting — reset fully
+            self._wal_gone_since = None
             self._set_state(State.IDLE)
             self._last_wal_mtime = None
             self._last_wal_size = None
             self._last_active_time = None
             return
+
+        # WAL found — clear the gone timer
+        self._wal_gone_since = None
 
         try:
             stat = wal.stat()
@@ -211,17 +252,17 @@ class ZoomNotesApp(rumps.App):
             if self._meeting_start_time is None:
                 self._meeting_start_time = time.monotonic()
 
-            if self._active_meeting_id is None or meeting_lock_age < 60:
-                counts = count_meeting_ids(wal)
-                new_id = max(counts, key=lambda k: counts[k]) if counts else None
+            if self._active_meeting_id is None or meeting_lock_age < 90:
+                scores = score_meeting_ids(wal)
+                new_id = max(scores, key=lambda k: scores[k]) if scores else None
                 if new_id != self._active_meeting_id:
                     log.info(
-                        "Meeting ID %s -> %s (lock_age=%.0fs, all counts: %s)",
+                        "Meeting ID %s -> %s (lock_age=%.0fs, scores: %s)",
                         self._active_meeting_id, new_id, meeting_lock_age,
-                        {k: v for k, v in sorted(counts.items(), key=lambda x: -x[1])},
+                        {k: f"{v:.0f}" for k, v in sorted(scores.items(), key=lambda x: -x[1])},
                     )
                     self._active_meeting_id = new_id
-                elif self._active_meeting_id and meeting_lock_age >= 60:
+                elif self._active_meeting_id and meeting_lock_age >= 90:
                     log.info(
                         "Locked onto meeting_id=%s after %.0fs",
                         self._active_meeting_id, meeting_lock_age,
@@ -261,6 +302,7 @@ class ZoomNotesApp(rumps.App):
             fresh = parse_transcript(wal, meeting_id_filter=self._active_meeting_id)
         except Exception:
             return
+        before = len(self._accumulated)
         for entry in fresh:
             mid = entry["msg_id"]
             if mid not in self._accumulated:
@@ -273,6 +315,8 @@ class ZoomNotesApp(rumps.App):
                     existing["speaker"] = entry["speaker"]
                 if entry.get("timestamp"):
                     existing["timestamp"] = entry["timestamp"]
+        if len(self._accumulated) > before and self._active_meeting_id:
+            persist_accumulator(self._active_meeting_id, self._accumulated)
 
     # ── State transitions ──────────────────────────────────────────────────────
 
@@ -327,11 +371,19 @@ class ZoomNotesApp(rumps.App):
                 # after startup), detect it from the WAL before snapshotting so
                 # the filter is applied correctly.
                 if self._active_meeting_id is None:
-                    counts = count_meeting_ids(transcript_wal)
-                    if counts:
-                        self._active_meeting_id = max(counts, key=lambda k: counts[k])
+                    scores = score_meeting_ids(transcript_wal)
+                    if scores:
+                        self._active_meeting_id = max(scores, key=lambda k: scores[k])
                         log.info("Detected meeting_id from WAL at generation time: %s", self._active_meeting_id)
                 self._snapshot_wal(transcript_wal)
+
+            # If the in-memory accumulator is empty (process was restarted mid-meeting),
+            # try loading the persisted snapshot from disk.
+            if not self._accumulated and self._active_meeting_id:
+                persisted = load_persisted_accumulator(self._active_meeting_id)
+                if persisted:
+                    self._accumulated = persisted
+                    log.info("Restored %d entries from persisted accumulator", len(persisted))
 
             if self._accumulated:
                 # Reconstruct sorted, deduplicated entries from accumulator
@@ -377,6 +429,8 @@ class ZoomNotesApp(rumps.App):
                 transcript_text, meeting_title, date_str
             )
             note_path = save_note(note_content, transcript_content, meeting_title, date_str)
+            if self._active_meeting_id:
+                delete_persisted_accumulator(self._active_meeting_id)
 
             short_name = slugify_title(meeting_title)
             notes_dir = VAULT_NOTES / date_str
@@ -403,6 +457,7 @@ class ZoomNotesApp(rumps.App):
             self._last_active_time = None
             self._active_meeting_id = None
             self._meeting_start_time = None
+            self._wal_gone_since = None
             self._accumulated = {}
             self._set_state(State.IDLE)
 
