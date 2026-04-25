@@ -209,14 +209,26 @@ class ZoomEngine:
 
         self._set_state(EngineState.GENERATING)
 
+        # Snapshot mtime/size so we can restore them after generation.
+        # This prevents a stale (unchanging) WAL from re-triggering on error.
+        saved_mtime = self._last_mtime
+        saved_size = self._last_size
+
         def worker():
             try:
                 self._generate_notes(origin, cfg)
+                # Success — full reset so a new meeting can be detected
+                self._reset_tracking()
             except Exception as exc:
                 emit({"event": "error", "message": str(exc)})
+                # Restore tracking state so the same stale WAL doesn't
+                # immediately re-trigger on the next poll tick.
+                self._last_mtime = saved_mtime
+                self._last_size = saved_size
+                self._last_active_ts = None  # disarm the idle timer
+                self._active_meeting_id = None
             finally:
                 self._generating_lock.release()
-                self._reset_tracking()
                 self._set_state(EngineState.IDLE)
 
         threading.Thread(target=worker, daemon=True).start()

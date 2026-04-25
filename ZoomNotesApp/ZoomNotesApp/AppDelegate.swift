@@ -159,7 +159,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             button.image = menuBarImage(for: state)
             switch state {
             case .idle:
-                button.contentTintColor = appState.isEngineRunning ? nil : .systemOrange
+                button.contentTintColor = nil  // default white/black template rendering
                 button.toolTip = appState.isEngineRunning ? "Zoom Notes — Idle" : "Zoom Notes — Engine starting…"
             case .active:
                 button.contentTintColor = .controlAccentColor
@@ -168,7 +168,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
                 button.contentTintColor = .systemOrange
                 button.toolTip = "Zoom Notes — Generating notes…"
             case .unknown:
-                button.contentTintColor = .systemOrange
+                button.contentTintColor = nil
                 button.toolTip = "Zoom Notes — Connecting…"
             }
         }
@@ -177,12 +177,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     private func menuBarImage(for state: EngineState) -> NSImage? {
         let symbolName: String
         switch state {
-        case .idle, .unknown: symbolName = "doc.plaintext"
-        case .active:          symbolName = "doc.plaintext.fill"
-        case .generating:      symbolName = "gear"
+        case .idle, .unknown: symbolName = "doc.text"
+        case .active:          symbolName = "doc.text.fill"
+        case .generating:      symbolName = "doc.text.fill"
         }
         let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Zoom Notes")
-        img?.isTemplate = (state == .idle || state == .unknown)
+        // Template = true makes macOS render it white/dark automatically (adapts to menu bar colour)
+        img?.isTemplate = true
         return img
     }
 
@@ -200,6 +201,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
     @objc func showSettings() {
         if settingsWindow == nil {
+            // Use NSPanel with .nonactivatingPanel so showing Settings never
+            // changes the app's activation state. On macOS 26, showing a regular
+            // NSWindow in an .accessory app temporarily promotes it to a regular
+            // app — closing the window then terminates the app.
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
                 styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
@@ -209,15 +214,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             panel.title = "Zoom Notes — Settings"
             panel.animationBehavior = .none
             panel.isFloatingPanel = false
+            panel.becomesKeyOnlyIfNeeded = false
             panel.delegate = self
             panel.contentView = NSHostingView(
                 rootView: SettingsView().environmentObject(appState)
             )
             settingsWindow = panel
         }
-        settingsWindow?.center()
-        settingsWindow?.orderFrontRegardless()
+        // Activate the app first so the panel can become key and receive input
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.center()
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc func openLogs() {
@@ -233,7 +241,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     func windowWillClose(_ notification: Notification) {
         if let w = notification.object as? NSWindow, w === settingsWindow {
             settingsWindow = nil
-            // Signal engine to reload settings after the window closes
+            // Restore accessory policy so the app disappears from the Dock
+            NSApp.setActivationPolicy(.accessory)
+            // Signal engine to reload settings
             appState.engineManager.reloadSettings()
         }
     }
