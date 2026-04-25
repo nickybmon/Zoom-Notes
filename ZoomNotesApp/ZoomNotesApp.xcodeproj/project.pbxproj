@@ -1,0 +1,423 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		42144784ED474F2B8F213543 /* ZoomNotesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */; };
+		FAA1C7777ADF438699CBA9FA /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6130797C4374F2C976E6C4F /* AppDelegate.swift */; };
+		4C473AB599AD4A0BACCE47CC /* EngineEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */; };
+		613CDE9688CC4E24999EA3A5 /* ZoomNotesConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */; };
+		3DF7BCFF7AEC473082CEDE8B /* EngineManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 774355B5E45A4EC5A111B5E9 /* EngineManager.swift */; };
+		E30EC9958F804EEA80C7451E /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCA0395A524F4199B538C4DC /* AppState.swift */; };
+		7E0809FC065443D89EB7B56D /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */; };
+		B615248E7BF448B6BC9B2B71 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DB50904A4BE41479F7842DD /* SettingsView.swift */; };
+		FFE75F14EB7542ED88A9F190 /* ConsoleLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */; };
+		9914EEFBBEB4461C93111F49 /* Permissions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 106E8FBA69014803B7E19772 /* Permissions.swift */; };
+		F7804AB366A4422ABE2CA0AF /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 666DDC72BA4A4BCD93768505 /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		8795DFDC08FB47268DF78CC0 /* ZoomNotesApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZoomNotesApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoomNotesApp.swift; sourceTree = "<group>"; };
+		C6130797C4374F2C976E6C4F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
+		5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoomNotesConfig.swift; sourceTree = "<group>"; };
+		774355B5E45A4EC5A111B5E9 /* EngineManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineManager.swift; sourceTree = "<group>"; };
+		CCA0395A524F4199B538C4DC /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewModel.swift; sourceTree = "<group>"; };
+		2DB50904A4BE41479F7842DD /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleLogger.swift; sourceTree = "<group>"; };
+		106E8FBA69014803B7E19772 /* Permissions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Permissions.swift; sourceTree = "<group>"; };
+		666DDC72BA4A4BCD93768505 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		355A5744F77E4FBEB42D1309 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		65808EC146A24232ABD83746 /* ZoomNotesApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ZoomNotesApp.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		45AFA5734CAA4F7BB19E91F8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		B4BC73955A75422194226B9D /* ZoomNotesApp */ = {
+			isa = PBXGroup;
+			children = (
+				28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */,
+				C6130797C4374F2C976E6C4F /* AppDelegate.swift */,
+				65808EC146A24232ABD83746 /* ZoomNotesApp.entitlements */,
+				39E7F8C48C55421087E79A08 /* Models */,
+				7F285D81B3BD422788A2AF7B /* Services */,
+				0108ECBD6A9D4BD0974D8047 /* ViewModels */,
+				88BAE6961F634930A7ED8C13 /* Views */,
+				3F7D6D71513E40A98CC85E7B /* Utilities */,
+				8D2E997AF28144B691A2385C /* Resources */,
+			);
+			path = ZoomNotesApp;
+			sourceTree = "<group>";
+		};
+		367B11A419FC4E16824A0316 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				8795DFDC08FB47268DF78CC0 /* ZoomNotesApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		39E7F8C48C55421087E79A08 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */,
+				5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		7F285D81B3BD422788A2AF7B /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				774355B5E45A4EC5A111B5E9 /* EngineManager.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		0108ECBD6A9D4BD0974D8047 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				CCA0395A524F4199B538C4DC /* AppState.swift */,
+				0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		88BAE6961F634930A7ED8C13 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				2DB50904A4BE41479F7842DD /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		3F7D6D71513E40A98CC85E7B /* Utilities */ = {
+			isa = PBXGroup;
+			children = (
+				302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */,
+				106E8FBA69014803B7E19772 /* Permissions.swift */,
+			);
+			path = Utilities;
+			sourceTree = "<group>";
+		};
+		8D2E997AF28144B691A2385C /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				666DDC72BA4A4BCD93768505 /* Assets.xcassets */,
+				355A5744F77E4FBEB42D1309 /* Info.plist */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		AA00000000000000000ROOT1 = {
+			isa = PBXGroup;
+			children = (
+				B4BC73955A75422194226B9D /* ZoomNotesApp */,
+				367B11A419FC4E16824A0316 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		89C2919C7724419CB821D067 /* ZoomNotesApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D260E2E993E9495AA1800889 /* Build configuration list for PBXNativeTarget "ZoomNotesApp" */;
+			buildPhases = (
+				45AFA5734CAA4F7BB19E91F8 /* Frameworks */,
+				150285C7CE98471D99475363 /* Sources */,
+				13D9ACF489054155AFAD6317 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ZoomNotesApp;
+			productName = ZoomNotesApp;
+			productReference = 8795DFDC08FB47268DF78CC0 /* ZoomNotesApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0A79358C754D44A892D55F39 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1540;
+				LastUpgradeCheck = 1540;
+				TargetAttributes = {
+					89C2919C7724419CB821D067 = {
+						CreatedOnToolsVersion = 15.4;
+					};
+				};
+			};
+			buildConfigurationList = 6AC312FA2C314DF3A4CEC8F3 /* Build configuration list for PBXProject "ZoomNotesApp" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = AA00000000000000000ROOT1;
+			productRefGroup = 367B11A419FC4E16824A0316 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				89C2919C7724419CB821D067 /* ZoomNotesApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		13D9ACF489054155AFAD6317 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F7804AB366A4422ABE2CA0AF /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		150285C7CE98471D99475363 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				42144784ED474F2B8F213543 /* ZoomNotesApp.swift in Sources */,
+				FAA1C7777ADF438699CBA9FA /* AppDelegate.swift in Sources */,
+				4C473AB599AD4A0BACCE47CC /* EngineEvent.swift in Sources */,
+				613CDE9688CC4E24999EA3A5 /* ZoomNotesConfig.swift in Sources */,
+				3DF7BCFF7AEC473082CEDE8B /* EngineManager.swift in Sources */,
+				E30EC9958F804EEA80C7451E /* AppState.swift in Sources */,
+				7E0809FC065443D89EB7B56D /* SettingsViewModel.swift in Sources */,
+				B615248E7BF448B6BC9B2B71 /* SettingsView.swift in Sources */,
+				FFE75F14EB7542ED88A9F190 /* ConsoleLogger.swift in Sources */,
+				9914EEFBBEB4461C93111F49 /* Permissions.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		4651EBD8DBF44C229C529E2D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_CYCLE = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		7FD09B4F98394D24B8714220 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_CYCLE = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		AF84B9854C5448BFAC438993 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = ZoomNotesApp/ZoomNotesApp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ZoomNotesApp/Resources/Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zoom-notes-assistant";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		B607F90769D941918604526D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = ZoomNotesApp/ZoomNotesApp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ZoomNotesApp/Resources/Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zoom-notes-assistant";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		6AC312FA2C314DF3A4CEC8F3 /* Build configuration list for PBXProject "ZoomNotesApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4651EBD8DBF44C229C529E2D /* Debug */,
+				7FD09B4F98394D24B8714220 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D260E2E993E9495AA1800889 /* Build configuration list for PBXNativeTarget "ZoomNotesApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AF84B9854C5448BFAC438993 /* Debug */,
+				B607F90769D941918604526D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = 0A79358C754D44A892D55F39 /* Project object */;
+}

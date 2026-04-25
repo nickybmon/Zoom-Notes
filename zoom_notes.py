@@ -2,7 +2,7 @@
 """
 Zoom Meeting Notes Assistant
 Reads Zoom's live AI Notetaker WAL files to extract transcripts,
-then summarizes them via Claude API and saves to your configured output directory.
+then summarizes them via your configured LLM and saves to your output directory.
 
 Usage:
   python zoom_notes.py --list          # List recent meetings found in WAL
@@ -39,6 +39,16 @@ def _load_dotenv():
 
 _load_dotenv()
 
+# Import config — must come after _load_dotenv() so env overrides are visible
+from zoom_config import (
+    ZoomNotesConfig,
+    get_config,
+    get_api_key,
+    resolve_subfolder,
+    resolve_filename,
+    DEFAULT_SYSTEM_PROMPT,
+)
+
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -47,26 +57,6 @@ MY_NOTES_ORIGINS = (
     ZOOM_BASE
     / "UnifyWebView_Cache/WebKit/UnSigned/Default/MyNotes/Origins"
 )
-VAULT_NOTES = Path(
-    os.environ.get("ZOOM_NOTES_OUTPUT_DIR")
-    or Path.home() / "Desktop/Meeting Notes/Notes"
-)
-VAULT_TRANSCRIPTS = Path(
-    os.environ.get("ZOOM_NOTES_TRANSCRIPTS_DIR")
-    or Path.home() / "Desktop/Meeting Notes/Transcripts"
-)
-
-# API endpoint — override with ZOOM_NOTES_API_URL to route through a proxy.
-# When a proxy is available, set this to your internal endpoint and remove
-# ANTHROPIC_API_KEY from .env (the proxy holds the key server-side).
-CLAUDE_API_URL = os.environ.get(
-    "ZOOM_NOTES_API_URL",
-    "https://api.anthropic.com/v1/messages",
-)
-
-# Known transcript store prefix (from research)
-TRANSCRIPT_DB_PREFIX = "1CB477F679D6"
-BLOCKS_DB_PREFIX = "DDEC8414E29A"
 
 
 # ── WAL Discovery ──────────────────────────────────────────────────────────────
@@ -365,58 +355,22 @@ def format_transcript(entries: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
-# ── Claude Summarization ──────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are a meticulous meeting notetaker. Produce detailed, well-structured meeting notes from the transcript. Be thorough — a reader who wasn't in the meeting should come away with a complete picture of what was discussed, decided, and committed to.
-
-Use this structure exactly. Include every section even if brief.
-
-## Overview
-2-4 sentences capturing the purpose and outcome of the meeting. Who was involved, what was the core focus, what was resolved or left open.
-
-## Attendees
-Bullet list of attendee names (use the speaker names from the transcript).
-
-## Topics Discussed
-A sequenced list of the main topics covered. For each topic, 1-3 sentences on what was said — include specific details, numbers, names, and context. Don't collapse important nuance into vague summaries.
-
-Format:
-- **[Topic name]** — [What was discussed. Be specific.]
-
-## Key Decisions
-Decisions that were explicitly made or agreed upon. If none, write "No explicit decisions recorded."
-
-Format:
-- [Decision] — [Who made it or who it affects, if clear]
-
-## Action Items
-A table of all commitments, tasks, and follow-ups. Include owner, task description, and due date if mentioned.
-
-| Owner | Task | Due Date |
-|-------|------|----------|
-| [name] | [what they committed to] | [date or null] |
-
-## Open Questions
-Unresolved questions, decisions deferred, or topics that need follow-up. Omit this section entirely if none.
-
-## Notes
-Any additional context, background, or detail worth capturing that didn't fit above. Omit if nothing relevant.
-
----
-
-Output only the meeting notes. No preamble, no explanation, no meta-commentary."""
-
+# ── LLM Summarization ──────────────────────────────────────────────────────────
 
 def summarize_with_claude(
     transcript: str,
     meeting_title: str,
     api_key: str,
+    model: str = "claude-sonnet-4-6",
+    api_url: str = "https://api.anthropic.com/v1/messages",
+    system_prompt: str | None = None,
 ) -> str:
-    """Call Claude API (or a configured proxy) to summarize the transcript."""
+    """Call Claude (Anthropic) API to summarize the transcript."""
+    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
     payload = {
-        "model": "claude-3-5-haiku-20241022",
-        "max_tokens": 4096,
-        "system": SYSTEM_PROMPT,
+        "model": model,
+        "max_tokens": 64000,
+        "system": prompt,
         "messages": [
             {
                 "role": "user",
@@ -430,7 +384,7 @@ def summarize_with_claude(
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        CLAUDE_API_URL,
+        api_url,
         data=data,
         headers={
             "x-api-key": api_key,
@@ -439,33 +393,194 @@ def summarize_with_claude(
         },
         method="POST",
     )
+    return _http_retry(req, lambda body: body["content"][0]["text"])
 
+
+def summarize_with_openai(
+    transcript: str,
+    meeting_title: str,
+    api_key: str,
+    model: str = "gpt-4o",
+    api_url: str = "https://api.openai.com/v1/chat/completions",
+    system_prompt: str | None = None,
+) -> str:
+    """Call OpenAI Chat Completions API to summarize the transcript."""
+    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Meeting: {meeting_title}\n\n"
+                    f"Transcript:\n\n{transcript}"
+                ),
+            },
+        ],
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        api_url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    return _http_retry(req, lambda body: body["choices"][0]["message"]["content"])
+
+
+def summarize_with_gemini(
+    transcript: str,
+    meeting_title: str,
+    api_key: str,
+    model: str = "gemini-2.0-flash",
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta/models",
+    system_prompt: str | None = None,
+) -> str:
+    """Call Google Gemini generateContent API to summarize the transcript."""
+    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    url = f"{base_url}/{model}:generateContent?key={api_key}"
+    payload = {
+        "system_instruction": {"parts": [{"text": prompt}]},
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": (
+                            f"Meeting: {meeting_title}\n\n"
+                            f"Transcript:\n\n{transcript}"
+                        )
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {"maxOutputTokens": 8192},
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    return _http_retry(
+        req,
+        lambda body: body["candidates"][0]["content"]["parts"][0]["text"],
+    )
+
+
+def summarize_with_ollama(
+    transcript: str,
+    meeting_title: str,
+    model: str = "llama3.2",
+    base_url: str = "http://localhost:11434",
+    system_prompt: str | None = None,
+) -> str:
+    """Call Ollama /api/chat to summarize the transcript (no API key needed)."""
+    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    url = f"{base_url.rstrip('/')}/api/chat"
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Meeting: {meeting_title}\n\n"
+                    f"Transcript:\n\n{transcript}"
+                ),
+            },
+        ],
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    return _http_retry(req, lambda body: body["message"]["content"])
+
+
+def _http_retry(req: urllib.request.Request, extract_fn, retries: int = 4) -> str:
+    """Shared retry loop for all LLM HTTP calls."""
     _RETRYABLE = {429, 500, 502, 503, 504}
     last_exc = None
-    for attempt in range(4):
+    for attempt in range(retries):
         if attempt:
             time.sleep(15 * (2 ** (attempt - 1)))  # 15s, 30s, 60s
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 body = json.loads(resp.read())
-                return body["content"][0]["text"]
+                return extract_fn(body)
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
-            last_exc = RuntimeError(f"Claude API error {e.code}: {error_body}")
+            last_exc = RuntimeError(f"LLM API error {e.code}: {error_body}")
             if e.code not in _RETRYABLE:
                 raise last_exc from e
         except OSError as e:
-            last_exc = RuntimeError(f"Claude network error: {e}")
+            last_exc = RuntimeError(f"LLM network error: {e}")
     raise last_exc
 
+
+def summarize(
+    transcript: str,
+    meeting_title: str,
+    cfg: ZoomNotesConfig | None = None,
+) -> str:
+    """
+    Dispatch to the correct LLM backend based on cfg.llm_provider.
+    cfg defaults to get_config() if not provided.
+    """
+    if cfg is None:
+        cfg = get_config()
+
+    provider = cfg.llm_provider
+    model = cfg.llm_model
+    system_prompt = cfg.effective_system_prompt
+
+    if provider == "claude":
+        api_key = get_api_key("claude")
+        if not api_key:
+            raise RuntimeError(
+                "No Anthropic API key found. Set it in Settings or ANTHROPIC_API_KEY env var."
+            )
+        api_url = os.environ.get("ZOOM_NOTES_API_URL", "https://api.anthropic.com/v1/messages")
+        return summarize_with_claude(transcript, meeting_title, api_key, model, api_url, system_prompt)
+
+    if provider == "openai":
+        api_key = get_api_key("openai")
+        if not api_key:
+            raise RuntimeError(
+                "No OpenAI API key found. Set it in Settings or OPENAI_API_KEY env var."
+            )
+        return summarize_with_openai(transcript, meeting_title, api_key, model, cfg.openai_base_url, system_prompt)
+
+    if provider == "gemini":
+        api_key = get_api_key("gemini")
+        if not api_key:
+            raise RuntimeError(
+                "No Gemini API key found. Set it in Settings or GEMINI_API_KEY env var."
+            )
+        return summarize_with_gemini(transcript, meeting_title, api_key, model, cfg.gemini_base_url, system_prompt)
+
+    if provider == "ollama":
+        return summarize_with_ollama(transcript, meeting_title, model, cfg.ollama_base_url, system_prompt)
+
+    raise RuntimeError(f"Unknown LLM provider: {provider!r}")
 
 
 # ── Note Writing ───────────────────────────────────────────────────────────────
 
 def slugify_title(title: str) -> str:
     """Turn a meeting title into a safe filename fragment."""
-    # Strip the Zoom-appended date/time from titles like "WFC Sync 2026-04-21 15:01(GMT-4:00)"
-    import re
     clean = re.sub(r"\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}.*$", "", title).strip()
     clean = re.sub(r"[^\w\s-]", "", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
@@ -477,18 +592,25 @@ def save_note(
     transcript_content: str,
     meeting_title: str,
     date_str: str,
+    cfg: ZoomNotesConfig | None = None,
 ) -> Path:
     """Write note and transcript to their respective dated vault subfolders."""
-    slug = slugify_title(meeting_title)
+    if cfg is None:
+        cfg = get_config()
 
-    notes_dir = VAULT_NOTES / date_str
+    slug = slugify_title(meeting_title)
+    subfolder = resolve_subfolder(cfg, date_str)
+
+    notes_dir = cfg.notes_path / subfolder if subfolder else cfg.notes_path
     notes_dir.mkdir(parents=True, exist_ok=True)
-    note_path = notes_dir / f"{slug}.md"
+    note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
+    note_path = notes_dir / note_filename
     note_path.write_text(note_content, encoding="utf-8")
 
-    transcripts_dir = VAULT_TRANSCRIPTS / date_str
+    transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
     transcripts_dir.mkdir(parents=True, exist_ok=True)
-    transcript_path = transcripts_dir / f"{slug} \u2014 transcript.md"
+    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
+    transcript_path = transcripts_dir / transcript_filename
     transcript_path.write_text(transcript_content, encoding="utf-8")
 
     return note_path
@@ -500,10 +622,19 @@ def build_note_content(
     date_str: str,
     attendees: list[str],
     created_iso: str,
+    cfg: ZoomNotesConfig | None = None,
 ) -> str:
+    if cfg is None:
+        cfg = get_config()
+
     slug = slugify_title(meeting_title)
+    subfolder = resolve_subfolder(cfg, date_str)
+    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
+
     transcript_link = (
-        f"[[Meetings/Transcripts/{date_str}/{slug} \u2014 transcript.md]]"
+        f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
+        if subfolder
+        else f"[[Meetings/Transcripts/{transcript_filename}]]"
     )
     daily_link = f"[[Daily/{date_str}]]"
     attendees_yaml = "\n".join(f'  - "{a}"' for a in attendees)
@@ -525,18 +656,34 @@ daily_note: "{daily_link}"
 """
 
 
-def build_transcript_content(transcript: str, meeting_title: str, date_str: str) -> str:
+def build_transcript_content(
+    transcript: str,
+    meeting_title: str,
+    date_str: str,
+    cfg: ZoomNotesConfig | None = None,
+) -> str:
+    if cfg is None:
+        cfg = get_config()
+
     slug = slugify_title(meeting_title)
-    note_link = f"[[Meetings/Notes/{date_str}/{slug}]]"
+    subfolder = resolve_subfolder(cfg, date_str)
+    note_filename = resolve_filename(cfg.filename_pattern, slug, date_str)
+
+    note_link = (
+        f"[[Meetings/Notes/{date_str}/{note_filename}]]"
+        if subfolder
+        else f"[[Meetings/Notes/{note_filename}]]"
+    )
+    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
     return f"""---
-title: "{slug} — transcript"
+title: "{transcript_filename}"
 type: transcript
 source: zoom-notes
 date: {date_str}
 note: "{note_link}"
 ---
 
-# {slug} — Transcript
+# {transcript_filename}
 
 {transcript}
 """
@@ -545,8 +692,9 @@ note: "{note_link}"
 # ── CLI Commands ───────────────────────────────────────────────────────────────
 
 def cmd_list(origin: Path) -> None:
-    blocks_wal = find_wal(origin, BLOCKS_DB_PREFIX)
-    transcript_wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
+    cfg = get_config()
+    blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
+    transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
 
     print("Zoom Meeting Notes — Recent Meetings\n")
     if blocks_wal:
@@ -567,7 +715,8 @@ def cmd_list(origin: Path) -> None:
 
 
 def cmd_dump(origin: Path) -> None:
-    wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
+    cfg = get_config()
+    wal = find_wal(origin, cfg.transcript_db_prefix)
     if not wal:
         print("No transcript WAL found. Is a meeting with My Notes active?", file=sys.stderr)
         sys.exit(1)
@@ -579,7 +728,8 @@ def cmd_dump(origin: Path) -> None:
 
 
 def cmd_watch(origin: Path) -> None:
-    wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
+    cfg = get_config()
+    wal = find_wal(origin, cfg.transcript_db_prefix)
     if not wal:
         print("No transcript WAL found. Start a Zoom meeting with My Notes enabled.", file=sys.stderr)
         sys.exit(1)
@@ -602,19 +752,10 @@ def cmd_watch(origin: Path) -> None:
 
 
 def cmd_notes(origin: Path, dry_run: bool = False) -> None:
-    import re
+    cfg = get_config()
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-    if not api_key:
-        print(
-            "Error: No API key found. Set ANTHROPIC_API_KEY in .env.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    transcript_wal = find_wal(origin, TRANSCRIPT_DB_PREFIX)
-    blocks_wal = find_wal(origin, BLOCKS_DB_PREFIX)
+    transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
+    blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
 
     if not transcript_wal:
         print("No transcript WAL found.", file=sys.stderr)
@@ -653,14 +794,15 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
     print(f"Date     : {date_str}")
     print(f"Speakers : {', '.join(attendees)}")
     print(f"Lines    : {len(entries)}")
+    print(f"Provider : {cfg.llm_provider} / {cfg.llm_model}")
 
-    print("\nSummarizing with Claude...")
-    summary = summarize_with_claude(transcript_text, meeting_title, api_key)
+    print("\nSummarizing...")
+    summary = summarize(transcript_text, meeting_title, cfg)
 
     note_content = build_note_content(
-        summary, meeting_title, date_str, attendees, created_iso
+        summary, meeting_title, date_str, attendees, created_iso, cfg
     )
-    transcript_content = build_transcript_content(transcript_text, meeting_title, date_str)
+    transcript_content = build_transcript_content(transcript_text, meeting_title, date_str, cfg)
 
     if dry_run:
         print("\n" + "─" * 60)
@@ -671,10 +813,13 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
         print("─" * 60)
         print("\n(Dry run — files not saved)")
     else:
-        note_path = save_note(note_content, transcript_content, meeting_title, date_str)
+        note_path = save_note(note_content, transcript_content, meeting_title, date_str, cfg)
         slug = slugify_title(meeting_title)
+        subfolder = resolve_subfolder(cfg, date_str)
+        transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
+        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
         print(f"\nNote saved      : {note_path}")
-        print(f"Transcript saved: {VAULT_TRANSCRIPTS / date_str / f'{slug} \u2014 transcript.md'}")
+        print(f"Transcript saved: {transcripts_dir / transcript_filename}")
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
@@ -689,7 +834,7 @@ def main() -> None:
     group.add_argument("--list", action="store_true", help="List recent meetings found in WAL")
     group.add_argument("--dump", action="store_true", help="Print current transcript to stdout")
     group.add_argument("--watch", action="store_true", help="Live-follow transcript during a meeting")
-    group.add_argument("--notes", action="store_true", help="Generate and save Claude meeting notes")
+    group.add_argument("--notes", action="store_true", help="Generate and save meeting notes")
     parser.add_argument("--dry-run", action="store_true", help="Preview notes without saving (use with --notes)")
 
     args = parser.parse_args()
