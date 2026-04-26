@@ -62,7 +62,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "RUNTIME=\"$SRCROOT/../python-runtime\"\nDEST=\"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Frameworks/python-runtime\"\nif [ -d \"$RUNTIME\" ]; then\n  mkdir -p \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Frameworks\"\n  rm -rf \"$DEST\"\n  cp -R \"$RUNTIME\" \"$DEST\"\n  echo \"Bundled Python copied to $DEST\"\nelse\n  echo \"warning: python-runtime/ not found — run scripts/fetch-python-runtime.sh first\"\nfi\n";
+			shellScript = "RUNTIME=\"$SRCROOT/../python-runtime\"\nDEST=\"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/python-runtime\"\nif [ -d \"$RUNTIME\" ]; then\n  rm -rf \"$DEST\"\n  cp -R \"$RUNTIME\" \"$DEST\"\n  echo \"Bundled Python copied to $DEST\"\n  # Sign all Mach-O binaries so notarization accepts them\n  find \"$DEST\" -type f \\( -name \"*.dylib\" -o -name \"*.so\" \\) | while read f; do\n    codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --timestamp --options runtime \"$f\" 2>/dev/null || true\n  done\n  codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --timestamp --options runtime \"$DEST/bin/python3.12\" 2>/dev/null || true\n  echo \"Bundled Python signed\"\nelse\n  echo \"warning: python-runtime/ not found — run scripts/fetch-python-runtime.sh first\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

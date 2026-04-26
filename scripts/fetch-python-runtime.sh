@@ -59,7 +59,7 @@ for f in "$STAGING/arm64/python/lib/libpython"*.dylib; do
     [ -f "$x86f" ] && lipo -create "$f" "$x86f" -output "$DEST/lib/$name" 2>/dev/null || true
 done
 
-# Strip unnecessary modules
+# Strip unnecessary modules and Tcl/Tk (causes codesign failures — not needed)
 rm -rf \
     "$DEST/lib/python3.12/test" \
     "$DEST/lib/python3.12/idlelib" \
@@ -68,6 +68,14 @@ rm -rf \
     "$DEST/lib/python3.12/ensurepip" \
     "$DEST/lib/python3.12/lib2to3" \
     "$DEST/lib/python3.12/__phello__" \
+    "$DEST/lib/python3.12/lib-dynload/_tkinter"*.so \
+    "$DEST/lib/itcl"* \
+    "$DEST/lib/libtcl"* \
+    "$DEST/lib/libtk"* \
+    "$DEST/lib/tcl"* \
+    "$DEST/lib/thread"* \
+    "$DEST/lib/tk"* \
+    "$DEST/lib/pkgconfig" \
     "$DEST/include" \
     "$DEST/share" \
     "$DEST/bin/idle3"* \

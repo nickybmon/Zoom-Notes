@@ -87,24 +87,6 @@ xcodebuild -exportArchive \
     | grep -E "^(error:|Export|\/\/)" || true
 echo "  ✓ Export complete: $APP_PATH"
 
-# ── 2b. Re-sign bundled Python runtime ────────────────────────────────────────
-echo "▶ Step 2b/5: Re-signing bundled Python runtime…"
-PYTHON_RUNTIME="$APP_PATH/Contents/Frameworks/python-runtime"
-if [ -d "$PYTHON_RUNTIME" ]; then
-    # Sign all dylibs and .so files first (inside-out order required by codesign)
-    find "$PYTHON_RUNTIME" \( -name "*.dylib" -o -name "*.so" \) | while read f; do
-        codesign --force --sign "Developer ID Application: Nick Blackmon (AJC82Q6789)" \
-            --timestamp --options runtime "$f" 2>/dev/null || true
-    done
-    # Sign the main executable
-    codesign --force --sign "Developer ID Application: Nick Blackmon (AJC82Q6789)" \
-        --timestamp --options runtime \
-        "$PYTHON_RUNTIME/bin/python3.12"
-    echo "  ✓ Python runtime re-signed"
-else
-    echo "  ⚠ python-runtime not found in exported app — skipping"
-fi
-
 # ── 3. Verify signature ────────────────────────────────────────────────────────
 echo "▶ Step 3/5: Verifying signature…"
 codesign --verify --deep --strict --verbose=1 "$APP_PATH" 2>&1 | grep -v "^$" || true

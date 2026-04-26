@@ -340,9 +340,9 @@ class EngineManager: ObservableObject {
 
     private func findPythonExecutable() -> String? {
         // Priority 1: Bundled Python inside the app bundle (distribution builds).
-        // Lives at Contents/Frameworks/python-runtime/bin/python3.12
-        if let frameworksPath = Bundle.main.privateFrameworksPath {
-            let bundled = "\(frameworksPath)/python-runtime/bin/python3.12"
+        // Lives at Contents/Resources/python-runtime/bin/python3.12
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundled = "\(resourcePath)/python-runtime/bin/python3.12"
             if FileManager.default.fileExists(atPath: bundled) {
                 log("[EngineManager] Using bundled Python: \(bundled)", level: .info)
                 return bundled
