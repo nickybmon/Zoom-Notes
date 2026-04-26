@@ -46,6 +46,24 @@
 			shellPath = /bin/sh;
 			shellScript = "cp \"$SRCROOT/../zoom_engine.py\" \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/\"\ncp \"$SRCROOT/../zoom_notes.py\" \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/\"\ncp \"$SRCROOT/../zoom_config.py\" \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/\"\n";
 		};
+		DD001A2B3F4E5D6A7B8C9D0E /* Copy Bundled Python */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy Bundled Python";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "RUNTIME=\"$SRCROOT/../python-runtime\"\nDEST=\"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Frameworks/python-runtime\"\nif [ -d \"$RUNTIME\" ]; then\n  mkdir -p \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Frameworks\"\n  rm -rf \"$DEST\"\n  cp -R \"$RUNTIME\" \"$DEST\"\n  echo \"Bundled Python copied to $DEST\"\nelse\n  echo \"warning: python-runtime/ not found — run scripts/fetch-python-runtime.sh first\"\nfi\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -172,7 +190,8 @@
 				45AFA5734CAA4F7BB19E91F8 /* Frameworks */,
 				150285C7CE98471D99475363 /* Sources */,
 				13D9ACF489054155AFAD6317 /* Resources */,
-				2248DF812F9E91ED00136050 /* CopyFiles */,
+				2248DF812F9E91ED00136050 /* Copy Python Engine */,
+				DD001A2B3F4E5D6A7B8C9D0E /* Copy Bundled Python */,
 			);
 			buildRules = (
 			);

@@ -30,3 +30,7 @@ build/
 rw.*.dmg
 scripts/dmg-assets/background.png
 scripts/dmg-assets/background@2x.png
+
+# Bundled Python runtime (fetched by scripts/fetch-python-runtime.sh)
+python-runtime/
+scripts/dmg-assets/background@2x.png

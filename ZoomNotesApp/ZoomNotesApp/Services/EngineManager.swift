@@ -339,12 +339,21 @@ class EngineManager: ObservableObject {
     }
 
     private func findPythonExecutable() -> String? {
-        // Venv Python first (guaranteed version match)
+        // Priority 1: Bundled Python inside the app bundle (distribution builds).
+        // Lives at Contents/Frameworks/python-runtime/bin/python3.12
+        if let frameworksPath = Bundle.main.privateFrameworksPath {
+            let bundled = "\(frameworksPath)/python-runtime/bin/python3.12"
+            if FileManager.default.fileExists(atPath: bundled) {
+                log("[EngineManager] Using bundled Python: \(bundled)", level: .info)
+                return bundled
+            }
+        }
+        // Priority 2: Venv Python (dev builds)
         if let venv = findVenvPath() {
             let p = "\(venv)/bin/python"
             if FileManager.default.fileExists(atPath: p) { return p }
         }
-        // Homebrew Python 3.x (3.10+ required for X | Y type syntax)
+        // Priority 3: Homebrew Python 3.x (3.10+ required for X | Y type syntax)
         let brewCandidates = [
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",
@@ -352,7 +361,7 @@ class EngineManager: ObservableObject {
         for p in brewCandidates where FileManager.default.fileExists(atPath: p) {
             return p
         }
-        // System Python — macOS ships 3.9 which is too old; last resort only
+        // Priority 4: System Python — macOS ships 3.9 which is too old; last resort only
         let system = "/usr/bin/python3"
         if FileManager.default.fileExists(atPath: system) { return system }
         return nil
