@@ -14,6 +14,9 @@ class AppState: ObservableObject {
     @Published var engineState: EngineState = .idle
     @Published var engineError: String?
     @Published var isEngineRunning = false
+    /// True only after the startup grace period — prevents false "Engine offline"
+    /// warnings in Settings during the first few seconds of launch.
+    @Published var engineStartupSettled = false
 
     // Last completed meeting (for menu bar "Last saved" item)
     @Published var lastSavedTitle: String?
@@ -45,6 +48,11 @@ class AppState: ObservableObject {
         Task.detached(priority: .userInitiated) { [engineManager] in
             engineManager.startEngine()
         }
+        // Give the engine 15 seconds to come up before showing "offline" warnings
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            engineStartupSettled = true
+        }
     }
 
     func stopEngine() {
@@ -56,6 +64,7 @@ class AppState: ObservableObject {
     private func handleEngineEvent(_ event: EngineEvent) {
         switch event.event {
         case "ready":
+            engineStartupSettled = true
             // One-shot setup status from the engine. Surface a clear error if
             // Zoom isn't detected so the user knows what to fix.
             if event.zoomInstalled == false {
@@ -64,6 +73,7 @@ class AppState: ObservableObject {
                 engineError = nil
             }
         case "state":
+            engineStartupSettled = true
             engineState = EngineState(event.value)
         case "done":
             engineState = .idle

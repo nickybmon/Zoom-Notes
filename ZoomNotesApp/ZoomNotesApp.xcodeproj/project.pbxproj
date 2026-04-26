@@ -7,34 +7,63 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		3DF7BCFF7AEC473082CEDE8B /* EngineManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 774355B5E45A4EC5A111B5E9 /* EngineManager.swift */; };
 		42144784ED474F2B8F213543 /* ZoomNotesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */; };
-		FAA1C7777ADF438699CBA9FA /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6130797C4374F2C976E6C4F /* AppDelegate.swift */; };
 		4C473AB599AD4A0BACCE47CC /* EngineEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */; };
 		613CDE9688CC4E24999EA3A5 /* ZoomNotesConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */; };
-		3DF7BCFF7AEC473082CEDE8B /* EngineManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 774355B5E45A4EC5A111B5E9 /* EngineManager.swift */; };
-		E30EC9958F804EEA80C7451E /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCA0395A524F4199B538C4DC /* AppState.swift */; };
 		7E0809FC065443D89EB7B56D /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */; };
-		B615248E7BF448B6BC9B2B71 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DB50904A4BE41479F7842DD /* SettingsView.swift */; };
-		FFE75F14EB7542ED88A9F190 /* ConsoleLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */; };
 		9914EEFBBEB4461C93111F49 /* Permissions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 106E8FBA69014803B7E19772 /* Permissions.swift */; };
+		B615248E7BF448B6BC9B2B71 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DB50904A4BE41479F7842DD /* SettingsView.swift */; };
+		CC001A2B3F4E5D6A7B8C9D0E /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC001A1B3F4E5D6A7B8C9D0E /* OnboardingView.swift */; };
+		E30EC9958F804EEA80C7451E /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCA0395A524F4199B538C4DC /* AppState.swift */; };
 		F7804AB366A4422ABE2CA0AF /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 666DDC72BA4A4BCD93768505 /* Assets.xcassets */; };
+		FAA1C7777ADF438699CBA9FA /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6130797C4374F2C976E6C4F /* AppDelegate.swift */; };
+		FFE75F14EB7542ED88A9F190 /* ConsoleLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		2248DF812F9E91ED00136050 /* Copy Python Engine */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../zoom_engine.py",
+				"$(SRCROOT)/../zoom_notes.py",
+				"$(SRCROOT)/../zoom_config.py",
+			);
+			name = "Copy Python Engine";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/zoom_engine.py",
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/zoom_notes.py",
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/zoom_config.py",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "cp \"$SRCROOT/../zoom_engine.py\" \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/\"\ncp \"$SRCROOT/../zoom_notes.py\" \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/\"\ncp \"$SRCROOT/../zoom_config.py\" \"$BUILT_PRODUCTS_DIR/$PRODUCT_NAME.app/Contents/Resources/\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXFileReference section */
-		8795DFDC08FB47268DF78CC0 /* ZoomNotesApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZoomNotesApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoomNotesApp.swift; sourceTree = "<group>"; };
-		C6130797C4374F2C976E6C4F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
-		9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
-		5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoomNotesConfig.swift; sourceTree = "<group>"; };
-		774355B5E45A4EC5A111B5E9 /* EngineManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineManager.swift; sourceTree = "<group>"; };
-		CCA0395A524F4199B538C4DC /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewModel.swift; sourceTree = "<group>"; };
-		2DB50904A4BE41479F7842DD /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
-		302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleLogger.swift; sourceTree = "<group>"; };
 		106E8FBA69014803B7E19772 /* Permissions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Permissions.swift; sourceTree = "<group>"; };
-		666DDC72BA4A4BCD93768505 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoomNotesApp.swift; sourceTree = "<group>"; };
+		2DB50904A4BE41479F7842DD /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		CC001A1B3F4E5D6A7B8C9D0E /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleLogger.swift; sourceTree = "<group>"; };
 		355A5744F77E4FBEB42D1309 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoomNotesConfig.swift; sourceTree = "<group>"; };
 		65808EC146A24232ABD83746 /* ZoomNotesApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ZoomNotesApp.entitlements; sourceTree = "<group>"; };
+		666DDC72BA4A4BCD93768505 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		774355B5E45A4EC5A111B5E9 /* EngineManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineManager.swift; sourceTree = "<group>"; };
+		8795DFDC08FB47268DF78CC0 /* ZoomNotesApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = ZoomNotesApp.app; path = "Zoom Notes.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
+		C6130797C4374F2C976E6C4F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		CCA0395A524F4199B538C4DC /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,20 +77,13 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		B4BC73955A75422194226B9D /* ZoomNotesApp */ = {
+		0108ECBD6A9D4BD0974D8047 /* ViewModels */ = {
 			isa = PBXGroup;
 			children = (
-				28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */,
-				C6130797C4374F2C976E6C4F /* AppDelegate.swift */,
-				65808EC146A24232ABD83746 /* ZoomNotesApp.entitlements */,
-				39E7F8C48C55421087E79A08 /* Models */,
-				7F285D81B3BD422788A2AF7B /* Services */,
-				0108ECBD6A9D4BD0974D8047 /* ViewModels */,
-				88BAE6961F634930A7ED8C13 /* Views */,
-				3F7D6D71513E40A98CC85E7B /* Utilities */,
-				8D2E997AF28144B691A2385C /* Resources */,
+				CCA0395A524F4199B538C4DC /* AppState.swift */,
+				0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */,
 			);
-			path = ZoomNotesApp;
+			path = ViewModels;
 			sourceTree = "<group>";
 		};
 		367B11A419FC4E16824A0316 /* Products */ = {
@@ -81,6 +103,15 @@
 			path = Models;
 			sourceTree = "<group>";
 		};
+		3F7D6D71513E40A98CC85E7B /* Utilities */ = {
+			isa = PBXGroup;
+			children = (
+				302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */,
+				106E8FBA69014803B7E19772 /* Permissions.swift */,
+			);
+			path = Utilities;
+			sourceTree = "<group>";
+		};
 		7F285D81B3BD422788A2AF7B /* Services */ = {
 			isa = PBXGroup;
 			children = (
@@ -89,30 +120,13 @@
 			path = Services;
 			sourceTree = "<group>";
 		};
-		0108ECBD6A9D4BD0974D8047 /* ViewModels */ = {
-			isa = PBXGroup;
-			children = (
-				CCA0395A524F4199B538C4DC /* AppState.swift */,
-				0AE8ED78256A4A82852D7BF4 /* SettingsViewModel.swift */,
-			);
-			path = ViewModels;
-			sourceTree = "<group>";
-		};
 		88BAE6961F634930A7ED8C13 /* Views */ = {
 			isa = PBXGroup;
 			children = (
 				2DB50904A4BE41479F7842DD /* SettingsView.swift */,
+				CC001A1B3F4E5D6A7B8C9D0E /* OnboardingView.swift */,
 			);
 			path = Views;
-			sourceTree = "<group>";
-		};
-		3F7D6D71513E40A98CC85E7B /* Utilities */ = {
-			isa = PBXGroup;
-			children = (
-				302DA049B11C46FFBA74AFDC /* ConsoleLogger.swift */,
-				106E8FBA69014803B7E19772 /* Permissions.swift */,
-			);
-			path = Utilities;
 			sourceTree = "<group>";
 		};
 		8D2E997AF28144B691A2385C /* Resources */ = {
@@ -132,6 +146,22 @@
 			);
 			sourceTree = "<group>";
 		};
+		B4BC73955A75422194226B9D /* ZoomNotesApp */ = {
+			isa = PBXGroup;
+			children = (
+				28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */,
+				C6130797C4374F2C976E6C4F /* AppDelegate.swift */,
+				65808EC146A24232ABD83746 /* ZoomNotesApp.entitlements */,
+				39E7F8C48C55421087E79A08 /* Models */,
+				7F285D81B3BD422788A2AF7B /* Services */,
+				0108ECBD6A9D4BD0974D8047 /* ViewModels */,
+				88BAE6961F634930A7ED8C13 /* Views */,
+				3F7D6D71513E40A98CC85E7B /* Utilities */,
+				8D2E997AF28144B691A2385C /* Resources */,
+			);
+			path = ZoomNotesApp;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -142,6 +172,7 @@
 				45AFA5734CAA4F7BB19E91F8 /* Frameworks */,
 				150285C7CE98471D99475363 /* Sources */,
 				13D9ACF489054155AFAD6317 /* Resources */,
+				2248DF812F9E91ED00136050 /* CopyFiles */,
 			);
 			buildRules = (
 			);
@@ -209,6 +240,7 @@
 				E30EC9958F804EEA80C7451E /* AppState.swift in Sources */,
 				7E0809FC065443D89EB7B56D /* SettingsViewModel.swift in Sources */,
 				B615248E7BF448B6BC9B2B71 /* SettingsView.swift in Sources */,
+				CC001A2B3F4E5D6A7B8C9D0E /* OnboardingView.swift in Sources */,
 				FFE75F14EB7542ED88A9F190 /* ConsoleLogger.swift in Sources */,
 				9914EEFBBEB4461C93111F49 /* Permissions.swift in Sources */,
 			);
@@ -252,11 +284,11 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu17;
-				GCC_DYNAMIC_NO_PIC = NO;
+			ENABLE_STRICT_OBJC_MSGSEND = YES;
+			ENABLE_TESTABILITY = YES;
+			ENABLE_USER_SCRIPT_SANDBOXING = NO;
+			GCC_C_LANGUAGE_STANDARD = gnu17;
+			GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -315,10 +347,10 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				ENABLE_NS_ASSERTIONS = NO;
-				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu17;
+			ENABLE_NS_ASSERTIONS = NO;
+			ENABLE_STRICT_OBJC_MSGSEND = YES;
+			ENABLE_USER_SCRIPT_SANDBOXING = NO;
+			GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
@@ -341,11 +373,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ZoomNotesApp/ZoomNotesApp.entitlements;
+				CODE_SIGN_IDENTITY = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = AJC82Q6789;
-				CODE_SIGN_IDENTITY = "Developer ID Application";
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ZoomNotesApp/Resources/Info.plist;
@@ -372,11 +404,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ZoomNotesApp/ZoomNotesApp.entitlements;
+				CODE_SIGN_IDENTITY = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = AJC82Q6789;
-				CODE_SIGN_IDENTITY = "Developer ID Application";
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ZoomNotesApp/Resources/Info.plist;
@@ -419,7 +451,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
 	};
 	rootObject = 0A79358C754D44A892D55F39 /* Project object */;
 }

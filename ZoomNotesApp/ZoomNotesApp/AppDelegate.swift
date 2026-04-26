@@ -17,9 +17,10 @@ import Combine
 import UserNotifications
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency UNUserNotificationCenterDelegate {
     var statusBarItem: NSStatusItem?
     var settingsWindow: NSWindow?
+    var onboardingWindow: NSWindow?
 
     let appState = AppState()
     private var cancellables = Set<AnyCancellable>()
@@ -37,7 +38,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         requestNotificationPermission()
         setupMenuBar()
         observeAppState()
-        showPrivacyDisclaimerIfNeeded()
+        showOnboardingIfNeeded()
 
         appState.startEngine()
 
@@ -259,6 +260,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         NSApplication.shared.terminate(nil)
     }
 
+    // MARK: - Onboarding
+
+    private static let onboardingKey = "hasCompletedOnboarding.v1"
+
+    private func showOnboardingIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Self.onboardingKey) else { return }
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 580),
+            styleMask: [.titled, .closable, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = ""
+        panel.titlebarAppearsTransparent = true
+        panel.animationBehavior = .alertPanel
+        panel.isFloatingPanel = false
+        panel.delegate = self
+        panel.contentView = NSHostingView(
+            rootView: OnboardingView(
+                onOpenSettings: { [weak self] in
+                    self?.dismissOnboarding()
+                    self?.showSettings()
+                },
+                onDismiss: { [weak self] in
+                    self?.dismissOnboarding()
+                }
+            )
+        )
+        onboardingWindow = panel
+
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func dismissOnboarding() {
+        UserDefaults.standard.set(true, forKey: Self.onboardingKey)
+        onboardingWindow?.close()
+        onboardingWindow = nil
+        NSApp.setActivationPolicy(.accessory)
+    }
+
     // MARK: - Privacy disclaimer
 
     private static let privacyDisclaimerKey = "hasSeenPrivacyDisclaimer.v1"
@@ -298,11 +343,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     // MARK: - NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
-        if let w = notification.object as? NSWindow, w === settingsWindow {
+        guard let w = notification.object as? NSWindow else { return }
+        if w === settingsWindow {
             settingsWindow = nil
-            // Restore accessory policy so the app disappears from the Dock.
-            // Engine reload is handled by SettingsViewModel.saveConfig()'s onSave
-            // callback — don't re-trigger here (would race the in-flight restart).
+            NSApp.setActivationPolicy(.accessory)
+        } else if w === onboardingWindow {
+            // Closed via red X — treat as dismiss
+            UserDefaults.standard.set(true, forKey: Self.onboardingKey)
+            onboardingWindow = nil
             NSApp.setActivationPolicy(.accessory)
         }
     }

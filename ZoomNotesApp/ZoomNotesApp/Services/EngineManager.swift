@@ -133,6 +133,10 @@ class EngineManager: ObservableObject {
         }
         env["PATH"] = pathParts.joined(separator: ":") + ":" + (env["PATH"] ?? "")
 
+        // Ensure the script's directory is on sys.path so zoom_config / zoom_notes imports resolve
+        let scriptDir = URL(fileURLWithPath: scriptPath).deletingLastPathComponent().path
+        env["PYTHONPATH"] = scriptDir + ":" + (env["PYTHONPATH"] ?? "")
+
         // Inject API keys from Keychain so Python never needs to call `security`
         // (avoids repeated keychain permission prompts for the python/security binaries)
         let keyMap: [(account: String, envVar: String)] = [
@@ -266,7 +270,17 @@ class EngineManager: ObservableObject {
     // MARK: - Path discovery
 
     private func findProjectRoot() -> URL? {
-        // Strategy 1: Walk up from app bundle looking for zoom_engine.py
+        // Strategy 1: Inside the app bundle's Resources folder (distribution builds).
+        // zoom_engine.py is copied here via a "Copy Files" Xcode build phase.
+        if let resourcePath = Bundle.main.resourcePath {
+            let resourceURL = URL(fileURLWithPath: resourcePath)
+            if FileManager.default.fileExists(atPath: resourceURL.appendingPathComponent("zoom_engine.py").path) {
+                return resourceURL
+            }
+        }
+
+        // Strategy 2: Walk up from app bundle looking for zoom_engine.py (dev builds
+        // where the app sits inside the repo directory).
         var url = URL(fileURLWithPath: Bundle.main.bundlePath)
         for _ in 0..<12 {
             if FileManager.default.fileExists(atPath: url.appendingPathComponent("zoom_engine.py").path) {
@@ -277,7 +291,7 @@ class EngineManager: ObservableObject {
             url = parent
         }
 
-        // Strategy 2: Walk up from source file (development builds)
+        // Strategy 3: Walk up from source file (Xcode direct-run builds)
         var src = URL(fileURLWithPath: #file)
         for _ in 0..<8 {
             src = src.deletingLastPathComponent()
@@ -286,7 +300,7 @@ class EngineManager: ObservableObject {
             }
         }
 
-        // Strategy 3: Known repo location
+        // Strategy 4: Known repo location (last resort for dev machines)
         let known = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents/Cursor/Zoom Meeting Notes Assistant")
         if FileManager.default.fileExists(atPath: known.appendingPathComponent("zoom_engine.py").path) {
@@ -308,27 +322,22 @@ class EngineManager: ObservableObject {
     }
 
     private func findPythonExecutable() -> String? {
+        // Venv Python first (guaranteed version match)
         if let venv = findVenvPath() {
             let p = "\(venv)/bin/python"
             if FileManager.default.fileExists(atPath: p) { return p }
         }
-        // System Python
+        // Homebrew Python 3.x (3.10+ required for X | Y type syntax)
+        let brewCandidates = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ]
+        for p in brewCandidates where FileManager.default.fileExists(atPath: p) {
+            return p
+        }
+        // System Python — macOS ships 3.9 which is too old; last resort only
         let system = "/usr/bin/python3"
         if FileManager.default.fileExists(atPath: system) { return system }
-        // `which python3`
-        let task = Process()
-        task.launchPath = "/usr/bin/which"
-        task.arguments = ["python3"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        try? task.run()
-        task.waitUntilExit()
-        if task.terminationStatus == 0,
-           let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-               .trimmingCharacters(in: .whitespacesAndNewlines),
-           !path.isEmpty {
-            return path
-        }
         return nil
     }
 }

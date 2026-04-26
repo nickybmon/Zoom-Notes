@@ -49,7 +49,7 @@ struct SettingsView: View {
 
                 Spacer()
 
-                if !appState.isEngineRunning {
+                if appState.engineStartupSettled && !appState.isEngineRunning {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
                         Text("Engine offline").font(.caption2).foregroundColor(.secondary)

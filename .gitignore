@@ -23,3 +23,9 @@ xcuserdata/
 
 # Agent / scratch artifacts
 tmp/agent/
+
+# Release artifacts (built, not committed)
+build/
+*.dmg
+rw.*.dmg
+scripts/dmg-assets/background.png
