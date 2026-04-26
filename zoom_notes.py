@@ -69,7 +69,7 @@ def find_wal(origin: Path, db_prefix: str) -> Path | None:
     for db_dir in idb_dir.iterdir():
         if db_dir.name.startswith(db_prefix):
             wal = db_dir / "IndexedDB.sqlite3-wal"
-            if wal.exists() and wal.stat().st_size > 1024:
+            if wal.exists() and wal.stat().st_size > 256:
                 candidates.append(wal)
     if not candidates:
         return None
@@ -107,15 +107,116 @@ def count_meeting_ids(wal_path: Path) -> dict[str, int]:
     return counts
 
 
-def detect_active_meeting_id(wal_path: Path) -> str | None:
-    """Return the meetingId that appears most frequently in the WAL.
+def score_meeting_ids(wal_path: Path) -> dict[str, float]:
+    """Score each meetingId using entry count, recency, and speaker presence.
 
-    When multiple meetings are stored in the same WAL (e.g. a meeting you were
-    invited to but didn't attend alongside one you did), the one you were
-    actually in will have far more transcript entries.
+    Weights:
+    - Base: 1 point per WAL entry
+    - Recency bonus: +50 if any entry has a timestamp within 2 hours of now
+    - Speaker bonus: +1000 if ZOOM_NOTES_USER_NAME matches a speaker in the meeting
+
+    Returns {meetingId: score}. Use max(scores, key=scores.get) to pick best.
     """
-    counts = count_meeting_ids(wal_path)
-    return max(counts, key=lambda k: counts[k]) if counts else None
+    user_name = os.environ.get("ZOOM_NOTES_USER_NAME", "").strip().lower()
+    lines = read_wal_strings(wal_path)
+
+    meeting_data: dict[str, dict] = {}
+    now_hms = datetime.now().strftime("%H:%M:%S")
+    try:
+        now_secs = sum(int(x) * m for x, m in zip(now_hms.split(":"), [3600, 60, 1]))
+    except ValueError:
+        now_secs = 0
+    _2h_secs = 2 * 3600
+
+    i = 0
+    while i < len(lines):
+        if lines[i] == "meetingId" and i + 1 < len(lines):
+            mid = lines[i + 1]
+            if mid and len(mid) > 8:
+                if mid not in meeting_data:
+                    meeting_data[mid] = {"count": 0, "has_recent": False, "has_user": False}
+                meeting_data[mid]["count"] += 1
+                for back in range(i - 1, max(i - 60, -1), -1):
+                    if lines[back] == "timeStampContent" and back + 1 < len(lines):
+                        try:
+                            ts_secs = sum(int(x) * m for x, m in zip(lines[back + 1].split(":"), [3600, 60, 1]))
+                            if abs(now_secs - ts_secs) <= _2h_secs:
+                                meeting_data[mid]["has_recent"] = True
+                        except (ValueError, AttributeError):
+                            pass
+                    elif lines[back] == "username" and back + 1 < len(lines):
+                        if user_name and lines[back + 1].strip().lower() == user_name:
+                            meeting_data[mid]["has_user"] = True
+        i += 1
+
+    scores: dict[str, float] = {}
+    for mid, data in meeting_data.items():
+        score = float(data["count"])
+        if data["has_recent"]:
+            score += 50
+        if data["has_user"]:
+            score += 1000
+        scores[mid] = score
+    return scores
+
+
+def detect_active_meeting_id(wal_path: Path) -> str | None:
+    """Return the best-scoring meetingId from the WAL.
+
+    Uses score_meeting_ids() which factors in entry count, timestamp recency,
+    and whether ZOOM_NOTES_USER_NAME appears as a speaker — preventing a
+    ghost/double-booked meeting from crowding out the one you actually attended.
+    """
+    scores = score_meeting_ids(wal_path)
+    return max(scores, key=lambda k: scores[k]) if scores else None
+
+
+# ── Transcript persistence ─────────────────────────────────────────────────────
+
+_CACHE_DIR = Path.home() / ".cache" / "zoom-notes"
+
+
+def persist_accumulator(meeting_id: str, entries: dict) -> None:
+    """Write the current accumulator snapshot to ~/.cache/zoom-notes/in-progress-{id}.json."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _CACHE_DIR / f"in-progress-{meeting_id}.json"
+        path.write_text(json.dumps(list(entries.values()), ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_persisted_accumulator(meeting_id: str) -> dict | None:
+    """Load a previously persisted accumulator snapshot keyed by msg_id."""
+    path = _CACHE_DIR / f"in-progress-{meeting_id}.json"
+    if not path.exists():
+        return None
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        return {e["msg_id"]: e for e in entries if "msg_id" in e}
+    except Exception:
+        return None
+
+
+def delete_persisted_accumulator(meeting_id: str) -> None:
+    """Remove the in-progress snapshot after successful note generation."""
+    try:
+        (_CACHE_DIR / f"in-progress-{meeting_id}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def purge_stale_accumulators(max_age_secs: int = 4 * 3600) -> None:
+    """Delete in-progress cache files older than max_age_secs (default 4h)."""
+    if not _CACHE_DIR.exists():
+        return
+    now = time.time()
+    for f in _CACHE_DIR.glob("in-progress-*.json"):
+        try:
+            if now - f.stat().st_mtime > max_age_secs:
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _sanitize_speaker(name: str) -> str:

@@ -67,6 +67,10 @@ from zoom_notes import (
     save_note,
     slugify_title,
     detect_active_meeting_id,
+    persist_accumulator,
+    load_persisted_accumulator,
+    delete_persisted_accumulator,
+    purge_stale_accumulators,
 )
 
 
@@ -117,6 +121,19 @@ class ZoomEngine:
         # meeting ends — the post-meeting WAL still contains the same entries,
         # so we'd otherwise re-summarize the same conversation.
         self._last_generated_meeting_id: str | None = None
+
+        # Accumulated transcript entries keyed by msg_id. Populated on every
+        # poll tick so a WAL checkpoint can't lose data already read.
+        self._accumulated: dict[str, dict] = {}
+        self._accumulated_lock = threading.Lock()
+
+        # Monotonic timestamp of when the WAL was last seen while ACTIVE.
+        # Set when the WAL disappears mid-meeting (Zoom checkpoint) so we can
+        # fire generation after idle_threshold even without the WAL present.
+        self._wal_gone_since: float | None = None
+
+        # Purge stale in-progress cache files left over from prior crashes.
+        purge_stale_accumulators()
 
         # Config (reloaded on SIGHUP or "reload" command)
         self._cfg_lock = threading.Lock()
@@ -231,10 +248,27 @@ class ZoomEngine:
 
         wal = find_wal(origin, cfg.transcript_db_prefix)
         if not wal:
-            if self._get_state() == EngineState.ACTIVE:
+            state = self._get_state()
+            if state == EngineState.ACTIVE:
+                with self._accumulated_lock:
+                    has_entries = bool(self._accumulated)
+                if has_entries:
+                    # WAL disappeared mid-meeting (Zoom checkpoint). Keep ACTIVE
+                    # and fire generation once the idle threshold elapses.
+                    if self._wal_gone_since is None:
+                        self._wal_gone_since = time.monotonic()
+                    idle_secs = time.monotonic() - self._wal_gone_since
+                    if idle_secs >= idle_threshold:
+                        self._wal_gone_since = None
+                        self._trigger_generate(origin, cfg)
+                    return
+                # No entries yet — WAL gone before we accumulated anything
+                self._wal_gone_since = None
                 self._set_state(EngineState.IDLE)
                 self._reset_tracking()
             return
+        # WAL present — reset the gone timer
+        self._wal_gone_since = None
 
         try:
             stat = wal.stat()
@@ -271,7 +305,35 @@ class ZoomEngine:
 
             if state == EngineState.IDLE:
                 self._write_tracking(meeting_id=meeting_id)
+                with self._accumulated_lock:
+                    self._accumulated = {}
                 self._set_state(EngineState.ACTIVE, meeting_id=meeting_id or "")
+
+            # Snapshot new entries into the accumulator on every change tick
+            try:
+                _, _, _, current_meeting_id = self._read_tracking()
+                fresh = parse_transcript(wal, meeting_id_filter=current_meeting_id)
+                with self._accumulated_lock:
+                    before = len(self._accumulated)
+                    for entry in fresh:
+                        mid_key = entry["msg_id"]
+                        if mid_key not in self._accumulated:
+                            self._accumulated[mid_key] = entry
+                        else:
+                            existing = self._accumulated[mid_key]
+                            if len(entry.get("message", "")) > len(existing.get("message", "")):
+                                existing["message"] = entry["message"]
+                            if entry.get("speaker") and entry["speaker"] != "Unknown":
+                                existing["speaker"] = entry["speaker"]
+                            if entry.get("timestamp"):
+                                existing["timestamp"] = entry["timestamp"]
+                    added = len(self._accumulated) - before
+                if added > 0 and current_meeting_id:
+                    with self._accumulated_lock:
+                        snapshot = dict(self._accumulated)
+                    persist_accumulator(current_meeting_id, snapshot)
+            except Exception:
+                pass
         else:
             if state == EngineState.ACTIVE and last_active_ts is not None:
                 idle_secs = now - last_active_ts
@@ -326,6 +388,12 @@ class ZoomEngine:
                 # Remember which meeting we just summarized so we don't
                 # re-summarize it if Zoom mutates the WAL on checkpoint.
                 self._last_generated_meeting_id = processing_meeting_id
+                # Clean up the in-memory accumulator and persisted disk snapshot.
+                with self._accumulated_lock:
+                    self._accumulated = {}
+                if processing_meeting_id:
+                    delete_persisted_accumulator(processing_meeting_id)
+                self._wal_gone_since = None
                 # Anchor tracking to the WAL state we just consumed. We must
                 # NOT reset to None — that would make the next poll see the
                 # unchanged WAL as "new", flip back to ACTIVE, idle out, and
@@ -351,19 +419,19 @@ class ZoomEngine:
                     self._reset_tracking()
             except concurrent.futures.TimeoutError:
                 emit({"event": "error", "message": "Note generation timed out — try again"})
-                # Best-effort cancel; the underlying urllib call may still
-                # finish on its own. Don't block on it.
                 future.cancel()
                 self._write_tracking(
                     mtime=saved_mtime, size=saved_size,
                     active_ts=None, meeting_id=None,
                 )
+                self._wal_gone_since = None
             except Exception as exc:
                 emit({"event": "error", "message": _friendly_error(exc)})
                 self._write_tracking(
                     mtime=saved_mtime, size=saved_size,
                     active_ts=None, meeting_id=None,
                 )
+                self._wal_gone_since = None
             finally:
                 executor.shutdown(wait=False)
                 self._generating_lock.release()
@@ -375,11 +443,26 @@ class ZoomEngine:
         transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
         blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
 
-        if not transcript_wal:
+        _, _, _, active_meeting_id = self._read_tracking()
+
+        # Try the in-memory accumulator first (most up-to-date).
+        with self._accumulated_lock:
+            acc_snapshot = dict(self._accumulated)
+
+        if acc_snapshot:
+            entries = sorted(acc_snapshot.values(), key=lambda e: e.get("timestamp") or "")
+        elif transcript_wal:
+            entries = parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
+        elif active_meeting_id:
+            # Process was restarted mid-meeting — try the persisted disk snapshot.
+            persisted = load_persisted_accumulator(active_meeting_id)
+            entries = sorted(persisted.values(), key=lambda e: e.get("timestamp") or "") if persisted else []
+        else:
+            entries = []
+
+        if not transcript_wal and not entries:
             raise RuntimeError("Transcript WAL not found during generation.")
 
-        _, _, _, active_meeting_id = self._read_tracking()
-        entries = parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
         if not entries:
             raise RuntimeError("No transcript entries found.")
 
