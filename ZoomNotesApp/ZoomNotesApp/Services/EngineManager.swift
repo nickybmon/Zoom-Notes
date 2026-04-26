@@ -99,9 +99,9 @@ class EngineManager: ObservableObject {
     private func spawnEngine() {
         guard let pythonPath = findPythonExecutable() else {
             DispatchQueue.main.async {
-                self.error = "Python executable not found. Run: python3 -m venv venv && ./venv/bin/pip install -r requirements.txt"
+                self.error = "Python 3.10+ is required. Install it with: brew install python3"
             }
-            log("[EngineManager] ERROR: Python not found", level: .error)
+            log("[EngineManager] ERROR: Python 3.10+ not found", level: .error)
             return
         }
 
@@ -221,7 +221,10 @@ class EngineManager: ObservableObject {
                         self.spawnEngine()
                     }
                 } else if status != 0 {
-                    // Unexpected crash — back off and retry.
+                    // If the engine died instantly, check if Python is too old
+                    if uptime < 2 && self.restartCount == 0 {
+                        self.checkPythonVersion(at: pythonPath)
+                    }
                     self.scheduleRestart()
                 } else {
                     // Clean exit we didn't ask for — surface it but don't loop.
@@ -252,10 +255,24 @@ class EngineManager: ObservableObject {
         }
     }
 
+    private func checkPythonVersion(at pythonPath: String) {
+        let task = Process()
+        task.launchPath = pythonPath
+        task.arguments = ["-c", "import sys; v=sys.version_info; exit(0 if v>=(3,10) else 1)"]
+        try? task.run()
+        task.waitUntilExit()
+        if task.terminationStatus != 0 {
+            DispatchQueue.main.async {
+                self.error = "Python 3.10+ is required but an older version was found. Install it with: brew install python3"
+            }
+            log("[EngineManager] Python version too old at \(pythonPath)", level: .error)
+        }
+    }
+
     private func scheduleRestart() {
         guard restartCount < maxRestarts else {
             DispatchQueue.main.async {
-                self.error = "Engine crashed \(self.maxRestarts) times — not restarting. Check logs."
+                self.error = "Engine failed to start. Check that Python 3.10+ is installed (brew install python3) and open logs for details."
             }
             return
         }
