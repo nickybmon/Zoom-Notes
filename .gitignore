@@ -29,3 +29,4 @@ build/
 *.dmg
 rw.*.dmg
 scripts/dmg-assets/background.png
+scripts/dmg-assets/background@2x.png

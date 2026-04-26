@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DMG Background — Export</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #08080a;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Render at exact 1320 x 800 (660pt @2x) — no scrollbars, no chrome. */
+  #dmg {
+    width: 1320px;
+    height: 800px;
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+  /* base background — matches the welcome-screen palette */
+  #dmg::before {
+    content: "";
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(120% 80% at 22% 50%, rgba(59,130,246,0.08), transparent 55%),
+      radial-gradient(100% 70% at 80% 65%, rgba(80,90,120,0.10), transparent 60%),
+      linear-gradient(180deg, #0d0e12 0%, #0a0a0c 60%, #07070a 100%);
+    z-index: 0;
+  }
+  .dot-texture {
+    position: absolute; inset: 0;
+    background-image: radial-gradient(rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 18px 18px;
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  /* headline up top */
+  .headline {
+    position: absolute;
+    left: 50%;
+    top: 78px;
+    transform: translateX(-50%);
+    text-align: center;
+    z-index: 2;
+    color: #e8e9ef;
+  }
+  .headline .step {
+    display: inline-block;
+    margin-bottom: 14px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.18);
+    color: #93b8ff;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  .headline .h {
+    margin: 0;
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .headline .h .accent { color: #93b8ff; }
+  .headline .sub {
+    margin-top: 10px;
+    font-size: 15px;
+    color: #9498a4;
+    font-weight: 400;
+  }
+
+  /* labels under each slot — exact same horizontal positions as the
+     icons that the DMG window will drop on top */
+  .label {
+    position: absolute;
+    top: calc(50% + 150px); /* sits below the icon area */
+    transform: translateX(-50%);
+    color: #9498a4;
+    font-size: 14px;
+    letter-spacing: 0.01em;
+    z-index: 2;
+    text-align: center;
+  }
+  .label.app  { left: 25%; }
+  .label.apps { left: 75%; }
+
+  /* arrow between slots */
+  .arrow-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  @keyframes flow { to { stroke-dashoffset: -40; } }
+  .flowline {
+    stroke-dasharray: 6 8;
+    animation: flow 2s linear infinite;
+  }
+  /* Static export uses no animation — toggled via .static class on body */
+  body.static .flowline { animation: none; }
+
+  /* Tiny floating capture button — hidden when ?clean=1 */
+  .toolbar {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 9;
+    display: flex;
+    gap: 8px;
+    font-family: inherit;
+  }
+  .toolbar button {
+    appearance: none;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(20,20,24,0.9);
+    color: #e8e9ef;
+    font-size: 12px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+  }
+  .toolbar button:hover { background: rgba(40,40,48,0.95); }
+  body.clean .toolbar { display: none; }
+</style>
+</head>
+<body>
+
+<div id="dmg">
+  <div class="dot-texture"></div>
+
+  <div class="headline">
+    <div class="step">Install</div>
+    <div class="h">Drag <span class="accent">Zoom Notes</span> into Applications</div>
+    <div class="sub">That's it. The app will be ready in your Applications folder.</div>
+  </div>
+
+  <!-- arrow -->
+  <svg class="arrow-svg" viewBox="0 0 1320 800" preserveAspectRatio="none">
+    <defs>
+      <marker id="ah-b" viewBox="0 0 12 12" refX="10" refY="6"
+              markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+        <path d="M0,0 L12,6 L0,12 Z" fill="#3b82f6" />
+      </marker>
+      <linearGradient id="line-b" x1="0" x2="1" y1="0" y2="0">
+        <stop offset="0%"  stop-color="#3b82f6" stop-opacity="0.15"/>
+        <stop offset="40%" stop-color="#3b82f6" stop-opacity="0.85"/>
+        <stop offset="100%" stop-color="#3b82f6" stop-opacity="1"/>
+      </linearGradient>
+    </defs>
+
+    <!-- soft track -->
+    <path d="M 430 400 Q 660 360 890 400"
+          fill="none"
+          stroke="rgba(59,130,246,0.12)"
+          stroke-width="14"
+          stroke-linecap="round" />
+
+    <!-- animated dashes -->
+    <path d="M 430 400 Q 660 360 890 400"
+          fill="none"
+          stroke="url(#line-b)"
+          stroke-width="3"
+          stroke-linecap="round"
+          class="flowline"
+          marker-end="url(#ah-b)" />
+  </svg>
+
+  <!-- labels -->
+  <div class="label app">Zoom Notes</div>
+  <div class="label apps">Applications</div>
+</div>
+
+<div class="toolbar">
+  <button id="dl1x">Download 1× (660×400)</button>
+  <button id="dl2x">Download 2× (1320×800)</button>
+</div>
+
+<script>
+  // The page is the export. ?clean=1 hides the toolbar.
+  if (location.search.includes('clean=1')) {
+    document.body.classList.add('clean', 'static');
+  }
+
+  // Quick client-side PNG export — renders the #dmg DOM via SVG foreignObject.
+  // Works for static dashed lines (animation pauses on capture frame).
+  async function exportPng(scale, filename) {
+    const dmg = document.getElementById('dmg');
+    const W = 1320, H = 800;
+
+    // Clone with all computed styles inlined so foreignObject renders correctly.
+    const clone = dmg.cloneNode(true);
+    inlineStyles(dmg, clone);
+
+    const xml = new XMLSerializer().serializeToString(clone);
+    const svg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${W*scale}" height="${H*scale}" viewBox="0 0 ${W} ${H}">
+        <foreignObject width="100%" height="100%">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="width:${W}px;height:${H}px;">${xml}</div>
+        </foreignObject>
+      </svg>`;
+
+    const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W * scale;
+    canvas.height = H * scale;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, W*scale, H*scale);
+    URL.revokeObjectURL(url);
+
+    canvas.toBlob((b) => {
+      const a = document.createElement('a');
+      a.download = filename;
+      a.href = URL.createObjectURL(b);
+      a.click();
+    }, 'image/png');
+  }
+
+  function inlineStyles(srcRoot, dstRoot) {
+    const srcs = [srcRoot, ...srcRoot.querySelectorAll('*')];
+    const dsts = [dstRoot, ...dstRoot.querySelectorAll('*')];
+    for (let i = 0; i < srcs.length; i++) {
+      const cs = getComputedStyle(srcs[i]);
+      let s = '';
+      for (let p = 0; p < cs.length; p++) {
+        const k = cs[p];
+        s += `${k}:${cs.getPropertyValue(k)};`;
+      }
+      dsts[i].setAttribute('style', s);
+    }
+  }
+
+  document.getElementById('dl1x').addEventListener('click', () =>
+    exportPng(1, 'background.png'));
+  document.getElementById('dl2x').addEventListener('click', () =>
+    exportPng(2, 'background@2x.png'));
+</script>
+
+</body>
+</html>

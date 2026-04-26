@@ -106,30 +106,34 @@ echo "  ✓ Notarization and stapling complete"
 # ── 5. Build DMG ───────────────────────────────────────────────────────────────
 echo "▶ Step 5/5: Building DMG…"
 
-if ! command -v create-dmg &> /dev/null; then
-    echo "  ✗ create-dmg not found. Run: brew install create-dmg"
+if ! command -v appdmg &> /dev/null; then
+    echo "  ✗ appdmg not found. Run: npm install -g appdmg"
     exit 1
 fi
 
-ICNS="$REPO_ROOT/ZoomNotesApp/ZoomNotesApp/Resources/AppIcon.icns"
+BG="$REPO_ROOT/scripts/dmg-assets/background.png"
+if [ ! -f "$BG" ]; then
+    echo "  ✗ Background image not found at scripts/dmg-assets/background.png"
+    echo "    Open scripts/dmg-assets/DMG Background Export.html and export it first."
+    exit 1
+fi
 
-# Regenerate background image
-swift "$REPO_ROOT/scripts/make-dmg-background.swift" \
-    "$REPO_ROOT/scripts/dmg-assets/background.png"
+cat > "$BUILD_DIR/appdmg.json" <<APPDMG
+{
+  "title": "$APP_NAME",
+  "icon": "$REPO_ROOT/ZoomNotesApp/ZoomNotesApp/Resources/AppIcon.icns",
+  "background": "$BG",
+  "icon-size": 100,
+  "window": { "size": { "width": 660, "height": 400 } },
+  "contents": [
+    { "x": 165, "y": 200, "type": "file", "path": "$APP_PATH" },
+    { "x": 495, "y": 200, "type": "link", "path": "/Applications" }
+  ],
+  "format": "UDZO"
+}
+APPDMG
 
-create-dmg \
-    --volname "$APP_NAME" \
-    --volicon "$ICNS" \
-    --background "$REPO_ROOT/scripts/dmg-assets/background.png" \
-    --window-pos 200 120 \
-    --window-size 660 400 \
-    --icon-size 120 \
-    --icon "$APP_NAME.app" 180 200 \
-    --hide-extension "$APP_NAME.app" \
-    --app-drop-link 480 200 \
-    --no-internet-enable \
-    "$DMG_PATH" \
-    "$APP_PATH"
+appdmg "$BUILD_DIR/appdmg.json" "$DMG_PATH"
 
 echo ""
 echo "✅ Done! DMG ready at:"

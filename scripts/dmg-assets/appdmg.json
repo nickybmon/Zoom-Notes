@@ -1,0 +1,14 @@
+{
+  "title": "Zoom Notes",
+  "icon": "../../ZoomNotesApp/ZoomNotesApp/Resources/AppIcon.icns",
+  "background": "background.png",
+  "icon-size": 100,
+  "window": {
+    "size": { "width": 660, "height": 400 }
+  },
+  "contents": [
+    { "x": 165, "y": 200, "type": "file", "path": "../../build/export/Zoom Notes.app" },
+    { "x": 495, "y": 200, "type": "link", "path": "/Applications" }
+  ],
+  "format": "UDZO"
+}
