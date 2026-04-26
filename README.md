@@ -111,32 +111,40 @@ If you need local-only processing, configure **Ollama** as the provider in Setti
 
 ## Requirements
 
-- macOS 13+
-- Python 3.10+ (system Python is fine)
-- Zoom desktop app with **My Notes** (AI Notetaker) enabled
+- macOS 13 (Ventura) or later
+- Zoom desktop app with **My Notes** (AI Companion / AI Notetaker) enabled
 - API key for your chosen LLM provider (or Ollama installed locally)
+
+No Python install required — Python 3.12 is bundled inside the app.
 
 ---
 
-## Setup
+## Installation
+
+1. **[Download the latest release](https://github.com/nickybmon/Zoom-Meeting-Assistant/releases/latest)** (`Zoom Notes-1.0.dmg`)
+2. Open the DMG and drag **Zoom Notes** into your Applications folder
+3. Launch the app — a menu bar icon appears
+4. On first launch, an onboarding window walks you through setup:
+   - Click **Open Settings** to configure your API key
+   - Pick your LLM provider in the **API / LLM** tab
+   - Paste your API key — stored in macOS Keychain, never written to disk
+   - Adjust output paths in the **Output** tab if needed (default: `~/Desktop/Meeting Notes/`)
+5. Start a Zoom meeting with My Notes enabled — the icon changes to "In Meeting" automatically
+
+### Building from source
 
 ```bash
-git clone https://github.com/YOUR_ORG/zoom-notes-assistant.git
-cd zoom-notes-assistant
+git clone https://github.com/nickybmon/Zoom-Meeting-Assistant.git
+cd Zoom-Meeting-Assistant
 
-# Optional: create a venv (the engine only uses stdlib, but Xcode looks for ./venv/bin/python first)
-python3 -m venv venv
+# Fetch the bundled Python runtime (arm64 + x86_64 universal)
+./scripts/fetch-python-runtime.sh
+
+# Open in Xcode and run, or build a release DMG:
+./scripts/release.sh
 ```
 
-Then open `ZoomNotesApp/ZoomNotesApp.xcodeproj` in Xcode and run.
-
-On first launch:
-1. Click the menu bar icon → **Settings…**
-2. Pick your LLM provider in the **API / LLM** tab
-3. Paste your API key — it's stored in macOS Keychain (no plaintext file)
-4. Configure output paths in the **Output** tab if you want to save somewhere other than `~/Desktop/Meeting Notes/`
-
-That's it. The engine starts polling Zoom's WAL automatically.
+`release.sh` requires Xcode command-line tools, a Developer ID Application certificate, and a stored `notarytool` keychain profile named `zoom-notes-notarytool`.
 
 ### Getting an API key
 
@@ -175,6 +183,7 @@ If you launch the engine outside the Swift app (e.g. for CLI debugging), the eng
 | `GEMINI_API_KEY` | Gemini key |
 | `ZOOM_NOTES_OUTPUT_DIR` | Override notes output directory |
 | `ZOOM_NOTES_TRANSCRIPTS_DIR` | Override transcripts output directory |
+| `ZOOM_NOTES_USER_NAME` | Your Zoom display name (exactly as it appears in meetings) — boosts the correct meeting when you're double-booked or in back-to-back meetings |
 
 ---
 
@@ -197,7 +206,7 @@ These commands read the same `settings.json` and Keychain entries the menu bar a
 ## Caveats
 
 - **Zoom updates may break this.** The WAL path and DB structure are internal implementation details — no stability guarantee. If detection stops working, update the WAL prefixes in Settings → Advanced.
-- The WAL is only present during an active meeting with My Notes enabled. After the meeting, Zoom checkpoints the WAL into the main DB and may delete it. The idle trigger is designed to capture it before that window closes.
+- After a meeting ends, Zoom checkpoints the WAL (deleting or shrinking it). The engine handles this by persisting accumulated transcript entries to `~/.cache/zoom-notes/` on every tick — notes are not lost even if the WAL disappears before the idle threshold fires.
 - The `<hash>` folder name appears stable per Zoom account but could change on re-login or app update. Run `python3 zoom_notes.py --list` to verify the path.
 - Transcription accuracy depends on Zoom's server-side ASR, not local processing.
 
@@ -210,6 +219,10 @@ ZoomNotesApp/                          # Swift/SwiftUI menu bar app (Xcode proje
 zoom_notes.py                          # Core: WAL discovery, transcript parsing, LLM calls, note writing
 zoom_engine.py                         # Headless WAL poller spawned by Swift; emits JSON events
 zoom_config.py                         # Settings + Keychain helpers (Python side)
+scripts/
+  release.sh                           # Full release pipeline: archive → sign → notarize → DMG
+  fetch-python-runtime.sh              # Downloads universal Python 3.12 into python-runtime/
+  dmg-assets/                          # DMG background image and appdmg config
 zoom-transcript-extraction.md          # Research: how the WAL was discovered and mapped
 CLAUDE.md                              # Project overview for AI coding assistants
 ```
