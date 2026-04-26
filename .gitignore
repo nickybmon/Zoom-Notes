@@ -1,8 +1,25 @@
+# Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+
+# macOS
 .DS_Store
+
+# Secrets / local config
 .env
-*.plist
 *.log
+
+# Xcode
+build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserstate
+xcuserdata/
+
+# Agent / scratch artifacts
+tmp/agent/

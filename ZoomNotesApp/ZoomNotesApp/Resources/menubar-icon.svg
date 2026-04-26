@@ -1,0 +1,45 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a2a2c"></stop>
+      <stop offset="100%" stop-color="#0e0e10"></stop>
+    </linearGradient>
+    
+    <radialGradient id="sheen" cx="50%" cy="-10%" r="70%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.10"></stop>
+      <stop offset="55%" stop-color="#ffffff" stop-opacity="0"></stop>
+    </radialGradient>
+    
+    <radialGradient id="vignette" cx="50%" cy="110%" r="90%">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.45"></stop>
+      <stop offset="55%" stop-color="#000000" stop-opacity="0"></stop>
+    </radialGradient>
+    
+    <clipPath id="squircle">
+      <path d="&#xA;        M 232 0&#xA;        L 792 0&#xA;        C 920 0 1024 104 1024 232&#xA;        L 1024 792&#xA;        C 1024 920 920 1024 792 1024&#xA;        L 232 1024&#xA;        C 104 1024 0 920 0 792&#xA;        L 0 232&#xA;        C 0 104 104 0 232 0&#xA;        Z"></path>
+    </clipPath>
+  </defs>
+
+  
+  <g clip-path="url(#squircle)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#tile)"></rect>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#sheen)"></rect>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#vignette)"></rect>
+  </g>
+
+  
+  <path d="&#xA;    M 232 1&#xA;    L 792 1&#xA;    C 920 1 1023 104 1023 232" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2"></path>
+
+  
+  <g fill="none" stroke="#ededed" stroke-width="51" stroke-linecap="round" stroke-linejoin="round">
+    
+    <path d="M 363 279 L 279 279 L 279 745 L 363 745"></path>
+    
+    <path d="M 661 279 L 745 279 L 745 745 L 661 745"></path>
+    
+    <line x1="410" y1="456" x2="614" y2="456"></line>
+    <line x1="410" y1="577" x2="540" y2="577"></line>
+  </g>
+</svg>

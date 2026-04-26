@@ -25,8 +25,11 @@ struct ZoomNotesConfig: Codable {
 
     var systemPrompt: String? = nil
 
+    var customFrontmatterProperties: [[String: String]] = []
+    var extraFrontmatterYaml: String = ""
+
     var pollIntervalSecs: Int = 5
-    var idleThresholdSecs: Int = 30
+    var idleThresholdSecs: Int = 90
 
     var transcriptDbPrefix: String = "1CB477F679D6"
     var blocksDbPrefix: String = "DDEC8414E29A"
@@ -44,6 +47,8 @@ struct ZoomNotesConfig: Codable {
         case filenamePattern = "filename_pattern"
         case transcriptFilenamePattern = "transcript_filename_pattern"
         case systemPrompt = "system_prompt"
+        case customFrontmatterProperties = "custom_frontmatter_properties"
+        case extraFrontmatterYaml = "extra_frontmatter_yaml"
         case pollIntervalSecs = "poll_interval_secs"
         case idleThresholdSecs = "idle_threshold_secs"
         case transcriptDbPrefix = "transcript_db_prefix"

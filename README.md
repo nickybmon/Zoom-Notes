@@ -1,6 +1,6 @@
 # Zoom Meeting Notes Assistant
 
-A macOS menu bar app that watches Zoom's AI Notetaker in real time, detects when a meeting ends, and automatically generates structured meeting notes via Claude — saved directly to your configured output directory (Obsidian vault, Desktop folder, or anywhere you like).
+A macOS menu bar app that watches Zoom's AI Notetaker in real time, detects when a meeting ends, and automatically generates structured meeting notes via Claude, OpenAI, Gemini, or Ollama — saved directly to your configured output directory (Obsidian vault, Desktop folder, or anywhere you like).
 
 No screen scraping. No network interception. Reads a local file Zoom already writes to your disk.
 
@@ -25,28 +25,34 @@ The WAL stores UTF-8 strings readable with `strings(1)` — no special permissio
 ```
 Zoom meeting starts
   → WAL file appears and grows
-  → Menu bar icon switches to ‖ (In Meeting)
+  → Menu bar icon switches to "In Meeting"
 
 Meeting ends
   → WAL stops changing
-  → After 30 seconds idle: icon switches to ↻ (Generating)
-  → Transcript is parsed, deduplicated, sent to Claude
+  → After idle threshold: icon switches to "Generating"
+  → Transcript is parsed, deduplicated, sent to your configured LLM
   → Structured notes saved to configured output directory
   → macOS notification fires
-  → Icon returns to ▶ (Idle)
+  → Icon returns to "Idle"
 ```
 
 ---
 
-## Menu bar states
+## Architecture
 
-| Icon | State | Meaning |
-|------|-------|---------|
-| `▶` | Idle | No active meeting detected |
-| `‖` | In Meeting | WAL is actively changing |
-| `↻` | Generating | Claude summarization in flight |
+A native Swift/SwiftUI menu bar app spawns a headless Python engine as a child process. The Python engine watches the WAL and emits newline-delimited JSON events; the Swift app renders state and handles user-facing concerns.
 
-The menu also has a **Generate Notes Now** item for manual trigger, and a **Quit** item.
+```
+ZoomNotesApp (Swift)         zoom_engine.py (Python)
+┌──────────────────┐         ┌─────────────────────┐
+│ Menu bar         │ stdout  │ WAL poll loop       │
+│ Settings UI      │◄────────│ Idle detection      │
+│ Notifications    │ stdin   │ LLM summarization   │
+│ Keychain         │────────►│ Note writing        │
+└──────────────────┘         └─────────────────────┘
+```
+
+API keys live exclusively in the macOS Keychain (service `zoom-notes-assistant`). The Swift app reads them and injects them into the Python engine's environment at launch — no key files on disk.
 
 ---
 
@@ -89,121 +95,110 @@ daily_note: "[[Daily/2026-04-21]]"
 
 ### Obsidian integration
 
-If you use Obsidian, point `ZOOM_NOTES_OUTPUT_DIR` and `ZOOM_NOTES_TRANSCRIPTS_DIR` at your vault's meetings folder. The frontmatter format (`source: zoom-notes`, wikilink-style `transcript` and `daily_note` fields) is compatible with Obsidian companion plugins for attendee resolution and daily note breadcrumbs.
+If you use Obsidian, point the Notes and Transcripts folders at your vault's meetings folder via Settings → Output. The frontmatter format (`source: zoom-notes`, wikilink-style `transcript` and `daily_note` fields) is compatible with Obsidian companion plugins for attendee resolution and daily note breadcrumbs.
 
-A common setup: clone this repo into `YourVault/Scripts/zoom-notes/` and set the output dirs to `YourVault/Meetings/Notes` and `YourVault/Meetings/Transcripts`.
+A common setup: clone this repo into `YourVault/Scripts/zoom-notes/` and configure the output dirs to `YourVault/Meetings/Notes` and `YourVault/Meetings/Transcripts`.
+
+---
+
+## Privacy
+
+This app sends full meeting transcripts (including any sensitive personnel, legal, or commercial content) to whatever LLM provider you configure. By default that's Anthropic.
+
+If you need local-only processing, configure **Ollama** as the provider in Settings → API / LLM. Ollama runs entirely on your machine and never sends transcripts to a third party.
 
 ---
 
 ## Requirements
 
-- macOS (Apple Silicon or Intel)
-- Python 3.10+
+- macOS 13+
+- Python 3.10+ (system Python is fine)
 - Zoom desktop app with **My Notes** (AI Notetaker) enabled
-- Anthropic API key (see below)
-
----
-
-## Getting the API key
-
-This tool uses Claude (Anthropic) to summarize transcripts. You need an `ANTHROPIC_API_KEY` to run it.
-
-- **Webflow team members:** get the shared key from the team 1Password vault (search "Zoom Notes Assistant").
-- **External users:** create your own key at [console.anthropic.com](https://console.anthropic.com/). A spend limit is recommended.
+- API key for your chosen LLM provider (or Ollama installed locally)
 
 ---
 
 ## Setup
 
 ```bash
-# Clone the repo (or drop it into your Obsidian vault's Scripts folder)
 git clone https://github.com/YOUR_ORG/zoom-notes-assistant.git
 cd zoom-notes-assistant
 
-# Create virtualenv and install the one dependency
+# Optional: create a venv (the engine only uses stdlib, but Xcode looks for ./venv/bin/python first)
 python3 -m venv venv
-./venv/bin/pip install rumps
-
-# Configure your API key and (optionally) output paths
-cp .env.example .env
-# Open .env and paste your Anthropic API key
 ```
 
-`.env` is gitignored — your key will never be accidentally committed.
+Then open `ZoomNotesApp/ZoomNotesApp.xcodeproj` in Xcode and run.
 
----
+On first launch:
+1. Click the menu bar icon → **Settings…**
+2. Pick your LLM provider in the **API / LLM** tab
+3. Paste your API key — it's stored in macOS Keychain (no plaintext file)
+4. Configure output paths in the **Output** tab if you want to save somewhere other than `~/Desktop/Meeting Notes/`
 
-## Running
+That's it. The engine starts polling Zoom's WAL automatically.
 
-### Menu bar app
+### Getting an API key
 
-```bash
-./venv/bin/python3 zoom_menu_bar.py
-```
+| Provider | Where |
+|---|---|
+| Claude (Anthropic) | [console.anthropic.com](https://console.anthropic.com/) |
+| OpenAI | [platform.openai.com](https://platform.openai.com/) |
+| Gemini (Google) | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| Ollama (local) | [ollama.com](https://ollama.com/) — no key required |
 
-The `▶` icon appears in your menu bar. Works automatically from there.
-
-### Auto-launch at login
-
-```bash
-# Write the launchd plist and print activation instructions
-./venv/bin/python3 zoom_menu_bar.py --install-login-item
-
-# Activate immediately (no reboot needed)
-launchctl load ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
-```
-
-Logs go to `~/Library/Logs/zoom-notes.log` and `zoom-notes-error.log`.
-
-To remove:
-```bash
-launchctl unload ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
-rm ~/Library/LaunchAgents/com.webflow.zoom-notes-assistant.plist
-```
-
-### CLI tools (zoom_notes.py)
-
-```bash
-./venv/bin/python3 zoom_notes.py --list      # Detect meetings in current WAL
-./venv/bin/python3 zoom_notes.py --dump      # Print full transcript to stdout
-./venv/bin/python3 zoom_notes.py --watch     # Live-follow transcript during a meeting
-./venv/bin/python3 zoom_notes.py --notes     # Generate and save notes now
-./venv/bin/python3 zoom_notes.py --notes --dry-run  # Preview without saving
-```
+A spend limit is recommended for paid providers.
 
 ---
 
 ## Configuration
 
-**Via `.env`** (recommended — set once, survives restarts):
+All settings are managed through the in-app Settings window. They persist to:
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | — | Your Anthropic API key |
-| `ZOOM_NOTES_OUTPUT_DIR` | No | `~/Desktop/Meeting Notes/Notes` | Where note files are saved |
-| `ZOOM_NOTES_TRANSCRIPTS_DIR` | No | `~/Desktop/Meeting Notes/Transcripts` | Where transcript files are saved |
-| `ZOOM_NOTES_API_URL` | No | Anthropic direct | Override to route through a proxy (see below) |
+- **`~/Library/Application Support/zoom-notes/settings.json`** — non-sensitive preferences
+- **macOS Keychain** (service `zoom-notes-assistant`) — API keys
 
-**Code constants** (edit `zoom_notes.py` / `zoom_menu_bar.py` directly):
+Tabs:
+- **API / LLM** — provider, model, API key, connection test
+- **Output** — notes/transcripts directories, subfolder pattern, filename pattern, custom frontmatter
+- **Prompt** — system prompt customization
+- **Advanced** — poll interval, idle threshold, WAL DB prefixes, base URL overrides
 
-| File | Constant | Default | Description |
-|------|----------|---------|-------------|
-| `zoom_menu_bar.py` | `POLL_INTERVAL_SECS` | `5` | How often to check the WAL |
-| `zoom_menu_bar.py` | `IDLE_THRESHOLD_SECS` | `30` | Seconds of WAL inactivity before triggering |
-| `zoom_notes.py` | `TRANSCRIPT_DB_PREFIX` | `1CB477F679D6` | IndexedDB folder prefix for transcript store |
-| `zoom_notes.py` | `BLOCKS_DB_PREFIX` | `DDEC8414E29A` | IndexedDB folder prefix for title/blocks store |
+### Environment variable overrides (optional)
 
-### Proxy support (future)
+If you launch the engine outside the Swift app (e.g. for CLI debugging), the engine still reads these env vars as fallbacks if Keychain is empty:
 
-The API call is designed to be routable through an internal proxy. When a proxy endpoint is available, set `ZOOM_NOTES_API_URL` in `.env` to your proxy URL — nothing else changes. The proxy receives the transcript and title, calls Claude server-side with a key that never touches user machines, and returns the summary. See the open issue for implementation details.
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude key |
+| `OPENAI_API_KEY` | OpenAI key |
+| `GEMINI_API_KEY` | Gemini key |
+| `ZOOM_NOTES_OUTPUT_DIR` | Override notes output directory |
+| `ZOOM_NOTES_TRANSCRIPTS_DIR` | Override transcripts output directory |
+
+---
+
+## CLI tools (debugging)
+
+`zoom_notes.py` is also runnable directly for inspecting WAL state:
+
+```bash
+./venv/bin/python3 zoom_notes.py --list                # Detect meetings in current WAL
+./venv/bin/python3 zoom_notes.py --dump                # Print full transcript to stdout
+./venv/bin/python3 zoom_notes.py --watch               # Live-follow transcript during a meeting
+./venv/bin/python3 zoom_notes.py --notes               # Generate and save notes now
+./venv/bin/python3 zoom_notes.py --notes --dry-run     # Preview without saving
+```
+
+These commands read the same `settings.json` and Keychain entries the menu bar app uses.
 
 ---
 
 ## Caveats
 
-- **Zoom updates may break this.** The WAL path and DB structure are internal implementation details — no stability guarantee.
-- The WAL is only present during an active meeting with My Notes enabled. After the meeting, Zoom checkpoints the WAL into the main DB and may delete it. The 30-second idle trigger is designed to capture it before that window closes.
-- The `<hash>` folder name appears stable per Zoom account but could change on re-login or app update. If detection stops working, run `--list` to verify the path.
+- **Zoom updates may break this.** The WAL path and DB structure are internal implementation details — no stability guarantee. If detection stops working, update the WAL prefixes in Settings → Advanced.
+- The WAL is only present during an active meeting with My Notes enabled. After the meeting, Zoom checkpoints the WAL into the main DB and may delete it. The idle trigger is designed to capture it before that window closes.
+- The `<hash>` folder name appears stable per Zoom account but could change on re-login or app update. Run `python3 zoom_notes.py --list` to verify the path.
 - Transcription accuracy depends on Zoom's server-side ASR, not local processing.
 
 ---
@@ -211,9 +206,10 @@ The API call is designed to be routable through an internal proxy. When a proxy 
 ## File structure
 
 ```
-zoom_notes.py           # Core: WAL discovery, transcript parsing, Claude API, note writing
-zoom_menu_bar.py        # Menu bar app: state machine, WAL poller, rumps UI
-.env.example            # Config template — copy to .env and add your API key
-.env                    # Your local config (gitignored — never committed)
-zoom-transcript-extraction.md  # Research: how the WAL was discovered and mapped
+ZoomNotesApp/                          # Swift/SwiftUI menu bar app (Xcode project)
+zoom_notes.py                          # Core: WAL discovery, transcript parsing, LLM calls, note writing
+zoom_engine.py                         # Headless WAL poller spawned by Swift; emits JSON events
+zoom_config.py                         # Settings + Keychain helpers (Python side)
+zoom-transcript-extraction.md          # Research: how the WAL was discovered and mapped
+CLAUDE.md                              # Project overview for AI coding assistants
 ```

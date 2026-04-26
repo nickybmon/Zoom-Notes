@@ -86,9 +86,20 @@ class ZoomNotesConfig:
     # Prompt (None = use DEFAULT_SYSTEM_PROMPT)
     system_prompt: str | None = None
 
-    # Polling / idle detection (used by zoom_menu_bar.py)
+    # Frontmatter customization
+    # List of {"key": "...", "value": "..."} dicts — appended to every note's frontmatter.
+    # Values support {title} and {date} tokens.
+    custom_frontmatter_properties: list = None  # type: ignore[assignment]
+    # Raw YAML string appended after structured properties (advanced).
+    extra_frontmatter_yaml: str = ""
+
+    def __post_init__(self):
+        if self.custom_frontmatter_properties is None:
+            self.custom_frontmatter_properties = []
+
+    # Polling / idle detection
     poll_interval_secs: int = 5
-    idle_threshold_secs: int = 30
+    idle_threshold_secs: int = 90
 
     # WAL prefixes (override if Zoom changes their IndexedDB hash)
     transcript_db_prefix: str = "1CB477F679D6"
@@ -142,12 +153,15 @@ _KEY_ENV_VARS = {
 }
 
 
+_SECURITY_BIN = "/usr/bin/security"
+
+
 def keychain_get(account: str) -> str | None:
     """Read a password from the macOS Keychain. Returns None if not found."""
     try:
         result = subprocess.run(
             [
-                "security", "find-generic-password",
+                _SECURITY_BIN, "find-generic-password",
                 "-s", _KEYCHAIN_SERVICE,
                 "-a", account,
                 "-w",
@@ -168,14 +182,13 @@ def keychain_set(account: str, value: str) -> bool:
     if not value:
         return keychain_delete(account)
     try:
-        # Try to update existing entry first
         result = subprocess.run(
             [
-                "security", "add-generic-password",
+                _SECURITY_BIN, "add-generic-password",
                 "-s", _KEYCHAIN_SERVICE,
                 "-a", account,
                 "-w", value,
-                "-U",  # update if exists
+                "-U",
             ],
             capture_output=True,
             text=True,
@@ -190,7 +203,7 @@ def keychain_delete(account: str) -> bool:
     try:
         result = subprocess.run(
             [
-                "security", "delete-generic-password",
+                _SECURITY_BIN, "delete-generic-password",
                 "-s", _KEYCHAIN_SERVICE,
                 "-a", account,
             ],
@@ -205,18 +218,23 @@ def keychain_delete(account: str) -> bool:
 def get_api_key(provider: str) -> str | None:
     """
     Return the API key for the given provider.
-    Priority: Keychain → env var (for backwards compat with .env / launchd plist).
+    Priority: env var (injected by Swift at launch) → Keychain CLI fallback.
+    Checking env first avoids calling the `security` binary, which triggers
+    repeated macOS keychain permission prompts when run from a subprocess.
     """
+    # Env var first — Swift EngineManager injects these from Keychain at launch
+    env_var = _KEY_ENV_VARS.get(provider)
+    if env_var:
+        val = os.environ.get(env_var)
+        if val:
+            return val
+
+    # Keychain CLI fallback (covers standalone / dev usage without Swift host)
     account = _KEY_ACCOUNTS.get(provider)
     if account:
         key = keychain_get(account)
         if key:
             return key
-
-    # Env var fallback (covers existing ANTHROPIC_API_KEY usage)
-    env_var = _KEY_ENV_VARS.get(provider)
-    if env_var:
-        return os.environ.get(env_var)
 
     return None
 
@@ -252,14 +270,19 @@ def load_config(force: bool = False) -> ZoomNotesConfig:
     else:
         cfg = ZoomNotesConfig()
 
-    # Env var overrides for paths (preserves ZOOM_NOTES_OUTPUT_DIR / ZOOM_NOTES_TRANSCRIPTS_DIR)
+    # Env var overrides for paths (preserves ZOOM_NOTES_OUTPUT_DIR / ZOOM_NOTES_TRANSCRIPTS_DIR
+    # for users who launch the engine from a CLI/launchd plist with these set).
+    # ZOOM_NOTES_API_URL is read directly by zoom_notes.summarize_with_claude;
+    # we don't need to copy it onto the config here.
     if val := os.environ.get("ZOOM_NOTES_OUTPUT_DIR"):
         cfg.notes_dir = val
     if val := os.environ.get("ZOOM_NOTES_TRANSCRIPTS_DIR"):
         cfg.transcripts_dir = val
-    if val := os.environ.get("ZOOM_NOTES_API_URL"):
-        # Legacy: if a proxy URL was set, treat as claude provider with custom base
-        cfg.openai_base_url = val  # stored for reference; callers handle routing
+
+    # L8 — defensive clamping so a malformed settings.json can't put the engine
+    # in a tight loop (poll_interval=0) or never trigger (idle_threshold=999999).
+    cfg.poll_interval_secs = max(1, min(cfg.poll_interval_secs, 300))
+    cfg.idle_threshold_secs = max(10, min(cfg.idle_threshold_secs, 600))
 
     _cached_config = cfg
     return cfg

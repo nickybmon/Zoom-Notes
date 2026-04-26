@@ -24,6 +24,13 @@ class EngineManager: ObservableObject {
     private var restartCount = 0
     private let maxRestarts = 5
 
+    /// Set to true when we're about to terminate the engine intentionally
+    /// (settings reload, app shutdown). The exit watcher consults this to
+    /// decide whether to auto-respawn — we still respawn after a settings
+    /// reload, but we DO NOT respawn after stopEngine() / app quit.
+    private var intentionalRestart = false
+    private var intentionalStop = false
+
     // MARK: - Public
 
     func startEngine() {
@@ -38,6 +45,7 @@ class EngineManager: ObservableObject {
     func stopEngine() {
         guard let proc = process else { return }
         log("[EngineManager] Stopping engine (PID \(proc.processIdentifier))", level: .info)
+        intentionalStop = true
         (proc.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         proc.terminate()
         DispatchQueue.global(qos: .utility).async {
@@ -63,11 +71,27 @@ class EngineManager: ObservableObject {
         try? stdin.fileHandleForWriting.write(contentsOf: data)
     }
 
-    /// Signal the engine to reload settings (SIGHUP).
-    func reloadSettings() {
-        guard let proc = process, proc.isRunning else { return }
-        kill(proc.processIdentifier, SIGHUP)
-        log("[EngineManager] Sent SIGHUP to engine (PID \(proc.processIdentifier))", level: .info)
+    /// Reload settings: SIGHUP for config-only changes, full restart when API keys may have changed.
+    /// A full restart is required after key changes because the API keys are
+    /// injected into the engine's environment at spawn time — SIGHUP only
+    /// invalidates the Python config cache, not the env vars.
+    func reloadSettings(restartForNewKeys: Bool = true) {
+        guard let proc = process, proc.isRunning else {
+            // Engine isn't running at all — start it instead of failing silently.
+            log("[EngineManager] reloadSettings() called but engine isn't running — spawning", level: .info)
+            spawnEngine()
+            return
+        }
+        if restartForNewKeys {
+            log("[EngineManager] Restarting engine to pick up new API keys", level: .info)
+            intentionalRestart = true
+            proc.terminate()
+            // The waitUntilExit() watcher in spawnEngine() will see
+            // intentionalRestart==true and re-spawn after the process dies.
+        } else {
+            kill(proc.processIdentifier, SIGHUP)
+            log("[EngineManager] Sent SIGHUP to engine (PID \(proc.processIdentifier))", level: .info)
+        }
     }
 
     // MARK: - Private
@@ -108,6 +132,20 @@ class EngineManager: ObservableObject {
             pathParts.append(brew)
         }
         env["PATH"] = pathParts.joined(separator: ":") + ":" + (env["PATH"] ?? "")
+
+        // Inject API keys from Keychain so Python never needs to call `security`
+        // (avoids repeated keychain permission prompts for the python/security binaries)
+        let keyMap: [(account: String, envVar: String)] = [
+            ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+            ("openai_api_key",    "OPENAI_API_KEY"),
+            ("gemini_api_key",    "GEMINI_API_KEY"),
+        ]
+        for pair in keyMap {
+            if let key = keychainGet(account: pair.account), !key.isEmpty {
+                env[pair.envVar] = key
+            }
+        }
+
         proc.environment = env
 
         let stdoutPipe = Pipe()
@@ -135,26 +173,58 @@ class EngineManager: ObservableObject {
             do {
                 try proc.run()
                 log("[EngineManager] Engine started, PID \(proc.processIdentifier)", level: .info)
+                let startedAt = Date()
                 DispatchQueue.main.async {
                     self.process = proc
                     self.isRunning = true
                     self.error = nil
-                    self.restartCount = 0
+                    // Don't reset restartCount yet — only do it if the engine
+                    // stays up for at least `healthyUptimeSecs`. Otherwise a
+                    // flapping process would reset the counter on every spawn
+                    // and restart forever.
                 }
 
-                // Monitor for unexpected exit
+                // Schedule the "you've stayed up long enough" reset.
+                let healthyUptimeSecs: TimeInterval = 60
+                DispatchQueue.main.asyncAfter(deadline: .now() + healthyUptimeSecs) { [weak self] in
+                    guard let self = self else { return }
+                    if self.process === proc && proc.isRunning {
+                        self.restartCount = 0
+                        log("[EngineManager] Engine stable for \(Int(healthyUptimeSecs))s — restart counter reset", level: .debug)
+                    }
+                }
+
                 proc.waitUntilExit()
                 let status = proc.terminationStatus
-                log("[EngineManager] Engine exited with status \(status)", level: status == 0 ? .info : .error)
+                let uptime = Date().timeIntervalSince(startedAt)
+                log("[EngineManager] Engine exited with status \(status) after \(Int(uptime))s", level: status == 0 ? .info : .error)
 
                 DispatchQueue.main.async {
                     self.isRunning = false
                     self.process = nil
                 }
 
-                // Auto-restart on crash (not on clean exit or SIGTERM)
-                if status != 0 && proc.terminationReason != .uncaughtSignal {
+                // Decide what to do about the exit.
+                if self.intentionalStop {
+                    // App is shutting down or user explicitly stopped — do nothing.
+                    self.intentionalStop = false
+                    log("[EngineManager] Exit was intentional (stopEngine) — not restarting", level: .debug)
+                } else if self.intentionalRestart {
+                    // Settings reload requested a restart — respawn immediately.
+                    self.intentionalRestart = false
+                    log("[EngineManager] Exit was intentional (reloadSettings) — respawning", level: .info)
+                    DispatchQueue.main.async {
+                        self.spawnEngine()
+                    }
+                } else if status != 0 {
+                    // Unexpected crash — back off and retry.
                     self.scheduleRestart()
+                } else {
+                    // Clean exit we didn't ask for — surface it but don't loop.
+                    log("[EngineManager] Engine exited cleanly without being asked — not restarting", level: .warning)
+                    DispatchQueue.main.async {
+                        self.error = "Engine exited unexpectedly. Reopen Settings or restart the app to recover."
+                    }
                 }
             } catch {
                 log("[EngineManager] Failed to launch engine: \(error.localizedDescription)", level: .error)

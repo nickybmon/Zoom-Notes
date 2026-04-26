@@ -27,6 +27,7 @@ private let navItems: [NavItem] = [
 // MARK: - Root view
 
 struct SettingsView: View {
+    var onSave: (() -> Void)? = nil
     @StateObject private var vm = SettingsViewModel()
     @EnvironmentObject var appState: AppState
     @State private var selectedTab: String = "llm"
@@ -100,7 +101,10 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 640, idealWidth: 640, minHeight: 560, idealHeight: 600)
-        .task { await vm.loadConfig() }
+        .task {
+            vm.onSave = onSave
+            await vm.loadConfig()
+        }
     }
 }
 
@@ -160,23 +164,32 @@ private struct LLMTab: View {
             Section("Model") {
                 switch vm.config.llmProvider {
                 case "claude":
-                    Picker("Model", selection: $vm.config.llmModel) {
-                        Text("Claude Opus 4.5").tag("claude-opus-4-5")
-                        Text("Claude Sonnet 4.6 (recommended)").tag("claude-sonnet-4-6")
-                        Text("Claude Haiku 4.5 (fastest)").tag("claude-haiku-4-5")
-                    }
+                    ModelPicker(
+                        selection: $vm.config.llmModel,
+                        knownModels: [
+                            ("claude-opus-4-5", "Claude Opus 4.5"),
+                            ("claude-sonnet-4-6", "Claude Sonnet 4.6 (recommended)"),
+                            ("claude-haiku-4-5", "Claude Haiku 4.5 (fastest)"),
+                        ]
+                    )
                 case "openai":
-                    Picker("Model", selection: $vm.config.llmModel) {
-                        Text("GPT-4o (recommended)").tag("gpt-4o")
-                        Text("GPT-4o mini").tag("gpt-4o-mini")
-                        Text("o1").tag("o1")
-                        Text("o3-mini").tag("o3-mini")
-                    }
+                    ModelPicker(
+                        selection: $vm.config.llmModel,
+                        knownModels: [
+                            ("gpt-4o", "GPT-4o (recommended)"),
+                            ("gpt-4o-mini", "GPT-4o mini"),
+                            ("o1", "o1"),
+                            ("o3-mini", "o3-mini"),
+                        ]
+                    )
                 case "gemini":
-                    Picker("Model", selection: $vm.config.llmModel) {
-                        Text("Gemini 2.0 Flash (recommended)").tag("gemini-2.0-flash")
-                        Text("Gemini 1.5 Pro").tag("gemini-1.5-pro")
-                    }
+                    ModelPicker(
+                        selection: $vm.config.llmModel,
+                        knownModels: [
+                            ("gemini-2.0-flash", "Gemini 2.0 Flash (recommended)"),
+                            ("gemini-1.5-pro", "Gemini 1.5 Pro"),
+                        ]
+                    )
                 case "ollama":
                     if vm.ollamaModels.isEmpty {
                         HStack {
@@ -206,7 +219,7 @@ private struct LLMTab: View {
                 case "claude":
                     SecureField("Anthropic API Key", text: $vm.claudeApiKey)
                         .help("Get your key at console.anthropic.com")
-                    Text("Stored securely in macOS Keychain. Leave blank to use ANTHROPIC_API_KEY env var.")
+                    Text("Stored securely in macOS Keychain.")
                         .font(.caption).foregroundColor(.secondary)
                 case "openai":
                     SecureField("OpenAI API Key", text: $vm.openaiApiKey)
@@ -216,7 +229,7 @@ private struct LLMTab: View {
                 case "gemini":
                     SecureField("Gemini API Key", text: $vm.geminiApiKey)
                         .help("Get your key at aistudio.google.com/apikey")
-                    Text("Stored securely in macOS Keychain. Leave blank to use GEMINI_API_KEY env var.")
+                    Text("Stored securely in macOS Keychain.")
                         .font(.caption).foregroundColor(.secondary)
                 case "ollama":
                     HStack(spacing: 6) {
@@ -256,6 +269,61 @@ private struct LLMTab: View {
         case "gemini":  return "gemini-2.0-flash"
         case "ollama":  return ""
         default:        return ""
+        }
+    }
+}
+
+/// A model picker that falls back to a free-text field when the user wants to
+/// type a model id we don't know about — avoids requiring an app release every
+/// time a provider ships a new model.
+private struct ModelPicker: View {
+    @Binding var selection: String
+    let knownModels: [(id: String, label: String)]
+
+    @State private var useCustom = false
+    @State private var customValue: String = ""
+
+    var body: some View {
+        Group {
+            if useCustom {
+                HStack {
+                    TextField("Model id", text: Binding(
+                        get: { customValue },
+                        set: {
+                            customValue = $0
+                            selection = $0
+                        }
+                    ))
+                    .font(.system(.body, design: .monospaced))
+                    Button("Use list") {
+                        useCustom = false
+                        if let first = knownModels.first {
+                            selection = first.id
+                        }
+                    }
+                    .font(.caption)
+                }
+            } else {
+                HStack {
+                    Picker("Model", selection: $selection) {
+                        ForEach(knownModels, id: \.id) { entry in
+                            Text(entry.label).tag(entry.id)
+                        }
+                    }
+                    Button("Custom…") {
+                        customValue = selection
+                        useCustom = true
+                    }
+                    .font(.caption)
+                }
+            }
+        }
+        .onAppear {
+            // If the saved model id isn't in our list, start in custom mode.
+            if !knownModels.contains(where: { $0.id == selection }) && !selection.isEmpty {
+                customValue = selection
+                useCustom = true
+            }
         }
     }
 }
@@ -300,6 +368,10 @@ private struct OutputTab: View {
                     .help("Tokens: {title} = meeting title   {date} = YYYY-MM-DD")
                 Text("{title} = meeting title   {date} = YYYY-MM-DD")
                     .font(.caption).foregroundColor(.secondary)
+            }
+
+            Section("Frontmatter") {
+                FrontmatterPropertiesSection(vm: vm)
             }
         }
         .formStyle(.grouped)
@@ -364,13 +436,34 @@ Output only the meeting notes. No preamble, no explanation, no meta-commentary.
 
     private var promptBinding: Binding<String> {
         Binding(
-            get: { vm.config.systemPrompt ?? "" },
-            set: { vm.config.systemPrompt = $0.isEmpty ? nil : $0 }
+            get: { vm.config.systemPrompt ?? Self.defaultPrompt },
+            set: {
+                vm.config.systemPrompt = ($0 == Self.defaultPrompt || $0.isEmpty) ? nil : $0
+            }
         )
     }
 
     var body: some View {
         Form {
+            Section {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "lock.shield")
+                        .foregroundColor(.secondary)
+                        .font(.system(size: 14))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Where your transcripts go")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("Full meeting transcripts are sent to your configured LLM provider (Claude, OpenAI, or Gemini) for summarization. For local-only processing, switch to Ollama in the API / LLM tab.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.vertical, 2)
+            } header: {
+                Text("Privacy")
+            }
+
             Section {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Customize the instructions Claude/OpenAI/Gemini/Ollama receives when generating notes. Leave blank to use the built-in default prompt.")
@@ -398,7 +491,9 @@ Output only the meeting notes. No preamble, no explanation, no meta-commentary.
         }
         .formStyle(.grouped)
         .alert("Reset to Default Prompt?", isPresented: $showingResetAlert) {
-            Button("Reset", role: .destructive) { vm.config.systemPrompt = nil }
+            Button("Reset", role: .destructive) {
+                vm.config.systemPrompt = nil  // nil = use Python default
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This will replace your custom prompt with the built-in default.")
@@ -421,11 +516,11 @@ private struct AdvancedTab: View {
                     Text("15 seconds").tag(15)
                 }
                 Picker("Idle threshold", selection: $vm.config.idleThresholdSecs) {
-                    Text("15 seconds").tag(15)
-                    Text("30 seconds (default)").tag(30)
+                    Text("30 seconds").tag(30)
                     Text("60 seconds").tag(60)
-                    Text("90 seconds").tag(90)
+                    Text("90 seconds (default)").tag(90)
                     Text("120 seconds").tag(120)
+                    Text("180 seconds").tag(180)
                 }
                 Text("Notes are generated after the transcript WAL is idle for this long.")
                     .font(.caption).foregroundColor(.secondary)
@@ -460,6 +555,129 @@ private struct AdvancedTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+// MARK: - Frontmatter Properties Section
+
+private struct FrontmatterPropertyRow: Identifiable {
+    let id: UUID
+    var key: String
+    var value: String
+
+    init(key: String = "", value: String = "") {
+        self.id = UUID()
+        self.key = key
+        self.value = value
+    }
+
+    init(from dict: [String: String]) {
+        self.id = UUID()
+        self.key = dict["key"] ?? ""
+        self.value = dict["value"] ?? ""
+    }
+
+    var asDict: [String: String] { ["key": key, "value": value] }
+}
+
+private struct FrontmatterPropertiesSection: View {
+    @ObservedObject var vm: SettingsViewModel
+    @State private var rows: [FrontmatterPropertyRow] = []
+    @State private var showRawYaml = false
+
+    private var extraYaml: Binding<String> {
+        Binding(
+            get: { vm.config.extraFrontmatterYaml },
+            set: { vm.config.extraFrontmatterYaml = $0 }
+        )
+    }
+
+    private func syncToConfig() {
+        vm.config.customFrontmatterProperties = rows.map(\.asDict)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Custom properties added to every note's YAML frontmatter.")
+                .font(.caption).foregroundColor(.secondary)
+
+            ForEach($rows) { $row in
+                HStack(spacing: 6) {
+                    TextField("key", text: $row.key)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .frame(width: 120)
+                        .onChange(of: row.key) { _ in syncToConfig() }
+
+                    Text(":").foregroundColor(.secondary).font(.system(size: 12))
+
+                    TextField("value", text: $row.value)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .onChange(of: row.value) { _ in syncToConfig() }
+
+                    Menu {
+                        Button("{title}") { row.value += "{title}"; syncToConfig() }
+                        Button("{date}")  { row.value += "{date}";  syncToConfig() }
+                    } label: {
+                        Image(systemName: "chevron.down.circle")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .frame(width: 20)
+                    .help("Insert token")
+
+                    Button {
+                        rows.removeAll { $0.id == row.id }
+                        syncToConfig()
+                    } label: {
+                        Image(systemName: "minus.circle.fill")
+                            .foregroundColor(.red)
+                            .font(.system(size: 13))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Button {
+                rows.append(FrontmatterPropertyRow())
+                syncToConfig()
+            } label: {
+                Label("Add property", systemImage: "plus.circle")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.accentColor)
+
+            Text("Tokens: {title} = meeting title   {date} = YYYY-MM-DD")
+                .font(.system(size: 10)).foregroundColor(.secondary)
+
+            Divider()
+
+            Toggle("Include raw YAML block (advanced)", isOn: $showRawYaml)
+                .font(.system(size: 12))
+
+            if showRawYaml {
+                TextEditor(text: extraYaml)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(minHeight: 80)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                Text("Appended after the structured properties above. Tokens work here too.")
+                    .font(.system(size: 10)).foregroundColor(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear {
+            rows = vm.config.customFrontmatterProperties.map { FrontmatterPropertyRow(from: $0) }
+            showRawYaml = !vm.config.extraFrontmatterYaml.isEmpty
+        }
+        .onChange(of: vm.config.customFrontmatterProperties) { newProps in
+            let currentDicts = rows.map(\.asDict)
+            if currentDicts != newProps {
+                rows = newProps.map { FrontmatterPropertyRow(from: $0) }
+            }
+        }
     }
 }
 

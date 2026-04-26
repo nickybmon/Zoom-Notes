@@ -20,30 +20,33 @@ stdin commands accepted (one JSON object per line):
   {"cmd": "reload"}       — reload settings (also triggered by SIGHUP)
 """
 
+import concurrent.futures
 import json
-import os
 import re
-import select
 import signal
 import sys
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 
-def _load_dotenv():
-    """Load .env file from the project directory (stdlib only)."""
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip())
+def _friendly_error(exc: Exception) -> str:
+    """Convert a raw exception into a short, human-readable menu bar message."""
+    msg = str(exc)
+    # HTTP status codes from LLM providers
+    for code, label in [
+        ("429", "LLM quota exceeded — try again later"),
+        ("401", "LLM authentication failed — check your API key in Settings"),
+        ("403", "LLM access denied — check your API key in Settings"),
+        ("500", "LLM server error — try again later"),
+        ("503", "LLM service unavailable — try again later"),
+    ]:
+        if code in msg:
+            return label
+    # Truncate anything else to a reasonable length
+    first_line = msg.splitlines()[0] if msg else "Unknown error"
+    return first_line[:80] + ("…" if len(first_line) > 80 else "")
 
-
-_load_dotenv()
 
 from zoom_config import (
     get_config,
@@ -87,28 +90,75 @@ class EngineState:
     GENERATING = "generating"
 
 
+# Hard ceiling for one note-generation pass (parse + LLM + write).
+# urllib's per-call timeout is 180s and _http_retry sleeps 15+30+60 between
+# attempts, so the worst-case for one summarize() call is ~13 minutes. We cap
+# the whole pipeline at 5 minutes — anything longer is almost certainly stuck.
+_GENERATE_TIMEOUT_SECS = 5 * 60
+
+
 class ZoomEngine:
     def __init__(self):
         self._state = EngineState.IDLE
         self._state_lock = threading.Lock()
         self._generating_lock = threading.Lock()
 
-        # WAL tracking for idle detection
+        # All WAL-tracking variables share a single lock. Read and write only
+        # via the helpers below; never touch the underscored fields directly
+        # from outside the lock.
+        self._tracking_lock = threading.Lock()
         self._last_mtime: float | None = None
         self._last_size: int | None = None
         self._last_active_ts: float | None = None
         self._active_meeting_id: str | None = None
 
+        # Last meeting_id we successfully generated notes for. Guards against
+        # duplicate generation when Zoom checkpoints/mutates the WAL after a
+        # meeting ends — the post-meeting WAL still contains the same entries,
+        # so we'd otherwise re-summarize the same conversation.
+        self._last_generated_meeting_id: str | None = None
+
         # Config (reloaded on SIGHUP or "reload" command)
         self._cfg_lock = threading.Lock()
         self._reload_requested = False
+        # Cleared together with config so a settings change picks up new WAL
+        # prefixes / a Zoom install relocation on the next tick.
+        self._origin_invalidated = False
 
-        # Register SIGHUP to reload settings
         signal.signal(signal.SIGHUP, self._on_sighup)
 
     def _on_sighup(self, signum, frame):
         """SIGHUP triggers a config reload on the next poll tick."""
         self._reload_requested = True
+
+    # ── Tracking helpers (always held under _tracking_lock) ─────────────────
+
+    def _read_tracking(self):
+        with self._tracking_lock:
+            return (
+                self._last_mtime,
+                self._last_size,
+                self._last_active_ts,
+                self._active_meeting_id,
+            )
+
+    def _write_tracking(self, *, mtime=..., size=..., active_ts=..., meeting_id=...):
+        with self._tracking_lock:
+            if mtime is not ...:
+                self._last_mtime = mtime
+            if size is not ...:
+                self._last_size = size
+            if active_ts is not ...:
+                self._last_active_ts = active_ts
+            if meeting_id is not ...:
+                self._active_meeting_id = meeting_id
+
+    def _reset_tracking(self) -> None:
+        with self._tracking_lock:
+            self._last_mtime = None
+            self._last_size = None
+            self._last_active_ts = None
+            self._active_meeting_id = None
 
     # ── State helpers ───────────────────────────────────────────────────────
 
@@ -130,24 +180,42 @@ class ZoomEngine:
             if self._reload_requested:
                 invalidate_config_cache()
                 self._reload_requested = False
+                self._origin_invalidated = True
         return get_config()
+
+    def _consume_origin_invalidated(self) -> bool:
+        with self._cfg_lock:
+            was = self._origin_invalidated
+            self._origin_invalidated = False
+            return was
 
     # ── Polling loop ────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        # Emit a one-shot readiness event with Zoom-detection status before
+        # the regular state stream, so the UI can show a setup error if
+        # Zoom isn't installed / WAL paths don't resolve.
+        initial_origin = find_origin_dir()
+        emit({
+            "event": "ready",
+            "zoom_installed": initial_origin is not None,
+            "wal_path": str(initial_origin) if initial_origin else None,
+        })
         emit({"event": "state", "value": EngineState.IDLE})
 
-        # Start stdin reader thread
         threading.Thread(target=self._stdin_reader, daemon=True).start()
 
-        origin = None
+        origin = initial_origin
         while True:
             try:
                 cfg = self._get_cfg()
                 poll_interval = cfg.poll_interval_secs
                 idle_threshold = cfg.idle_threshold_secs
 
-                if origin is None:
+                # Reset cached origin whenever config was reloaded OR we never
+                # found one — a re-poll is cheap (single directory iter) and
+                # lets us recover when Zoom is installed/relocated mid-session.
+                if origin is None or self._consume_origin_invalidated():
                     origin = find_origin_dir()
 
                 self._poll_once(origin, cfg, idle_threshold)
@@ -177,57 +245,127 @@ class ZoomEngine:
         size = stat.st_size
         now = time.time()
 
-        changed = (mtime != self._last_mtime) or (size != self._last_size)
-        self._last_mtime = mtime
-        self._last_size = size
+        last_mtime, last_size, last_active_ts, _ = self._read_tracking()
+
+        # First poll after startup (or after _reset_tracking): we don't know
+        # whether the WAL is currently changing or just has stale state from a
+        # past meeting. Anchor to the observed values WITHOUT marking it as
+        # "changed" — otherwise a stale WAL from a meeting that ended hours
+        # ago would immediately flip us to ACTIVE on engine restart and
+        # re-trigger generation 90 seconds later.
+        if last_mtime is None or last_size is None:
+            self._write_tracking(mtime=mtime, size=size)
+            return
+
+        changed = (mtime != last_mtime) or (size != last_size)
+        self._write_tracking(mtime=mtime, size=size)
 
         state = self._get_state()
 
         if changed:
-            self._last_active_ts = now
-            # Try to detect the active meeting ID
+            self._write_tracking(active_ts=now)
             try:
                 meeting_id = detect_active_meeting_id(wal)
             except Exception:
                 meeting_id = None
 
             if state == EngineState.IDLE:
-                self._active_meeting_id = meeting_id
+                self._write_tracking(meeting_id=meeting_id)
                 self._set_state(EngineState.ACTIVE, meeting_id=meeting_id or "")
         else:
-            if state == EngineState.ACTIVE and self._last_active_ts is not None:
-                idle_secs = now - self._last_active_ts
+            if state == EngineState.ACTIVE and last_active_ts is not None:
+                idle_secs = now - last_active_ts
                 if idle_secs >= idle_threshold:
+                    # Belt-and-suspenders: don't re-summarize a meeting we
+                    # already finished. Zoom checkpoints the WAL after the
+                    # meeting ends, which mutates mtime/size and would
+                    # otherwise look like a new active period.
+                    _, _, _, current_meeting_id = self._read_tracking()
+                    if current_meeting_id is not None and \
+                       current_meeting_id == self._last_generated_meeting_id:
+                        self._write_tracking(active_ts=None)
+                        self._set_state(EngineState.IDLE)
+                        return
+
+                    provider = cfg.llm_provider
+                    if provider != "ollama":
+                        from zoom_config import get_api_key as _get_key
+                        if not _get_key(provider):
+                            emit({"event": "error", "message": f"No API key set for {provider}. Open Settings to configure."})
+                            self._write_tracking(active_ts=None)  # disarm until WAL changes again
+                            return
                     self._trigger_generate(origin, cfg)
 
     # ── Note generation ─────────────────────────────────────────────────────
 
     def _trigger_generate(self, origin, cfg) -> None:
-        """Start note generation in a background thread (non-blocking)."""
+        """Start note generation in a background thread (non-blocking).
+
+        Wraps the work in a ThreadPoolExecutor so we can cap wall-clock time at
+        _GENERATE_TIMEOUT_SECS — a stuck LLM call must not pin the engine to
+        the GENERATING state forever.
+        """
         if not self._generating_lock.acquire(blocking=False):
-            return  # Already generating
+            return
 
         self._set_state(EngineState.GENERATING)
 
-        # Snapshot mtime/size so we can restore them after generation.
-        # This prevents a stale (unchanging) WAL from re-triggering on error.
-        saved_mtime = self._last_mtime
-        saved_size = self._last_size
+        # Snapshot tracking state under-lock so a restore-on-error can put us
+        # back in a coherent ACTIVE-but-disarmed state.
+        saved_mtime, saved_size, _, _ = self._read_tracking()
+
+        # Snapshot the meeting_id we're processing so the worker can record
+        # it on success even after _reset_tracking would have cleared it.
+        _, _, _, processing_meeting_id = self._read_tracking()
 
         def worker():
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(self._generate_notes, origin, cfg)
             try:
-                self._generate_notes(origin, cfg)
-                # Success — full reset so a new meeting can be detected
-                self._reset_tracking()
+                future.result(timeout=_GENERATE_TIMEOUT_SECS)
+                # Remember which meeting we just summarized so we don't
+                # re-summarize it if Zoom mutates the WAL on checkpoint.
+                self._last_generated_meeting_id = processing_meeting_id
+                # Anchor tracking to the WAL state we just consumed. We must
+                # NOT reset to None — that would make the next poll see the
+                # unchanged WAL as "new", flip back to ACTIVE, idle out, and
+                # regenerate the same notes in a loop.
+                #
+                # Re-stat now so we capture any final writes Zoom did during
+                # the generation window; if the meeting really is over the
+                # next poll's mtime/size will match these and `changed`
+                # stays False until a NEW meeting starts.
+                try:
+                    wal = find_wal(origin, cfg.transcript_db_prefix)
+                    if wal is not None:
+                        s = wal.stat()
+                        self._write_tracking(
+                            mtime=s.st_mtime, size=s.st_size,
+                            active_ts=None, meeting_id=None,
+                        )
+                    else:
+                        # WAL disappeared entirely — meeting fully checkpointed.
+                        # Safe to reset; there's nothing to re-trigger on.
+                        self._reset_tracking()
+                except OSError:
+                    self._reset_tracking()
+            except concurrent.futures.TimeoutError:
+                emit({"event": "error", "message": "Note generation timed out — try again"})
+                # Best-effort cancel; the underlying urllib call may still
+                # finish on its own. Don't block on it.
+                future.cancel()
+                self._write_tracking(
+                    mtime=saved_mtime, size=saved_size,
+                    active_ts=None, meeting_id=None,
+                )
             except Exception as exc:
-                emit({"event": "error", "message": str(exc)})
-                # Restore tracking state so the same stale WAL doesn't
-                # immediately re-trigger on the next poll tick.
-                self._last_mtime = saved_mtime
-                self._last_size = saved_size
-                self._last_active_ts = None  # disarm the idle timer
-                self._active_meeting_id = None
+                emit({"event": "error", "message": _friendly_error(exc)})
+                self._write_tracking(
+                    mtime=saved_mtime, size=saved_size,
+                    active_ts=None, meeting_id=None,
+                )
             finally:
+                executor.shutdown(wait=False)
                 self._generating_lock.release()
                 self._set_state(EngineState.IDLE)
 
@@ -240,10 +378,30 @@ class ZoomEngine:
         if not transcript_wal:
             raise RuntimeError("Transcript WAL not found during generation.")
 
-        # Filter to the active meeting's entries
-        entries = parse_transcript(transcript_wal, meeting_id_filter=self._active_meeting_id)
+        _, _, _, active_meeting_id = self._read_tracking()
+        entries = parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
         if not entries:
             raise RuntimeError("No transcript entries found.")
+
+        # Minimum-meeting-length gate: skip false-positive triggers from
+        # mid-meeting silences or test calls. Heuristic: at least 10 utterances
+        # AND at least 120 seconds spanned by their timestamps.
+        if len(entries) < 10:
+            raise RuntimeError("Meeting too short — skipped (fewer than 10 utterances).")
+        ts_strings = sorted(e.get("timestamp") or "" for e in entries if e.get("timestamp"))
+        if len(ts_strings) >= 2:
+            try:
+                first = datetime.strptime(ts_strings[0], "%H:%M:%S")
+                last = datetime.strptime(ts_strings[-1], "%H:%M:%S")
+                span = (last - first).total_seconds()
+                if span < 0:  # crossed midnight; treat as long enough
+                    span = 120
+                if span < 120:
+                    raise RuntimeError(
+                        f"Meeting too short — skipped (transcript spans only {int(span)}s)."
+                    )
+            except ValueError:
+                pass  # malformed timestamps — fall through and let summarization run
 
         # Meeting title
         meeting_title = None
@@ -281,7 +439,7 @@ class ZoomEngine:
         note_path = save_note(note_content, transcript_content, meeting_title, date_str, cfg)
 
         # Derive transcript path for the "done" event
-        slug = slugify_title(meeting_title)
+        slug = slugify_title(meeting_title, fallback_date=date_str)
         subfolder = resolve_subfolder(cfg, date_str)
         transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
         transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
@@ -289,7 +447,7 @@ class ZoomEngine:
 
         emit({
             "event": "done",
-            "title": slugify_title(meeting_title),
+            "title": slug,
             "path": str(note_path),
             "transcript_path": str(transcript_path),
             "attendees": attendees,
@@ -320,15 +478,6 @@ class ZoomEngine:
                 self._trigger_generate(origin, cfg)
             else:
                 emit({"event": "error", "message": "Zoom WAL directory not found."})
-
-    # ── Helpers ─────────────────────────────────────────────────────────────
-
-    def _reset_tracking(self) -> None:
-        self._last_mtime = None
-        self._last_size = None
-        self._last_active_ts = None
-        self._active_meeting_id = None
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

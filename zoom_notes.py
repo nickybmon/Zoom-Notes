@@ -23,23 +23,10 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 
-def _load_dotenv():
-    """Load .env file from the project directory into os.environ (stdlib only)."""
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip())
-
-_load_dotenv()
-
-# Import config — must come after _load_dotenv() so env overrides are visible
 from zoom_config import (
     ZoomNotesConfig,
     get_config,
@@ -93,11 +80,12 @@ def find_wal(origin: Path, db_prefix: str) -> Path | None:
 
 def read_wal_strings(wal_path: Path) -> list[str]:
     """Copy WAL to temp file and extract printable strings."""
-    tmp = Path(tempfile.mktemp(suffix=".wal"))
+    with tempfile.NamedTemporaryFile(suffix=".wal", delete=False) as tf:
+        tmp = Path(tf.name)
     try:
         shutil.copy2(wal_path, tmp)
         result = subprocess.run(
-            ["strings", str(tmp)],
+            ["/usr/bin/strings", str(tmp)],
             capture_output=True,
             text=True,
             errors="replace",
@@ -128,6 +116,19 @@ def detect_active_meeting_id(wal_path: Path) -> str | None:
     """
     counts = count_meeting_ids(wal_path)
     return max(counts, key=lambda k: counts[k]) if counts else None
+
+
+def _sanitize_speaker(name: str) -> str:
+    """Strip control chars and clip to 80 chars.
+
+    Speaker names are user-controlled (Zoom self-rename / external attendees)
+    and end up both in the rendered Markdown transcript AND in the LLM prompt
+    context, so they're a small prompt-injection vector. Stripping ASCII
+    control codes and clipping to a reasonable length keeps things clean
+    without blocking legitimate emoji or non-Latin scripts.
+    """
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", name or "").strip()
+    return cleaned[:80] if cleaned else ""
 
 
 def parse_transcript(wal_path: Path, meeting_id_filter: str | None = None) -> list[dict]:
@@ -184,7 +185,7 @@ def parse_transcript(wal_path: Path, meeting_id_filter: str | None = None) -> li
                     if lines[j] == "timeStampContent" and j + 1 < len(lines):
                         timestamp = lines[j + 1]
                     if lines[j] == "username" and j + 1 < len(lines):
-                        speaker = lines[j + 1]
+                        speaker = _sanitize_speaker(lines[j + 1])
                     if lines[j] == "meetingId" and j + 1 < len(lines):
                         meeting_id = lines[j + 1]
                         break
@@ -512,14 +513,17 @@ def summarize_with_ollama(
 def _http_retry(req: urllib.request.Request, extract_fn, retries: int = 4) -> str:
     """Shared retry loop for all LLM HTTP calls."""
     _RETRYABLE = {429, 500, 502, 503, 504}
-    last_exc = None
+    last_exc: Exception | None = None
     for attempt in range(retries):
         if attempt:
             time.sleep(15 * (2 ** (attempt - 1)))  # 15s, 30s, 60s
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 body = json.loads(resp.read())
+            try:
                 return extract_fn(body)
+            except (KeyError, IndexError, TypeError) as e:
+                raise RuntimeError(f"Unexpected LLM response shape: {e}") from e
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
             last_exc = RuntimeError(f"LLM API error {e.code}: {error_body}")
@@ -527,7 +531,7 @@ def _http_retry(req: urllib.request.Request, extract_fn, retries: int = 4) -> st
                 raise last_exc from e
         except OSError as e:
             last_exc = RuntimeError(f"LLM network error: {e}")
-    raise last_exc
+    raise last_exc or RuntimeError("LLM call failed after retries")
 
 
 def summarize(
@@ -579,12 +583,56 @@ def summarize(
 
 # ── Note Writing ───────────────────────────────────────────────────────────────
 
-def slugify_title(title: str) -> str:
-    """Turn a meeting title into a safe filename fragment."""
-    clean = re.sub(r"\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}.*$", "", title).strip()
+def slugify_title(title: str, fallback_date: str | None = None) -> str:
+    """Turn a meeting title into a safe filename fragment.
+
+    Strips Zoom's trailing "YYYY-MM-DD HH:MM" timestamp, removes filesystem-
+    unsafe chars, collapses whitespace, and enforces a non-empty 1..100 char
+    result that can't be a hidden file or reserved name.
+    """
+    clean = re.sub(r"\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}.*$", "", title or "").strip()
     clean = re.sub(r"[^\w\s-]", "", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
+    # Strip leading dot/dash so we never produce a hidden file or option-shaped name
+    clean = clean.lstrip(".-").strip()
+    # Truncate to 100 chars (filesystem-friendly) at a word boundary if possible
+    if len(clean) > 100:
+        clean = clean[:100].rsplit(" ", 1)[0] or clean[:100]
+    if not clean or clean in {".", "..", "-"}:
+        clean = f"Meeting {fallback_date}" if fallback_date else "Meeting"
     return clean
+
+
+_RECENT_OVERWRITE_WINDOW_SECS = 60
+
+
+def _next_available_path(target: Path) -> Path:
+    """If target was modified within the last `_RECENT_OVERWRITE_WINDOW_SECS`,
+    return a `-2`, `-3`, ... suffixed sibling so we don't silently overwrite a
+    freshly-saved note.
+
+    The window is intentionally short (60s): legitimate same-second reruns from
+    a manual "Generate Notes Now" should disambiguate, but a runaway engine
+    loop must NOT be allowed to produce dozens of `-N.md` siblings — the
+    real fix for that lives in zoom_engine._trigger_generate (last-meeting-id
+    guard + tracking anchor on success).
+
+    Older files are allowed to be overwritten — repeat invocations of the same
+    recurring meeting on different days land in different dated subfolders, so
+    a same-day path collision usually means the user wants to refresh.
+    """
+    if not target.exists():
+        return target
+    age = time.time() - target.stat().st_mtime
+    if age >= _RECENT_OVERWRITE_WINDOW_SECS:
+        return target
+    stem, suffix = target.stem, target.suffix
+    parent = target.parent
+    for n in range(2, 100):
+        candidate = parent / f"{stem}-{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return target  # give up; overwrite rather than fail
 
 
 def save_note(
@@ -594,26 +642,73 @@ def save_note(
     date_str: str,
     cfg: ZoomNotesConfig | None = None,
 ) -> Path:
-    """Write note and transcript to their respective dated vault subfolders."""
+    """Write note and transcript to their respective dated vault subfolders.
+
+    If a same-named file was written in the last 5 minutes, append `-2`/`-3`/…
+    to avoid clobbering a just-generated note (e.g. duplicate idle trigger).
+    """
     if cfg is None:
         cfg = get_config()
 
-    slug = slugify_title(meeting_title)
+    slug = slugify_title(meeting_title, fallback_date=date_str)
     subfolder = resolve_subfolder(cfg, date_str)
 
     notes_dir = cfg.notes_path / subfolder if subfolder else cfg.notes_path
     notes_dir.mkdir(parents=True, exist_ok=True)
     note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
-    note_path = notes_dir / note_filename
+    note_path = _next_available_path(notes_dir / note_filename)
     note_path.write_text(note_content, encoding="utf-8")
 
     transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
-    transcript_path = transcripts_dir / transcript_filename
+    transcript_path = _next_available_path(transcripts_dir / transcript_filename)
     transcript_path.write_text(transcript_content, encoding="utf-8")
 
     return note_path
+
+
+_YAML_UNSAFE_CHARS = set(":#[]{},&*?|>\"'%@`")
+
+
+def _yaml_quote(value: str) -> str:
+    """Return a YAML-safe scalar representation of `value`.
+
+    Plain scalars are valid YAML when they contain none of the indicator chars
+    above and don't start with whitespace, `-`, `?`, or `:`. Anything else is
+    emitted as a JSON string, which is also valid YAML and round-trips safely.
+    """
+    if value == "":
+        return '""'
+    if value[0] in " -?:" or value[-1] == " ":
+        return json.dumps(value, ensure_ascii=False)
+    if any(c in _YAML_UNSAFE_CHARS for c in value):
+        return json.dumps(value, ensure_ascii=False)
+    if "\n" in value:
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def _build_custom_frontmatter(cfg: "ZoomNotesConfig", title: str, date_str: str) -> str:
+    """Return custom frontmatter lines (with trailing newline) from config."""
+    lines = []
+    for prop in (cfg.custom_frontmatter_properties or []):
+        key = prop.get("key", "").strip()
+        value = prop.get("value", "").strip()
+        if not key:
+            continue
+        # Sanitize the key to a YAML-safe identifier so users can't break the
+        # frontmatter by typing `:` in the key field.
+        key = re.sub(r"[^A-Za-z0-9_\-]", "_", key)
+        value = value.replace("{title}", title).replace("{date}", date_str)
+        lines.append(f"{key}: {_yaml_quote(value)}")
+    extra = (cfg.extra_frontmatter_yaml or "").strip()
+    if extra:
+        extra = extra.replace("{title}", title).replace("{date}", date_str)
+        # Raw YAML is intentionally not quoted — power users opt in by enabling
+        # the "raw YAML block" toggle and accept responsibility for syntax.
+        lines.append(extra)
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def build_note_content(
@@ -627,7 +722,7 @@ def build_note_content(
     if cfg is None:
         cfg = get_config()
 
-    slug = slugify_title(meeting_title)
+    slug = slugify_title(meeting_title, fallback_date=date_str)
     subfolder = resolve_subfolder(cfg, date_str)
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
 
@@ -637,18 +732,21 @@ def build_note_content(
         else f"[[Meetings/Transcripts/{transcript_filename}]]"
     )
     daily_link = f"[[Daily/{date_str}]]"
-    attendees_yaml = "\n".join(f'  - "{a}"' for a in attendees)
+    attendees_yaml = "\n".join(f"  - {_yaml_quote(a)}" for a in attendees)
+
+    custom_lines = _build_custom_frontmatter(cfg, slug, date_str)
+
     return f"""---
-title: "{slug}"
+title: {_yaml_quote(slug)}
 type: meeting
 source: zoom-notes
 date: {date_str}
 created: {created_iso}
 attendees:
 {attendees_yaml}
-transcript: "{transcript_link}"
-daily_note: "{daily_link}"
----
+transcript: {_yaml_quote(transcript_link)}
+daily_note: {_yaml_quote(daily_link)}
+{custom_lines}---
 
 # {slug}
 
@@ -665,7 +763,7 @@ def build_transcript_content(
     if cfg is None:
         cfg = get_config()
 
-    slug = slugify_title(meeting_title)
+    slug = slugify_title(meeting_title, fallback_date=date_str)
     subfolder = resolve_subfolder(cfg, date_str)
     note_filename = resolve_filename(cfg.filename_pattern, slug, date_str)
 
@@ -676,11 +774,11 @@ def build_transcript_content(
     )
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
     return f"""---
-title: "{transcript_filename}"
+title: {_yaml_quote(transcript_filename)}
 type: transcript
 source: zoom-notes
 date: {date_str}
-note: "{note_link}"
+note: {_yaml_quote(note_link)}
 ---
 
 # {transcript_filename}
@@ -814,7 +912,7 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
         print("\n(Dry run — files not saved)")
     else:
         note_path = save_note(note_content, transcript_content, meeting_title, date_str, cfg)
-        slug = slugify_title(meeting_title)
+        slug = slugify_title(meeting_title, fallback_date=date_str)
         subfolder = resolve_subfolder(cfg, date_str)
         transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
         transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"

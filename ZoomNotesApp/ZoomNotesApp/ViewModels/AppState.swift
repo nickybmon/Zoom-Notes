@@ -55,6 +55,14 @@ class AppState: ObservableObject {
 
     private func handleEngineEvent(_ event: EngineEvent) {
         switch event.event {
+        case "ready":
+            // One-shot setup status from the engine. Surface a clear error if
+            // Zoom isn't detected so the user knows what to fix.
+            if event.zoomInstalled == false {
+                engineError = "Zoom not detected. Install the Zoom desktop app, or update WAL paths in Settings → Advanced."
+            } else {
+                engineError = nil
+            }
         case "state":
             engineState = EngineState(event.value)
         case "done":

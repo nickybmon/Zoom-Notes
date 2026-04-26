@@ -17,6 +17,9 @@ class SettingsViewModel: ObservableObject {
     @Published var error: String?
     @Published var saveSuccess = false
 
+    /// Called after a successful save so the caller can signal the engine.
+    var onSave: (() -> Void)?
+
     // API key fields (loaded from Keychain, written back on save)
     @Published var claudeApiKey: String = ""
     @Published var openaiApiKey: String = ""
@@ -62,6 +65,7 @@ class SettingsViewModel: ObservableObject {
 
             try saveConfig_(config)
             saveSuccess = true
+            onSave?()
             Task {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 await MainActor.run { self.saveSuccess = false }

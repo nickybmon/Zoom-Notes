@@ -37,6 +37,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         requestNotificationPermission()
         setupMenuBar()
         observeAppState()
+        showPrivacyDisclaimerIfNeeded()
 
         appState.startEngine()
 
@@ -90,9 +91,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     func setupMenuBar() {
         statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         guard let button = statusBarItem?.button else { return }
-        button.image = menuBarImage(for: .idle)
+        button.image = menuBarIcon()
         button.toolTip = "Zoom Notes"
         updateMenuBar()
+    }
+
+    /// Returns the menu bar template image — custom glyph asset, SF Symbol fallback.
+    private func menuBarIcon() -> NSImage {
+        // Custom glyph from asset catalog (black strokes on transparent, isTemplate
+        // makes macOS invert to white on dark menu bars automatically)
+        if let img = NSImage(named: "MenuBarIcon") {
+            img.isTemplate = false  // white strokes — let macOS render as-is
+            return img
+        }
+        // SF Symbol fallback
+        if let sf = NSImage(systemSymbolName: "doc.text", accessibilityDescription: "Zoom Notes") {
+            sf.isTemplate = true
+            return sf
+        }
+        // Last-resort drawn fallback
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+            NSColor.black.setFill()
+            let path = NSBezierPath()
+            let (w, h) = (rect.width, rect.height)
+            let m: CGFloat = 2, fold: CGFloat = 5
+            path.move(to: NSPoint(x: m, y: m))
+            path.line(to: NSPoint(x: m, y: h - m))
+            path.line(to: NSPoint(x: w - m - fold, y: h - m))
+            path.line(to: NSPoint(x: w - m, y: h - m - fold))
+            path.line(to: NSPoint(x: w - m, y: m))
+            path.close()
+            path.fill()
+            return true
+        }
+        img.isTemplate = true
+        return img
     }
 
     func updateMenuBar() {
@@ -138,8 +171,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             menu.addItem(.separator())
         }
 
-        // Error display
-        if let err = appState.engineError {
+        // Error display — show errors that are actionable; suppress transient/auth noise
+        if let err = appState.engineError,
+           !err.contains("401"),
+           !err.contains("API key"),
+           !err.contains("quota exceeded") {
             let errItem = NSMenuItem(title: "⚠ \(err)", action: nil, keyEquivalent: "")
             errItem.isEnabled = false
             menu.addItem(errItem)
@@ -154,12 +190,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         menu.items.forEach { $0.target = self }
         statusBarItem?.menu = menu
 
-        // Update icon
+        // Update icon — image is always doc.text (outlined), tint signals state
         if let button = statusBarItem?.button {
-            button.image = menuBarImage(for: state)
+            button.image = menuBarIcon()
             switch state {
-            case .idle:
-                button.contentTintColor = nil  // default white/black template rendering
+            case .idle, .unknown:
+                button.contentTintColor = nil
                 button.toolTip = appState.isEngineRunning ? "Zoom Notes — Idle" : "Zoom Notes — Engine starting…"
             case .active:
                 button.contentTintColor = .controlAccentColor
@@ -167,25 +203,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             case .generating:
                 button.contentTintColor = .systemOrange
                 button.toolTip = "Zoom Notes — Generating notes…"
-            case .unknown:
-                button.contentTintColor = nil
-                button.toolTip = "Zoom Notes — Connecting…"
             }
         }
     }
 
-    private func menuBarImage(for state: EngineState) -> NSImage? {
-        let symbolName: String
-        switch state {
-        case .idle, .unknown: symbolName = "doc.text"
-        case .active:          symbolName = "doc.text.fill"
-        case .generating:      symbolName = "doc.text.fill"
-        }
-        let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Zoom Notes")
-        // Template = true makes macOS render it white/dark automatically (adapts to menu bar colour)
-        img?.isTemplate = true
-        return img
-    }
 
     // MARK: - Menu actions
 
@@ -217,7 +238,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             panel.becomesKeyOnlyIfNeeded = false
             panel.delegate = self
             panel.contentView = NSHostingView(
-                rootView: SettingsView().environmentObject(appState)
+                rootView: SettingsView(onSave: { [weak self] in
+                    self?.appState.engineManager.reloadSettings()
+                }).environmentObject(appState)
             )
             settingsWindow = panel
         }
@@ -236,15 +259,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         NSApplication.shared.terminate(nil)
     }
 
+    // MARK: - Privacy disclaimer
+
+    private static let privacyDisclaimerKey = "hasSeenPrivacyDisclaimer.v1"
+
+    private func showPrivacyDisclaimerIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.privacyDisclaimerKey) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Heads up: transcripts are sent to your LLM provider"
+        alert.informativeText = """
+        Zoom Notes generates meeting summaries by sending the full transcript \
+        of each meeting to whichever LLM provider you configure (Claude, OpenAI, \
+        or Gemini by default). Anything spoken in the meeting — including \
+        sensitive or confidential content — is included.
+
+        If you need local-only processing, choose Ollama in Settings → API / LLM. \
+        Ollama runs entirely on your Mac and never sends data to a third party.
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Got it")
+        alert.addButton(withTitle: "Open Settings")
+
+        // Make sure the alert is visible by briefly going active.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        NSApp.setActivationPolicy(.accessory)
+
+        defaults.set(true, forKey: Self.privacyDisclaimerKey)
+
+        if response == .alertSecondButtonReturn {
+            showSettings()
+        }
+    }
+
     // MARK: - NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
         if let w = notification.object as? NSWindow, w === settingsWindow {
             settingsWindow = nil
-            // Restore accessory policy so the app disappears from the Dock
+            // Restore accessory policy so the app disappears from the Dock.
+            // Engine reload is handled by SettingsViewModel.saveConfig()'s onSave
+            // callback — don't re-trigger here (would race the in-flight restart).
             NSApp.setActivationPolicy(.accessory)
-            // Signal engine to reload settings
-            appState.engineManager.reloadSettings()
         }
     }
 

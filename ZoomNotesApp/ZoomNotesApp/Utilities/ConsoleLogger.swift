@@ -35,10 +35,30 @@ class ConsoleLogger {
     func startLogging() {
         guard !isLogging else { return }
         ensureLogsDirectory()
+        pruneOldLogDirectories(olderThanDays: 30)
         openLogFile()
         isLogging = true
         log("Zoom Notes Assistant — logging started", level: .info)
         logAppSystemInfo()
+    }
+
+    /// Delete dated log subfolders (`YYYY-MM-DD/`) under `~/Library/Logs/zoom-notes/`
+    /// whose modification time is older than `olderThanDays`. Called once per
+    /// app launch so logs don't grow unbounded.
+    private func pruneOldLogDirectories(olderThanDays days: Int) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: logsDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey]
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
+        for url in entries {
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
+            guard values?.isDirectory == true,
+                  let mtime = values?.contentModificationDate,
+                  mtime < cutoff else { continue }
+            try? fm.removeItem(at: url)
+        }
     }
 
     func stopLogging() {
