@@ -103,6 +103,19 @@ class EngineState:
 # the whole pipeline at 5 minutes — anything longer is almost certainly stuck.
 _GENERATE_TIMEOUT_SECS = 5 * 60
 
+# Force a fresh on-disk snapshot every N ACTIVE ticks regardless of whether
+# the in-memory accumulator changed. Belt-and-suspenders against a SQLite WAL
+# checkpoint that resets the file without the parser yielding new entries —
+# the in-RAM accumulator stays correct, but the on-disk copy could otherwise
+# go stale right when a crash would leave it as the only surviving copy.
+# At the default 5s poll interval, 6 ticks ≈ 30s.
+_PERIODIC_PERSIST_TICKS = 6
+
+# A WAL "shrink" is suspicious only when the new size is well below the
+# previous size — normal frame rotation can drop a few bytes between ticks
+# without truncating the log. Treat <50% of last_size as a truncate signal.
+_TRUNCATE_RATIO = 0.5
+
 
 class ZoomEngine:
     def __init__(self):
@@ -143,6 +156,13 @@ class ZoomEngine:
         # Set when the WAL disappears mid-meeting (Zoom checkpoint) so we can
         # fire generation after idle_threshold even without the WAL present.
         self._wal_gone_since: float | None = None
+
+        # Counter of ACTIVE ticks since the last accumulator persist call. Used
+        # to force a fresh disk snapshot every _PERIODIC_PERSIST_TICKS even when
+        # nothing changed in the parser output — guards against the gap where a
+        # SQLite WAL checkpoint truncates the file without producing parser
+        # output that flips `changed_in_acc` true.
+        self._ticks_since_persist: int = 0
 
         # Purge stale in-progress cache files left over from prior crashes.
         purge_stale_accumulators()
@@ -188,6 +208,10 @@ class ZoomEngine:
             self._last_size = None
             self._last_active_ts = None
             self._active_meeting_id = None
+        # Reset the periodic-persist counter alongside tracking — its meaning
+        # is "ticks since last persist while ACTIVE", and a tracking reset
+        # always implies we're leaving ACTIVE.
+        self._ticks_since_persist = 0
 
     # ── State helpers ───────────────────────────────────────────────────────
 
@@ -242,6 +266,33 @@ class ZoomEngine:
             was = self._origin_invalidated
             self._origin_invalidated = False
             return was
+
+    # ── Persistence helpers ─────────────────────────────────────────────────
+
+    def _persist_accumulator_now(self, meeting_id: str, reason: str) -> None:
+        """Snapshot and write the in-memory accumulator to disk, atomically.
+
+        Resets the periodic-persist tick counter so a same-tick persist can't
+        be immediately followed by another forced one. `reason` is included in
+        the diag event for post-mortem analysis ("changed", "truncated",
+        "periodic"). Safe to call even with an empty accumulator — it just
+        writes an empty snapshot, which is a valid resume state.
+        """
+        if not meeting_id:
+            return
+        with self._accumulated_lock:
+            snapshot = dict(self._accumulated)
+        try:
+            persist_accumulator(meeting_id, snapshot)
+        except Exception:
+            return
+        self._ticks_since_persist = 0
+        self._emit_diag(
+            "accumulator_persisted",
+            count=len(snapshot),
+            meeting_id=meeting_id,
+            reason=reason,
+        )
 
     # ── Polling loop ────────────────────────────────────────────────────────
 
@@ -329,9 +380,43 @@ class ZoomEngine:
             return
 
         changed = (mtime != last_mtime) or (size != last_size)
+
+        # Truncate detection: the WAL shrunk well below its previous size,
+        # which on SQLite means a checkpoint truncated the journal. The new
+        # entries we already accumulated are still valid in RAM, but the
+        # parser will yield nothing new from this point until fresh writes
+        # land — so this is a critical moment to force a persist.
+        truncated = (
+            last_size is not None
+            and size < last_size
+            and size < last_size * _TRUNCATE_RATIO
+        )
+
         self._write_tracking(mtime=mtime, size=size)
 
         state = self._get_state()
+
+        # Force a fresh disk snapshot when the WAL just got truncated (a
+        # SQLite checkpoint cleared the journal) or when we've gone too many
+        # ACTIVE ticks without persisting. Run this BEFORE the change-handling
+        # branch so a tick that sees a truncate ALSO benefits from the regular
+        # accumulator-update logic below if there happens to be fresh data.
+        if state == EngineState.ACTIVE:
+            self._ticks_since_persist += 1
+            _, _, _, current_meeting_id = self._read_tracking()
+            if current_meeting_id and (
+                truncated or self._ticks_since_persist >= _PERIODIC_PERSIST_TICKS
+            ):
+                if truncated:
+                    self._emit_diag(
+                        "wal_truncated",
+                        meeting_id=current_meeting_id,
+                        old_size=last_size, new_size=size,
+                    )
+                self._persist_accumulator_now(
+                    current_meeting_id,
+                    reason="truncated" if truncated else "periodic",
+                )
 
         if changed:
             self._write_tracking(active_ts=now)
@@ -342,6 +427,10 @@ class ZoomEngine:
 
             if state == EngineState.IDLE:
                 self._write_tracking(meeting_id=meeting_id)
+                # Fresh ACTIVE period — restart the periodic-persist clock so
+                # we don't immediately force a snapshot on the very first
+                # change tick before the accumulator has any new content.
+                self._ticks_since_persist = 0
                 with self._accumulated_lock:
                     # Seed from any persisted snapshot so a mid-meeting engine
                     # restart doesn't lose entries collected before the restart.
@@ -421,10 +510,7 @@ class ZoomEngine:
                 # timestamp update). Speaker corrections and timestamp fills
                 # matter for retry just as much as new utterances.
                 if changed_in_acc and current_meeting_id:
-                    with self._accumulated_lock:
-                        snapshot = dict(self._accumulated)
-                    persist_accumulator(current_meeting_id, snapshot)
-                    self._emit_diag("accumulator_persisted", count=len(snapshot), meeting_id=current_meeting_id)
+                    self._persist_accumulator_now(current_meeting_id, reason="changed")
             except Exception:
                 pass
         else:
