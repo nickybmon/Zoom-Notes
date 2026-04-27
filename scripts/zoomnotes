@@ -1,0 +1,27 @@
+#!/bin/bash
+# zoomnotes — global launcher for the local-install workflow.
+#
+# Symlinked from ~/.local/bin/zoomnotes -> this file (see `make install-cli`),
+# so you can run `zoomnotes` from anywhere to rebuild and relaunch the app.
+#
+# Resolves its own location (following symlinks), then delegates to
+# scripts/install-local.sh in the repo. All args are forwarded.
+#
+# Examples:
+#   zoomnotes              # quit, build Release, install, launch
+#   zoomnotes --debug      # faster Debug build for quick iteration
+#   zoomnotes --no-launch  # install but don't launch
+#   zoomnotes --help
+
+set -euo pipefail
+
+# Resolve the real location of this script even when invoked via symlink.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+exec "$SCRIPT_DIR/install-local.sh" "$@"
