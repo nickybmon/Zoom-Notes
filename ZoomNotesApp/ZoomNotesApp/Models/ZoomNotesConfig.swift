@@ -38,6 +38,8 @@ struct ZoomNotesConfig: Codable {
     var openaiBaseUrl: String = "https://api.openai.com/v1/chat/completions"
     var geminiBaseUrl: String = "https://generativelanguage.googleapis.com/v1beta/models"
 
+    var diagnostics: Bool = false
+
     enum CodingKeys: String, CodingKey {
         case llmProvider = "llm_provider"
         case llmModel = "llm_model"
@@ -56,6 +58,7 @@ struct ZoomNotesConfig: Codable {
         case ollamaBaseUrl = "ollama_base_url"
         case openaiBaseUrl = "openai_base_url"
         case geminiBaseUrl = "gemini_base_url"
+        case diagnostics
     }
 }
 

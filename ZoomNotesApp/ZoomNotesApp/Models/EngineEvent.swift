@@ -21,12 +21,19 @@ struct EngineEvent: Decodable {
     let transcriptPath: String?
     let attendees: [String]?
 
-    // Present on "error" events
+    // Present on "error" and "note_failed" events
     let message: String?
+
+    // Present on "note_failed" events
+    let notePath: String?
 
     // Present on "ready" events (one-shot at engine startup)
     let zoomInstalled: Bool?
     let walPath: String?
+
+    // Present on "diag" events (Phase 6 diagnostics; ignored by most consumers)
+    let kind: String?
+    let count: Int?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -34,11 +41,14 @@ struct EngineEvent: Decodable {
         case meetingId = "meeting_id"
         case title
         case path
+        case notePath = "note_path"
         case transcriptPath = "transcript_path"
         case attendees
         case message
         case zoomInstalled = "zoom_installed"
         case walPath = "wal_path"
+        case kind
+        case count
     }
 }
 

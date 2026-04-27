@@ -105,6 +105,11 @@ class ZoomNotesConfig:
     transcript_db_prefix: str = "1CB477F679D6"
     blocks_db_prefix: str = "DDEC8414E29A"
 
+    # Diagnostics: emit structured `diag` events on meeting_id changes,
+    # accumulator persistence, etc. Useful for post-mortem debugging
+    # without recompiling. Off by default.
+    diagnostics: bool = False
+
     # Provider base URLs (override to route through a proxy)
     ollama_base_url: str = "http://localhost:11434"
     openai_base_url: str = "https://api.openai.com/v1/chat/completions"

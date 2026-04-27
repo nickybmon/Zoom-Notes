@@ -63,8 +63,11 @@ from zoom_notes import (
     format_transcript,
     summarize,
     build_note_content,
+    build_placeholder_note,
     build_transcript_content,
-    save_note,
+    save_transcript_only,
+    save_note_only,
+    overwrite_note,
     slugify_title,
     detect_active_meeting_id,
     persist_accumulator,
@@ -121,6 +124,15 @@ class ZoomEngine:
         # meeting ends — the post-meeting WAL still contains the same entries,
         # so we'd otherwise re-summarize the same conversation.
         self._last_generated_meeting_id: str | None = None
+
+        # Set by _generate_notes when it writes a placeholder note instead of
+        # a final note. Read by the worker so it knows to keep the persisted
+        # accumulator (for retry) rather than deleting it.
+        self._last_run_note_failed: bool = False
+
+        # Most recent failed-note metadata, used to drive a retry without
+        # asking the user to remember the meeting ID. Cleared on retry success.
+        self._last_failed_meeting: dict | None = None
 
         # Accumulated transcript entries keyed by msg_id. Populated on every
         # poll tick so a WAL checkpoint can't lose data already read.
@@ -189,6 +201,31 @@ class ZoomEngine:
     def _get_state(self) -> str:
         with self._state_lock:
             return self._state
+
+    # ── Diagnostics ─────────────────────────────────────────────────────────
+
+    def _emit_diag(self, kind: str, **fields) -> None:
+        """Emit a structured diagnostic event when diagnostics is enabled.
+
+        These show up in the engine's stdout JSON stream and are mirrored to
+        the Swift app's log file by EngineManager. Useful for post-mortem
+        investigation of "why was my meeting skipped" without code reading.
+        """
+        try:
+            if not self._diagnostics_enabled():
+                return
+        except Exception:
+            return
+        payload = {"event": "diag", "kind": kind}
+        payload.update(fields)
+        emit(payload)
+
+    def _diagnostics_enabled(self) -> bool:
+        try:
+            cfg = self._get_cfg()
+            return bool(getattr(cfg, "diagnostics", False))
+        except Exception:
+            return False
 
     # ── Config ─────────────────────────────────────────────────────────────
 
@@ -306,32 +343,88 @@ class ZoomEngine:
             if state == EngineState.IDLE:
                 self._write_tracking(meeting_id=meeting_id)
                 with self._accumulated_lock:
+                    # Seed from any persisted snapshot so a mid-meeting engine
+                    # restart doesn't lose entries collected before the restart.
+                    # Validate every entry's meeting_id matches — guards against
+                    # a mismatched snapshot ever poisoning the accumulator.
                     self._accumulated = {}
-                self._set_state(EngineState.ACTIVE, meeting_id=meeting_id or "")
+                    if meeting_id:
+                        persisted = load_persisted_accumulator(meeting_id)
+                        if persisted:
+                            self._accumulated = {
+                                k: v for k, v in persisted.items()
+                                if not v.get("meeting_id") or v.get("meeting_id") == meeting_id
+                            }
+                    acc_size = len(self._accumulated)
+                self._emit_diag(
+                    "meeting_id_changed",
+                    from_id=None, to_id=meeting_id or "",
+                    reason="idle_to_active", seeded_from_snapshot=acc_size > 0,
+                )
+                self._set_state(
+                    EngineState.ACTIVE,
+                    meeting_id=meeting_id or "",
+                    accumulator_size=acc_size,
+                )
+            elif state == EngineState.ACTIVE and meeting_id:
+                # Re-evaluate the active meeting ID on every tick. If the WAL
+                # now scores a different meeting as best (new meeting started
+                # while old meeting's data was still in the WAL), switch to it
+                # and clear the accumulator so we don't mix the two meetings.
+                _, _, _, current_tracking_id = self._read_tracking()
+                if current_tracking_id and meeting_id != current_tracking_id:
+                    self._write_tracking(meeting_id=meeting_id)
+                    with self._accumulated_lock:
+                        self._accumulated = {}
+                    self._emit_diag(
+                        "meeting_id_changed",
+                        from_id=current_tracking_id, to_id=meeting_id,
+                        reason="active_reevaluation",
+                    )
+                    self._set_state(
+                        EngineState.ACTIVE,
+                        meeting_id=meeting_id,
+                        accumulator_size=0,
+                    )
 
-            # Snapshot new entries into the accumulator on every change tick
+            # Snapshot new entries into the accumulator on every change tick.
+            # No meeting_id_filter here — we accumulate everything and filter
+            # at generation time. This prevents a stale meeting ID (detected
+            # at IDLE→ACTIVE when old data was still in the WAL) from causing
+            # new utterances to be silently dropped.
             try:
                 _, _, _, current_meeting_id = self._read_tracking()
-                fresh = parse_transcript(wal, meeting_id_filter=current_meeting_id)
+                fresh = parse_transcript(wal)
+                changed_in_acc = False
                 with self._accumulated_lock:
-                    before = len(self._accumulated)
                     for entry in fresh:
                         mid_key = entry["msg_id"]
                         if mid_key not in self._accumulated:
                             self._accumulated[mid_key] = entry
+                            changed_in_acc = True
                         else:
                             existing = self._accumulated[mid_key]
-                            if len(entry.get("message", "")) > len(existing.get("message", "")):
-                                existing["message"] = entry["message"]
-                            if entry.get("speaker") and entry["speaker"] != "Unknown":
+                            if len(entry.get("text", "")) > len(existing.get("text", "")):
+                                existing["text"] = entry["text"]
+                                changed_in_acc = True
+                            if entry.get("speaker") and entry["speaker"] != "Unknown" \
+                               and existing.get("speaker") != entry["speaker"]:
                                 existing["speaker"] = entry["speaker"]
-                            if entry.get("timestamp"):
+                                changed_in_acc = True
+                            if entry.get("timestamp") and existing.get("timestamp") != entry["timestamp"]:
                                 existing["timestamp"] = entry["timestamp"]
-                    added = len(self._accumulated) - before
-                if added > 0 and current_meeting_id:
+                                changed_in_acc = True
+                            if entry.get("meeting_id") and not existing.get("meeting_id"):
+                                existing["meeting_id"] = entry["meeting_id"]
+                                changed_in_acc = True
+                # Persist on any change (new entry, longer text, speaker fix,
+                # timestamp update). Speaker corrections and timestamp fills
+                # matter for retry just as much as new utterances.
+                if changed_in_acc and current_meeting_id:
                     with self._accumulated_lock:
                         snapshot = dict(self._accumulated)
                     persist_accumulator(current_meeting_id, snapshot)
+                    self._emit_diag("accumulator_persisted", count=len(snapshot), meeting_id=current_meeting_id)
             except Exception:
                 pass
         else:
@@ -380,18 +473,26 @@ class ZoomEngine:
         # it on success even after _reset_tracking would have cleared it.
         _, _, _, processing_meeting_id = self._read_tracking()
 
+        # Reset the per-run note_failed flag so the worker can detect whether
+        # _generate_notes wrote a placeholder (LLM failure) or a final note.
+        self._last_run_note_failed = False
+
         def worker():
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(self._generate_notes, origin, cfg)
             try:
                 future.result(timeout=_GENERATE_TIMEOUT_SECS)
-                # Remember which meeting we just summarized so we don't
-                # re-summarize it if Zoom mutates the WAL on checkpoint.
+                # Remember which meeting we just processed so we don't
+                # re-trigger if Zoom mutates the WAL on checkpoint. We do
+                # this even on note_failed — the user retries via the menu
+                # bar, not by waiting for another idle period.
                 self._last_generated_meeting_id = processing_meeting_id
-                # Clean up the in-memory accumulator and persisted disk snapshot.
+                # Clean up the in-memory accumulator. Keep the persisted
+                # disk snapshot if note generation failed — it's the source
+                # of truth for the retry flow.
                 with self._accumulated_lock:
                     self._accumulated = {}
-                if processing_meeting_id:
+                if processing_meeting_id and not self._last_run_note_failed:
                     delete_persisted_accumulator(processing_meeting_id)
                 self._wal_gone_since = None
                 # Anchor tracking to the WAL state we just consumed. We must
@@ -440,25 +541,19 @@ class ZoomEngine:
         threading.Thread(target=worker, daemon=True).start()
 
     def _generate_notes(self, origin, cfg) -> None:
+        """Three-stage finalization: build transcript, save transcript, generate note.
+
+        Save-transcript is the durability boundary — once it succeeds, the
+        meeting's content is safe on disk regardless of what happens to the
+        LLM call. LLM failures produce a placeholder note (saved alongside
+        the transcript) and a retryable `note_failed` event, NOT a hard error.
+        """
         transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
         blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
 
         _, _, _, active_meeting_id = self._read_tracking()
 
-        # Try the in-memory accumulator first (most up-to-date).
-        with self._accumulated_lock:
-            acc_snapshot = dict(self._accumulated)
-
-        if acc_snapshot:
-            entries = sorted(acc_snapshot.values(), key=lambda e: e.get("timestamp") or "")
-        elif transcript_wal:
-            entries = parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
-        elif active_meeting_id:
-            # Process was restarted mid-meeting — try the persisted disk snapshot.
-            persisted = load_persisted_accumulator(active_meeting_id)
-            entries = sorted(persisted.values(), key=lambda e: e.get("timestamp") or "") if persisted else []
-        else:
-            entries = []
+        entries = self._collect_entries_for_generation(transcript_wal, active_meeting_id)
 
         if not transcript_wal and not entries:
             raise RuntimeError("Transcript WAL not found during generation.")
@@ -466,37 +561,7 @@ class ZoomEngine:
         if not entries:
             raise RuntimeError("No transcript entries found.")
 
-        # Minimum-meeting-length gate: skip false-positive triggers from
-        # mid-meeting silences or test calls. Heuristic: at least 10 utterances
-        # AND at least 120 seconds spanned by their timestamps.
-        if len(entries) < 10:
-            raise RuntimeError("Meeting too short — skipped (fewer than 10 utterances).")
-        ts_strings = sorted(e.get("timestamp") or "" for e in entries if e.get("timestamp"))
-        if len(ts_strings) >= 2:
-            try:
-                first = datetime.strptime(ts_strings[0], "%H:%M:%S")
-                last = datetime.strptime(ts_strings[-1], "%H:%M:%S")
-                span = (last - first).total_seconds()
-                if span < 0:  # crossed midnight; treat as long enough
-                    span = 120
-                if span < 120:
-                    raise RuntimeError(
-                        f"Meeting too short — skipped (transcript spans only {int(span)}s)."
-                    )
-            except ValueError:
-                pass  # malformed timestamps — fall through and let summarization run
-
-        # Meeting title
-        meeting_title = None
-        if blocks_wal:
-            try:
-                meeting_title = parse_meeting_title(blocks_wal, entries)
-            except Exception:
-                pass
-        if not meeting_title:
-            mtime = transcript_wal.stat().st_mtime
-            meeting_title = f"Zoom Meeting {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}"
-
+        meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
         date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
 
@@ -510,23 +575,54 @@ class ZoomEngine:
         created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         transcript_text = format_transcript(entries)
 
-        # Reload config in case settings changed while generating
         cfg = self._get_cfg()
-        summary = summarize(transcript_text, meeting_title, cfg)
 
+        # ── Stage 1: save transcript (durability boundary) ─────────────────
+        transcript_content = build_transcript_content(transcript_text, meeting_title, date_str, cfg)
+        transcript_path = save_transcript_only(transcript_content, meeting_title, date_str, cfg)
+        slug = slugify_title(meeting_title, fallback_date=date_str)
+
+        # ── Stage 2: generate note via LLM ─────────────────────────────────
+        try:
+            summary = summarize(transcript_text, meeting_title, cfg)
+        except Exception as exc:
+            error_msg = _friendly_error(exc)
+            placeholder = build_placeholder_note(
+                meeting_title=meeting_title,
+                date_str=date_str,
+                attendees=attendees,
+                created_iso=created_iso,
+                error_message=error_msg,
+                meeting_id=active_meeting_id or "",
+                cfg=cfg,
+            )
+            placeholder_path = save_note_only(placeholder, meeting_title, date_str, cfg)
+            self._last_run_note_failed = True
+            self._last_failed_meeting = {
+                "meeting_id": active_meeting_id or "",
+                "title": slug,
+                "note_path": str(placeholder_path),
+                "transcript_path": str(transcript_path),
+                "message": error_msg,
+                "date_str": date_str,
+                "attendees": attendees,
+            }
+            emit({
+                "event": "note_failed",
+                "title": slug,
+                "note_path": str(placeholder_path),
+                "transcript_path": str(transcript_path),
+                "meeting_id": active_meeting_id or "",
+                "attendees": attendees,
+                "message": error_msg,
+            })
+            return
+
+        # ── Stage 3: save the final note ───────────────────────────────────
         note_content = build_note_content(
             summary, meeting_title, date_str, attendees, created_iso, cfg
         )
-        transcript_content = build_transcript_content(transcript_text, meeting_title, date_str, cfg)
-
-        note_path = save_note(note_content, transcript_content, meeting_title, date_str, cfg)
-
-        # Derive transcript path for the "done" event
-        slug = slugify_title(meeting_title, fallback_date=date_str)
-        subfolder = resolve_subfolder(cfg, date_str)
-        transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
-        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
-        transcript_path = transcripts_dir / transcript_filename
+        note_path = save_note_only(note_content, meeting_title, date_str, cfg)
 
         emit({
             "event": "done",
@@ -535,6 +631,53 @@ class ZoomEngine:
             "transcript_path": str(transcript_path),
             "attendees": attendees,
         })
+
+    def _collect_entries_for_generation(self, transcript_wal, active_meeting_id):
+        """Pick the best entries source: in-memory accumulator > WAL > disk snapshot.
+
+        Filter by active_meeting_id at this stage (not at poll time) so a stale
+        ID at IDLE→ACTIVE transition never silently drops new utterances. Falls
+        back to unfiltered if the filter would wipe everything (e.g. entries
+        captured before the meetingId field appeared in the WAL).
+        """
+        with self._accumulated_lock:
+            acc_snapshot = dict(self._accumulated)
+
+        if acc_snapshot:
+            if active_meeting_id:
+                acc_entries = [
+                    e for e in acc_snapshot.values()
+                    if e.get("meeting_id") == active_meeting_id
+                ]
+                if not acc_entries:
+                    acc_entries = list(acc_snapshot.values())
+            else:
+                acc_entries = list(acc_snapshot.values())
+            return sorted(acc_entries, key=lambda e: e.get("timestamp") or "")
+
+        if transcript_wal:
+            return parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
+
+        if active_meeting_id:
+            persisted = load_persisted_accumulator(active_meeting_id)
+            if persisted:
+                return sorted(
+                    persisted.values(), key=lambda e: e.get("timestamp") or ""
+                )
+
+        return []
+
+    def _derive_meeting_title(self, blocks_wal, transcript_wal, entries) -> str:
+        meeting_title = None
+        if blocks_wal:
+            try:
+                meeting_title = parse_meeting_title(blocks_wal, entries)
+            except Exception:
+                pass
+        if not meeting_title:
+            mtime = transcript_wal.stat().st_mtime if transcript_wal else time.time()
+            meeting_title = f"Zoom Meeting {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}"
+        return meeting_title
 
     # ── Stdin reader ────────────────────────────────────────────────────────
 
@@ -561,6 +704,128 @@ class ZoomEngine:
                 self._trigger_generate(origin, cfg)
             else:
                 emit({"event": "error", "message": "Zoom WAL directory not found."})
+        elif action == "retry":
+            meeting_id = cmd.get("meeting_id") or ""
+            self._trigger_retry(meeting_id)
+
+    # ── Retry flow ──────────────────────────────────────────────────────────
+
+    def _trigger_retry(self, meeting_id: str) -> None:
+        """Re-run note generation for a previously-failed meeting.
+
+        Loads the persisted accumulator from disk, re-runs the LLM stage,
+        and overwrites the placeholder note on success. The transcript on
+        disk is left as-is. Emits `done` on success or `error` on failure.
+        """
+        if not self._generating_lock.acquire(blocking=False):
+            emit({"event": "error", "message": "Generation already in progress."})
+            return
+
+        # Resolve which failed meeting to retry. If the caller didn't pass a
+        # meeting_id, use the most recent failure (driven from the menu bar).
+        failed = self._last_failed_meeting
+        if not meeting_id and failed:
+            meeting_id = failed.get("meeting_id") or ""
+        if failed and failed.get("meeting_id") != meeting_id:
+            failed = None  # caller is retrying a different meeting
+
+        if not meeting_id:
+            self._generating_lock.release()
+            emit({"event": "error", "message": "No failed meeting to retry."})
+            return
+
+        cfg = self._get_cfg()
+
+        def worker():
+            self._set_state(EngineState.GENERATING)
+            try:
+                persisted = load_persisted_accumulator(meeting_id)
+                if not persisted:
+                    emit({
+                        "event": "error",
+                        "message": "Cached transcript no longer available for retry.",
+                    })
+                    return
+                entries = sorted(
+                    persisted.values(), key=lambda e: e.get("timestamp") or ""
+                )
+                if not entries:
+                    emit({"event": "error", "message": "No transcript entries to retry."})
+                    return
+
+                # Reuse failure metadata when available; otherwise re-derive.
+                if failed:
+                    meeting_title = failed.get("title") or ""
+                    date_str = failed.get("date_str") or datetime.now().strftime("%Y-%m-%d")
+                    attendees = list(failed.get("attendees") or [])
+                    placeholder_path_str = failed.get("note_path") or ""
+                else:
+                    origin = find_origin_dir()
+                    blocks_wal = find_wal(origin, cfg.blocks_db_prefix) if origin else None
+                    transcript_wal = find_wal(origin, cfg.transcript_db_prefix) if origin else None
+                    meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
+                    m = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
+                    date_str = m.group(1) if m else datetime.now().strftime("%Y-%m-%d")
+                    seen: dict[str, None] = {}
+                    for e in entries:
+                        s = e.get("speaker")
+                        if s and s != "Unknown":
+                            seen[s] = None
+                    attendees = list(seen.keys())
+                    placeholder_path_str = ""
+
+                created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                transcript_text = format_transcript(entries)
+                slug = slugify_title(meeting_title, fallback_date=date_str)
+
+                try:
+                    summary = summarize(transcript_text, meeting_title, cfg)
+                except Exception as exc:
+                    emit({
+                        "event": "note_failed",
+                        "title": slug,
+                        "note_path": placeholder_path_str,
+                        "transcript_path": (failed or {}).get("transcript_path", ""),
+                        "meeting_id": meeting_id,
+                        "attendees": attendees,
+                        "message": _friendly_error(exc),
+                    })
+                    return
+
+                note_content = build_note_content(
+                    summary, meeting_title, date_str, attendees, created_iso, cfg
+                )
+
+                # Overwrite the placeholder note in place if we know its path,
+                # otherwise write a fresh note (which save_note_only will
+                # disambiguate via _next_available_path).
+                from pathlib import Path as _Path
+                if placeholder_path_str and _Path(placeholder_path_str).exists():
+                    overwrite_note(_Path(placeholder_path_str), note_content)
+                    note_path = _Path(placeholder_path_str)
+                else:
+                    note_path = save_note_only(note_content, meeting_title, date_str, cfg)
+
+                # Cleanup: drop the persisted accumulator and forget the
+                # last-failed meeting so the menu bar Retry item disappears.
+                delete_persisted_accumulator(meeting_id)
+                self._last_failed_meeting = None
+                self._last_run_note_failed = False
+
+                emit({
+                    "event": "done",
+                    "title": slug,
+                    "path": str(note_path),
+                    "transcript_path": (failed or {}).get("transcript_path", ""),
+                    "attendees": attendees,
+                })
+            except Exception as exc:
+                emit({"event": "error", "message": _friendly_error(exc)})
+            finally:
+                self._generating_lock.release()
+                self._set_state(EngineState.IDLE)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

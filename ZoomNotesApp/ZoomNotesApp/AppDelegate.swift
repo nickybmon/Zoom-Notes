@@ -69,7 +69,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             actions: [openAction],
             intentIdentifiers: []
         )
-        UNUserNotificationCenter.current().setNotificationCategories([savedCategory])
+
+        let retryAction = UNNotificationAction(
+            identifier: "RETRY_NOTE_GEN",
+            title: "Retry",
+            options: [.foreground]
+        )
+        let showTranscriptAction = UNNotificationAction(
+            identifier: "SHOW_TRANSCRIPT",
+            title: "Show transcript"
+        )
+        let failedCategory = UNNotificationCategory(
+            identifier: "NOTE_FAILED",
+            actions: [retryAction, showTranscriptAction],
+            intentIdentifiers: []
+        )
+
+        UNUserNotificationCenter.current().setNotificationCategories([savedCategory, failedCategory])
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
@@ -79,10 +95,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        if response.actionIdentifier == "OPEN_IN_FINDER" || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
-            if let path = userInfo["notePath"] as? String {
+        switch response.actionIdentifier {
+        case "OPEN_IN_FINDER", UNNotificationDefaultActionIdentifier:
+            if let path = userInfo["notePath"] as? String, !path.isEmpty {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            } else if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
             }
+        case "RETRY_NOTE_GEN":
+            ConsoleLogger.shared.logUserAction("Retry note generation (from notification)")
+            Task { @MainActor in self.appState.retryFailedMeeting() }
+        case "SHOW_TRANSCRIPT":
+            if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            }
+        default:
+            break
         }
         completionHandler()
     }
@@ -159,6 +187,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
+        // Retry note generation if a failed meeting is queued. The transcript
+        // is already on disk; this just re-runs the LLM call.
+        if let failure = appState.lastFailedMeeting {
+            let retryItem = NSMenuItem(
+                title: "Retry note generation: \(failure.title)",
+                action: #selector(retryFailed),
+                keyEquivalent: "r"
+            )
+            retryItem.keyEquivalentModifierMask = .command
+            retryItem.target = self
+            menu.addItem(retryItem)
+
+            let detailItem = NSMenuItem(
+                title: "    \(failure.message)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            detailItem.isEnabled = false
+            menu.addItem(detailItem)
+
+            if let path = failure.transcriptPath, !path.isEmpty {
+                let openTranscript = NSMenuItem(
+                    title: "Show transcript in Finder",
+                    action: #selector(openLastTranscriptInFinder),
+                    keyEquivalent: ""
+                )
+                openTranscript.target = self
+                menu.addItem(openTranscript)
+            }
+            menu.addItem(.separator())
+        }
+
         // Manual trigger when active
         if state == .active {
             let genItem = NSMenuItem(
@@ -219,6 +279,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     @objc func openLastNoteInFinder() {
         guard let path = appState.lastSavedPath, !path.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    @objc func openLastTranscriptInFinder() {
+        let path = appState.lastFailedMeeting?.transcriptPath
+            ?? appState.lastSavedTranscriptPath
+        guard let path, !path.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    @objc func retryFailed() {
+        ConsoleLogger.shared.logUserAction("Retry note generation")
+        appState.retryFailedMeeting()
     }
 
     @objc func showSettings() {
@@ -374,6 +446,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             .store(in: &cancellables)
 
         appState.$lastSavedTitle
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateMenuBar() }
+            .store(in: &cancellables)
+
+        appState.$lastFailedMeeting
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateMenuBar() }
             .store(in: &cancellables)

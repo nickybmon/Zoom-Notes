@@ -126,7 +126,10 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
         now_secs = sum(int(x) * m for x, m in zip(now_hms.split(":"), [3600, 60, 1]))
     except ValueError:
         now_secs = 0
-    _2h_secs = 2 * 3600
+    # Recency window tightened to 30 min so a stale prior meeting still
+    # resident in the WAL can't outscore a freshly-started one whose first
+    # few entries were just written.
+    _RECENCY_WINDOW_SECS = 30 * 60
 
     i = 0
     while i < len(lines):
@@ -140,7 +143,7 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
                     if lines[back] == "timeStampContent" and back + 1 < len(lines):
                         try:
                             ts_secs = sum(int(x) * m for x, m in zip(lines[back + 1].split(":"), [3600, 60, 1]))
-                            if abs(now_secs - ts_secs) <= _2h_secs:
+                            if abs(now_secs - ts_secs) <= _RECENCY_WINDOW_SECS:
                                 meeting_data[mid]["has_recent"] = True
                         except (ValueError, AttributeError):
                             pass
@@ -152,10 +155,13 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
     scores: dict[str, float] = {}
     for mid, data in meeting_data.items():
         score = float(data["count"])
+        # Recency bonus must dominate raw entry count — a freshly-started
+        # meeting may only have a handful of entries while a stale one in
+        # the WAL has thousands. Without a large bonus, the stale one wins.
         if data["has_recent"]:
-            score += 50
+            score += 100_000
         if data["has_user"]:
-            score += 1000
+            score += 1_000_000
         scores[mid] = score
     return scores
 
@@ -176,19 +182,70 @@ def detect_active_meeting_id(wal_path: Path) -> str | None:
 _CACHE_DIR = Path.home() / ".cache" / "zoom-notes"
 
 
+def _atomic_write_text(path: Path, data: str) -> None:
+    """Write text to `path` atomically: write to .tmp, fsync, rename.
+
+    Prevents partial reads if the engine crashes mid-write or another
+    process happens to read the file during a refresh.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
+
+
+def _safe_meeting_id_slug(meeting_id: str) -> str:
+    """Make a meeting ID safe for use as a filename component.
+
+    Zoom meeting IDs are base64-ish and may contain `/`, `+`, `=` — none of
+    which we want in filenames. Replace any non-alphanumeric character with
+    `_` so the cache file is always a valid POSIX filename.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]", "_", meeting_id)
+
+
 def persist_accumulator(meeting_id: str, entries: dict) -> None:
-    """Write the current accumulator snapshot to ~/.cache/zoom-notes/in-progress-{id}.json."""
+    """Write the current accumulator snapshot atomically.
+
+    Writes two files to ~/.cache/zoom-notes/:
+      - in-progress-{slug}.json  — full structured entries for retry/replay
+      - in-progress-{slug}.md    — human-readable transcript for crash recovery
+
+    Both files are written atomically (write-tmp, fsync, rename) so a crash
+    during the write can never leave a half-written file on disk.
+    """
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path = _CACHE_DIR / f"in-progress-{meeting_id}.json"
-        path.write_text(json.dumps(list(entries.values()), ensure_ascii=False), encoding="utf-8")
+        slug = _safe_meeting_id_slug(meeting_id)
+        sorted_entries = sorted(
+            entries.values(), key=lambda e: e.get("timestamp") or ""
+        )
+        json_path = _CACHE_DIR / f"in-progress-{slug}.json"
+        _atomic_write_text(
+            json_path, json.dumps(sorted_entries, ensure_ascii=False)
+        )
+        md_path = _CACHE_DIR / f"in-progress-{slug}.md"
+        header = (
+            f"# Live transcript (in progress)\n\n"
+            f"Meeting ID: `{meeting_id}`  \n"
+            f"Last updated: {datetime.now().isoformat(timespec='seconds')}  \n"
+            f"Entries: {len(sorted_entries)}\n\n"
+            f"---\n\n"
+        )
+        _atomic_write_text(md_path, header + format_transcript(sorted_entries) + "\n")
     except OSError:
         pass
 
 
 def load_persisted_accumulator(meeting_id: str) -> dict | None:
     """Load a previously persisted accumulator snapshot keyed by msg_id."""
-    path = _CACHE_DIR / f"in-progress-{meeting_id}.json"
+    slug = _safe_meeting_id_slug(meeting_id)
+    path = _CACHE_DIR / f"in-progress-{slug}.json"
     if not path.exists():
         return None
     try:
@@ -200,23 +257,30 @@ def load_persisted_accumulator(meeting_id: str) -> dict | None:
 
 def delete_persisted_accumulator(meeting_id: str) -> None:
     """Remove the in-progress snapshot after successful note generation."""
-    try:
-        (_CACHE_DIR / f"in-progress-{meeting_id}.json").unlink(missing_ok=True)
-    except OSError:
-        pass
+    slug = _safe_meeting_id_slug(meeting_id)
+    for ext in (".json", ".md"):
+        try:
+            (_CACHE_DIR / f"in-progress-{slug}{ext}").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def purge_stale_accumulators(max_age_secs: int = 4 * 3600) -> None:
-    """Delete in-progress cache files older than max_age_secs (default 4h)."""
+def purge_stale_accumulators(max_age_secs: int = 24 * 3600) -> None:
+    """Delete in-progress cache files older than max_age_secs (default 24h).
+
+    24h is wide enough that a same-day retry always has the cache available,
+    while still cleaning up forgotten snapshots from prior days.
+    """
     if not _CACHE_DIR.exists():
         return
     now = time.time()
-    for f in _CACHE_DIR.glob("in-progress-*.json"):
-        try:
-            if now - f.stat().st_mtime > max_age_secs:
-                f.unlink(missing_ok=True)
-        except OSError:
-            pass
+    for pattern in ("in-progress-*.json", "in-progress-*.md", "in-progress-*.tmp"):
+        for f in _CACHE_DIR.glob(pattern):
+            try:
+                if now - f.stat().st_mtime > max_age_secs:
+                    f.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _sanitize_speaker(name: str) -> str:
@@ -736,6 +800,60 @@ def _next_available_path(target: Path) -> Path:
     return target  # give up; overwrite rather than fail
 
 
+def save_transcript_only(
+    transcript_content: str,
+    meeting_title: str,
+    date_str: str,
+    cfg: ZoomNotesConfig | None = None,
+) -> Path:
+    """Save just the transcript to the user's Transcripts/ folder.
+
+    This is the durability boundary: once this returns, the meeting's
+    content is safe on disk regardless of whether note generation succeeds.
+    """
+    if cfg is None:
+        cfg = get_config()
+    slug = slugify_title(meeting_title, fallback_date=date_str)
+    subfolder = resolve_subfolder(cfg, date_str)
+    transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
+    transcript_path = _next_available_path(transcripts_dir / transcript_filename)
+    transcript_path.write_text(transcript_content, encoding="utf-8")
+    return transcript_path
+
+
+def save_note_only(
+    note_content: str,
+    meeting_title: str,
+    date_str: str,
+    cfg: ZoomNotesConfig | None = None,
+) -> Path:
+    """Save just the note to the user's Notes/ folder.
+
+    Used both for the final LLM-generated note and for the placeholder note
+    written when LLM generation fails.
+    """
+    if cfg is None:
+        cfg = get_config()
+    slug = slugify_title(meeting_title, fallback_date=date_str)
+    subfolder = resolve_subfolder(cfg, date_str)
+    notes_dir = cfg.notes_path / subfolder if subfolder else cfg.notes_path
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
+    note_path = _next_available_path(notes_dir / note_filename)
+    note_path.write_text(note_content, encoding="utf-8")
+    return note_path
+
+
+def overwrite_note(
+    note_path: Path,
+    note_content: str,
+) -> None:
+    """Overwrite an existing note file in place (used by retry to replace placeholder)."""
+    note_path.write_text(note_content, encoding="utf-8")
+
+
 def save_note(
     note_content: str,
     transcript_content: str,
@@ -745,28 +863,12 @@ def save_note(
 ) -> Path:
     """Write note and transcript to their respective dated vault subfolders.
 
-    If a same-named file was written in the last 5 minutes, append `-2`/`-3`/…
-    to avoid clobbering a just-generated note (e.g. duplicate idle trigger).
+    Convenience wrapper for callers that already have both pieces ready.
+    Engine code should prefer save_transcript_only + save_note_only so a
+    transcript is preserved even when note generation fails.
     """
-    if cfg is None:
-        cfg = get_config()
-
-    slug = slugify_title(meeting_title, fallback_date=date_str)
-    subfolder = resolve_subfolder(cfg, date_str)
-
-    notes_dir = cfg.notes_path / subfolder if subfolder else cfg.notes_path
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
-    note_path = _next_available_path(notes_dir / note_filename)
-    note_path.write_text(note_content, encoding="utf-8")
-
-    transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
-    transcripts_dir.mkdir(parents=True, exist_ok=True)
-    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
-    transcript_path = _next_available_path(transcripts_dir / transcript_filename)
-    transcript_path.write_text(transcript_content, encoding="utf-8")
-
-    return note_path
+    save_transcript_only(transcript_content, meeting_title, date_str, cfg)
+    return save_note_only(note_content, meeting_title, date_str, cfg)
 
 
 _YAML_UNSAFE_CHARS = set(":#[]{},&*?|>\"'%@`")
@@ -853,6 +955,72 @@ daily_note: {_yaml_quote(daily_link)}
 
 {summary}
 """
+
+
+def build_placeholder_note(
+    meeting_title: str,
+    date_str: str,
+    attendees: list[str],
+    created_iso: str,
+    error_message: str,
+    meeting_id: str,
+    cfg: ZoomNotesConfig | None = None,
+) -> str:
+    """Build a placeholder note used when LLM generation fails.
+
+    Includes machine-readable retry metadata in the frontmatter and a
+    human-readable error message in the body so the user can either click
+    Retry in the menu bar or invoke the CLI manually.
+    """
+    if cfg is None:
+        cfg = get_config()
+
+    slug = slugify_title(meeting_title, fallback_date=date_str)
+    subfolder = resolve_subfolder(cfg, date_str)
+    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
+
+    transcript_link = (
+        f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
+        if subfolder
+        else f"[[Meetings/Transcripts/{transcript_filename}]]"
+    )
+    daily_link = f"[[Daily/{date_str}]]"
+    attendees_yaml = "\n".join(f"  - {_yaml_quote(a)}" for a in attendees)
+    cache_slug = _safe_meeting_id_slug(meeting_id)
+    cache_path = f"~/.cache/zoom-notes/in-progress-{cache_slug}.json"
+
+    custom_lines = _build_custom_frontmatter(cfg, slug, date_str)
+
+    body = f"""# {slug}
+
+> **Note generation failed.** The transcript was saved successfully, but the LLM call did not complete.
+
+**Error:** {error_message}
+
+## Retry options
+
+- **Recommended:** Open the Zoom Notes menu bar item and click **Retry note generation**.
+- **Manual CLI:** Run `python zoom_notes.py --notes` (uses the latest WAL) or restore the cached transcript from `{cache_path}` and re-summarize.
+
+The full transcript is preserved at the linked file above and at the cache path so nothing is lost.
+"""
+
+    return f"""---
+title: {_yaml_quote(slug)}
+type: meeting
+source: zoom-notes
+date: {date_str}
+created: {created_iso}
+status: note-generation-failed
+attendees:
+{attendees_yaml}
+transcript: {_yaml_quote(transcript_link)}
+daily_note: {_yaml_quote(daily_link)}
+retry_meeting_id: {_yaml_quote(meeting_id)}
+retry_cache_path: {_yaml_quote(cache_path)}
+{custom_lines}---
+
+{body}"""
 
 
 def build_transcript_content(

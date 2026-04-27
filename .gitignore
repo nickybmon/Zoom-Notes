@@ -33,3 +33,9 @@ scripts/dmg-assets/background@2x.png
 
 # Bundled Python runtime (fetched by scripts/fetch-python-runtime.sh)
 python-runtime/
+
+# Test fixtures: captured WALs contain real meeting content (names, speech).
+# Never commit them. Use tools/capture_wal.py to seed fresh fixtures locally.
+tests/fixtures/*/
+*.sqlite3-wal
+*.sqlite3-shm

@@ -9,6 +9,17 @@ import Foundation
 import Combine
 import UserNotifications
 
+/// Snapshot of a meeting whose note generation failed. The transcript was
+/// already saved successfully — this is just the metadata needed to retry
+/// the LLM call without reprocessing the WAL.
+struct FailedMeeting: Equatable {
+    let meetingId: String
+    let title: String
+    let notePath: String?
+    let transcriptPath: String?
+    let message: String
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var engineState: EngineState = .idle
@@ -22,6 +33,10 @@ class AppState: ObservableObject {
     @Published var lastSavedTitle: String?
     @Published var lastSavedPath: String?
     @Published var lastSavedTranscriptPath: String?
+
+    // Most recent meeting whose note generation failed. Drives the menu bar
+    // "Retry note generation" item. Cleared on successful retry.
+    @Published var lastFailedMeeting: FailedMeeting?
 
     let engineManager = EngineManager()
     private var cancellables = Set<AnyCancellable>()
@@ -65,8 +80,6 @@ class AppState: ObservableObject {
         switch event.event {
         case "ready":
             engineStartupSettled = true
-            // One-shot setup status from the engine. Surface a clear error if
-            // Zoom isn't detected so the user knows what to fix.
             if event.zoomInstalled == false {
                 engineError = "Zoom not detected. Install the Zoom desktop app, or update WAL paths in Settings → Advanced."
             } else {
@@ -83,12 +96,42 @@ class AppState: ObservableObject {
                 lastSavedTranscriptPath = event.transcriptPath
                 sendNoteMadeNotification(title: title, path: event.path)
             }
+            // A successful "done" supersedes any prior failure for the same
+            // meeting (this is what the retry path emits on success).
+            lastFailedMeeting = nil
+        case "note_failed":
+            engineState = .idle
+            let failure = FailedMeeting(
+                meetingId: event.meetingId ?? "",
+                title: event.title ?? "Untitled meeting",
+                notePath: event.notePath,
+                transcriptPath: event.transcriptPath,
+                message: event.message ?? "Unknown error"
+            )
+            lastFailedMeeting = failure
+            // Transcript is safe — surface the partial-success state in the
+            // "Last saved" item so the user sees something landed on disk.
+            if let path = failure.transcriptPath, !path.isEmpty {
+                lastSavedTitle = failure.title
+                lastSavedPath = failure.notePath
+                lastSavedTranscriptPath = path
+            }
+            sendNoteFailedNotification(failure: failure)
         case "error":
             engineError = event.message
             engineState = .idle
         default:
             break
         }
+    }
+
+    // MARK: - Retry
+
+    /// Send a retry command for the most recent failed meeting (or a specific one).
+    func retryFailedMeeting(_ failure: FailedMeeting? = nil) {
+        let target = failure ?? lastFailedMeeting
+        guard let target else { return }
+        engineManager.sendCommand(["cmd": "retry", "meeting_id": target.meetingId])
     }
 
     // MARK: - Notifications
@@ -104,6 +147,25 @@ class AppState: ObservableObject {
         }
         let request = UNNotificationRequest(
             identifier: "zoom-notes-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
+    private func sendNoteFailedNotification(failure: FailedMeeting) {
+        let content = UNMutableNotificationContent()
+        content.title = "Note Generation Failed"
+        content.body = "\(failure.title) — transcript saved. \(failure.message)"
+        content.sound = .default
+        content.categoryIdentifier = "NOTE_FAILED"
+        content.userInfo = [
+            "meetingId": failure.meetingId,
+            "transcriptPath": failure.transcriptPath ?? "",
+            "notePath": failure.notePath ?? "",
+        ]
+        let request = UNNotificationRequest(
+            identifier: "zoom-notes-failed-\(UUID().uuidString)",
             content: content,
             trigger: nil
         )
