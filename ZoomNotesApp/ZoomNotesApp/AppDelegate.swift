@@ -188,13 +188,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         }
 
         // Recoverable meetings — in-progress accumulators left on disk by a
-        // prior crashed engine session. Single recovery shows inline; two or
-        // more collapse into a submenu to keep the menu compact.
+        // prior crashed engine session OR by a previous LLM failure that's
+        // still inside its 30-day failed/ retention window. Single recovery
+        // shows inline; two or more collapse into a submenu.
         if !appState.recoverableMeetings.isEmpty {
             if appState.recoverableMeetings.count == 1 {
                 let rec = appState.recoverableMeetings[0]
                 let recoverItem = NSMenuItem(
-                    title: "Recover unfinished meeting (\(rec.entryCount) entries)",
+                    title: recoverableMenuTitle(for: rec),
                     action: #selector(recoverFromMenu(_:)),
                     keyEquivalent: ""
                 )
@@ -202,13 +203,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 recoverItem.target = self
                 menu.addItem(recoverItem)
 
-                let detail = NSMenuItem(
-                    title: "    \(rec.slugHint)",
-                    action: nil,
-                    keyEquivalent: ""
-                )
-                detail.isEnabled = false
-                menu.addItem(detail)
+                let detailText = recoverableSubtitleDetail(for: rec)
+                if !detailText.isEmpty {
+                    let detail = NSMenuItem(
+                        title: "    \(detailText)",
+                        action: nil,
+                        keyEquivalent: ""
+                    )
+                    detail.isEnabled = false
+                    menu.addItem(detail)
+                }
             } else {
                 let parent = NSMenuItem(
                     title: "Recover unfinished meetings (\(appState.recoverableMeetings.count))",
@@ -218,7 +222,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 let submenu = NSMenu()
                 for rec in appState.recoverableMeetings {
                     let item = NSMenuItem(
-                        title: "\(rec.slugHint) — \(rec.entryCount) entries",
+                        title: recoverableMenuTitle(for: rec),
                         action: #selector(recoverFromMenu(_:)),
                         keyEquivalent: ""
                     )
@@ -343,8 +347,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
               let rec = appState.recoverableMeetings.first(where: { $0.meetingId == mid }) else {
             return
         }
-        ConsoleLogger.shared.logUserAction("Recover unfinished meeting (\(rec.entryCount) entries)")
+        ConsoleLogger.shared.logUserAction("Recover unfinished meeting (\(rec.entryCount) entries, \(rec.location.rawValue))")
         appState.recoverMeeting(rec)
+    }
+
+    /// The primary clickable label for a recoverable meeting in the menu.
+    /// Failed-bucket entries get a "(failed N days ago)" suffix to communicate
+    /// urgency / age; root entries (live crashes) get the entry count which
+    /// is more useful for those since there's no failure history to surface.
+    private func recoverableMenuTitle(for rec: RecoverableMeeting) -> String {
+        switch rec.location {
+        case .failed:
+            let label = rec.displayLabel
+            if let suffix = relativeAgeSuffix(rec.failedAt) {
+                return "Recover failed meeting: \(label) (failed \(suffix))"
+            }
+            return "Recover failed meeting: \(label)"
+        case .root:
+            return "Recover unfinished meeting: \(rec.displayLabel) (\(rec.entryCount) entries)"
+        }
+    }
+
+    /// Optional subtitle line shown beneath the recover item when there's
+    /// only one recoverable meeting. For failed bucket entries we surface
+    /// the LLM error so the user knows what to fix before retrying.
+    private func recoverableSubtitleDetail(for rec: RecoverableMeeting) -> String {
+        switch rec.location {
+        case .failed:
+            return rec.lastError ?? rec.slugHint
+        case .root:
+            return rec.slugHint
+        }
+    }
+
+    /// Render an ISO8601 timestamp as "5 minutes ago", "3 days ago", etc.
+    /// Returns nil if the input is missing or unparseable so the caller can
+    /// fall back gracefully.
+    private func relativeAgeSuffix(_ iso: String?) -> String? {
+        guard let iso, !iso.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        var date = formatter.date(from: iso)
+        if date == nil {
+            // Engine emits with timespec='seconds' which omits the timezone
+            // suffix — try the no-fractional, no-timezone variant too.
+            let fallback = DateFormatter()
+            fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            fallback.timeZone = .current
+            fallback.locale = Locale(identifier: "en_US_POSIX")
+            date = fallback.date(from: iso)
+        }
+        guard let date else { return nil }
+        let relative = RelativeDateTimeFormatter()
+        relative.unitsStyle = .full
+        return relative.localizedString(for: date, relativeTo: Date())
     }
 
     @objc func showSettings() {

@@ -36,10 +36,17 @@ struct EngineEvent: Decodable {
     let count: Int?
 
     // Present on "recovery_available" events (one per persisted accumulator
-    // found at engine startup — survivors of a prior crash).
+    // found at engine startup — survivors of a prior crash or LLM failure).
     let entryCount: Int?
     let lastUpdated: String?
     let slugHint: String?
+    /// "root" for live/just-failed snapshots inside the 24h window, "failed"
+    /// for confirmed-failed snapshots inside the 30-day window. The menu bar
+    /// uses this to choose between a generic "Recover unfinished meeting"
+    /// label and a richer "Recover failed meeting (N days ago)" label.
+    let location: String?
+    let failedAt: String?
+    let lastError: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -58,6 +65,9 @@ struct EngineEvent: Decodable {
         case entryCount = "entry_count"
         case lastUpdated = "last_updated"
         case slugHint = "slug_hint"
+        case location
+        case failedAt = "failed_at"
+        case lastError = "last_error"
     }
 }
 
