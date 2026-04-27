@@ -79,13 +79,33 @@ def find_wal(origin: Path, db_prefix: str) -> Path | None:
 # ── WAL Parsing ────────────────────────────────────────────────────────────────
 
 def read_wal_strings(wal_path: Path) -> list[str]:
-    """Copy WAL to temp file and extract printable strings."""
+    """Copy WAL to temp file and extract printable strings.
+
+    Runs `strings(1)` with `-n 2` instead of the default `-n 4`. macOS's
+    default 4-byte minimum drops short utterances ("OK", "Hi", "No",
+    "Hmm") and short speaker names ("Li", "An", "Bo") — they simply
+    never make it into the parser input, so transcripts come back with
+    the speaker labeled "Unknown" and one-word answers missing entirely.
+
+    Lowering to 2 means more raw lines come through, but the parser is
+    structural — it only treats a line as a value when the line BEFORE
+    it is a known token like `messageId`, `message`, `username`, or
+    `meetingId`. Random two-byte ASCII garbage that happens to live
+    inside a WAL page doesn't cluster around those tokens, so the noise
+    floor stays low. The downstream `is_real_text` validator (length,
+    junk-word, must-contain-letter) catches anything that does slip
+    through.
+
+    The cost is a modestly larger strings() output (a few % in practice
+    on the Zoom WAL — measured empirically). Worth it for the
+    correctness win on short answers and short names.
+    """
     with tempfile.NamedTemporaryFile(suffix=".wal", delete=False) as tf:
         tmp = Path(tf.name)
     try:
         shutil.copy2(wal_path, tmp)
         result = subprocess.run(
-            ["/usr/bin/strings", str(tmp)],
+            ["/usr/bin/strings", "-n", "2", str(tmp)],
             capture_output=True,
             text=True,
             errors="replace",
@@ -648,8 +668,14 @@ def parse_transcript(wal_path: Path, meeting_id_filter: str | None = None) -> li
                         meeting_id = lines[j + 1]
                         break
 
+                # Length floor lowered from >3 to >=2 in tandem with the
+                # `strings -n 2` change in read_wal_strings — without this,
+                # the short utterances that strings now emits would be
+                # filtered right back out here. The other validators (junk
+                # word list, prefix bans, must-contain-letter) carry the
+                # weight that the length check used to.
                 is_real_text = (
-                    len(text) > 3
+                    len(text) >= 2
                     and text not in _JUNK_EXACT
                     and not text.startswith(("{", "http", "BLOCK_", "PRODUCT_", "16:0:"))
                     and not text.isdigit()
