@@ -12,12 +12,15 @@ JSON events emitted to stdout:
   {"event": "state", "value": "idle"}
   {"event": "state", "value": "active", "meeting_id": "<id>"}
   {"event": "state", "value": "generating"}
-  {"event": "done", "title": "...", "path": "...", "transcript_path": "...", "attendees": [...]}
+  {"event": "done", "title": "...", "path": "...", "transcript_path": "...", "attendees": [...], "meeting_id": "..."}
+  {"event": "recovery_available", "meeting_id": "...", "entry_count": N, "last_updated": "...", "slug_hint": "..."}
   {"event": "error", "message": "..."}
 
 stdin commands accepted (one JSON object per line):
-  {"cmd": "generate"}     — manual trigger
-  {"cmd": "reload"}       — reload settings (also triggered by SIGHUP)
+  {"cmd": "generate"}                       — manual trigger
+  {"cmd": "reload"}                         — reload settings (also triggered by SIGHUP)
+  {"cmd": "retry", "meeting_id": "..."}     — retry a meeting whose LLM call just failed
+  {"cmd": "recover", "meeting_id": "..."}   — recover a meeting from a prior crash
 """
 
 import concurrent.futures
@@ -74,6 +77,7 @@ from zoom_notes import (
     load_persisted_accumulator,
     delete_persisted_accumulator,
     purge_stale_accumulators,
+    list_recoverable_meetings,
 )
 
 
@@ -165,7 +169,21 @@ class ZoomEngine:
         self._ticks_since_persist: int = 0
 
         # Purge stale in-progress cache files left over from prior crashes.
+        # Order matters: purge first so the recovery scan that follows only
+        # surfaces snapshots inside the live retention window.
         purge_stale_accumulators()
+
+        # Snapshot any in-progress accumulators that survived purge so run()
+        # can emit `recovery_available` events on startup. We capture this in
+        # __init__ rather than at run() time so a crash between those two
+        # phases doesn't lose the list. The Swift menu bar uses these events
+        # to surface a "Recover unfinished meeting" item — without this,
+        # cached transcripts from a prior crash are unreachable through the
+        # UI even though they're sitting on disk.
+        try:
+            self._recoverable_at_startup: list[dict] = list_recoverable_meetings()
+        except Exception:
+            self._recoverable_at_startup = []
 
         # Config (reloaded on SIGHUP or "reload" command)
         self._cfg_lock = threading.Lock()
@@ -306,6 +324,22 @@ class ZoomEngine:
             "zoom_installed": initial_origin is not None,
             "wal_path": str(initial_origin) if initial_origin else None,
         })
+
+        # Surface any in-progress accumulators left over from a prior crash.
+        # Emitted between `ready` and the first `state` event so the UI can
+        # render a "Recover unfinished meeting" menu before the engine starts
+        # actively polling. The UI is responsible for suppressing recovery
+        # entries whose meeting_id later matches an `active` state event —
+        # those will be auto-resumed via the existing IDLE→ACTIVE seed path.
+        for rec in self._recoverable_at_startup:
+            emit({
+                "event": "recovery_available",
+                "meeting_id": rec["meeting_id"],
+                "entry_count": rec["entry_count"],
+                "last_updated": rec["last_updated"],
+                "slug_hint": rec["slug_hint"],
+            })
+
         emit({"event": "state", "value": EngineState.IDLE})
 
         threading.Thread(target=self._stdin_reader, daemon=True).start()
@@ -716,6 +750,7 @@ class ZoomEngine:
             "path": str(note_path),
             "transcript_path": str(transcript_path),
             "attendees": attendees,
+            "meeting_id": active_meeting_id or "",
         })
 
     def _collect_entries_for_generation(self, transcript_wal, active_meeting_id):
@@ -792,6 +827,18 @@ class ZoomEngine:
                 emit({"event": "error", "message": "Zoom WAL directory not found."})
         elif action == "retry":
             meeting_id = cmd.get("meeting_id") or ""
+            self._trigger_retry(meeting_id)
+        elif action == "recover":
+            # Recovery is mechanically identical to retry — load the persisted
+            # accumulator, re-derive title from blocks WAL, run the LLM,
+            # write the note. The distinction is purely intent-level: retry
+            # operates on a meeting whose failure was just observed in this
+            # engine session; recover operates on one whose failure happened
+            # in a prior session and was found at startup.
+            meeting_id = cmd.get("meeting_id") or ""
+            if not meeting_id:
+                emit({"event": "error", "message": "recover command requires meeting_id."})
+                return
             self._trigger_retry(meeting_id)
 
     # ── Retry flow ──────────────────────────────────────────────────────────
@@ -904,6 +951,7 @@ class ZoomEngine:
                     "path": str(note_path),
                     "transcript_path": (failed or {}).get("transcript_path", ""),
                     "attendees": attendees,
+                    "meeting_id": meeting_id,
                 })
             except Exception as exc:
                 emit({"event": "error", "message": _friendly_error(exc)})

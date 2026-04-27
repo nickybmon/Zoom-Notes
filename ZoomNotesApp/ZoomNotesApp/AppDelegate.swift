@@ -187,6 +187,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
+        // Recoverable meetings — in-progress accumulators left on disk by a
+        // prior crashed engine session. Single recovery shows inline; two or
+        // more collapse into a submenu to keep the menu compact.
+        if !appState.recoverableMeetings.isEmpty {
+            if appState.recoverableMeetings.count == 1 {
+                let rec = appState.recoverableMeetings[0]
+                let recoverItem = NSMenuItem(
+                    title: "Recover unfinished meeting (\(rec.entryCount) entries)",
+                    action: #selector(recoverFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                recoverItem.representedObject = rec.meetingId
+                recoverItem.target = self
+                menu.addItem(recoverItem)
+
+                let detail = NSMenuItem(
+                    title: "    \(rec.slugHint)",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                detail.isEnabled = false
+                menu.addItem(detail)
+            } else {
+                let parent = NSMenuItem(
+                    title: "Recover unfinished meetings (\(appState.recoverableMeetings.count))",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                let submenu = NSMenu()
+                for rec in appState.recoverableMeetings {
+                    let item = NSMenuItem(
+                        title: "\(rec.slugHint) — \(rec.entryCount) entries",
+                        action: #selector(recoverFromMenu(_:)),
+                        keyEquivalent: ""
+                    )
+                    item.representedObject = rec.meetingId
+                    item.target = self
+                    submenu.addItem(item)
+                }
+                parent.submenu = submenu
+                menu.addItem(parent)
+            }
+            menu.addItem(.separator())
+        }
+
         // Retry note generation if a failed meeting is queued. The transcript
         // is already on disk; this just re-runs the LLM call.
         if let failure = appState.lastFailedMeeting {
@@ -291,6 +336,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     @objc func retryFailed() {
         ConsoleLogger.shared.logUserAction("Retry note generation")
         appState.retryFailedMeeting()
+    }
+
+    @objc func recoverFromMenu(_ sender: NSMenuItem) {
+        guard let mid = sender.representedObject as? String,
+              let rec = appState.recoverableMeetings.first(where: { $0.meetingId == mid }) else {
+            return
+        }
+        ConsoleLogger.shared.logUserAction("Recover unfinished meeting (\(rec.entryCount) entries)")
+        appState.recoverMeeting(rec)
     }
 
     @objc func showSettings() {
@@ -451,6 +505,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             .store(in: &cancellables)
 
         appState.$lastFailedMeeting
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateMenuBar() }
+            .store(in: &cancellables)
+
+        appState.$recoverableMeetings
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateMenuBar() }
             .store(in: &cancellables)

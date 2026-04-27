@@ -20,6 +20,20 @@ struct FailedMeeting: Equatable {
     let message: String
 }
 
+/// A persisted in-progress accumulator found at engine startup — the
+/// survivor of a prior crash. The transcript itself is NOT yet on disk in
+/// the user's Notes/Transcripts folders; only the cache snapshot is. The
+/// "recover" command runs the same pipeline as a normal end-of-meeting
+/// finalize: derive title, save transcript, run LLM, save note.
+struct RecoverableMeeting: Equatable, Identifiable {
+    let meetingId: String
+    let entryCount: Int
+    let lastUpdated: String
+    let slugHint: String
+
+    var id: String { meetingId }
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var engineState: EngineState = .idle
@@ -37,6 +51,14 @@ class AppState: ObservableObject {
     // Most recent meeting whose note generation failed. Drives the menu bar
     // "Retry note generation" item. Cleared on successful retry.
     @Published var lastFailedMeeting: FailedMeeting?
+
+    // Meetings whose in-progress accumulator survived a prior crash. Emitted
+    // by the engine at startup as `recovery_available` events. Drives the
+    // menu bar "Recover unfinished meeting" submenu. Entries are removed:
+    //   - when the user successfully recovers them (via `done` event)
+    //   - when an `active` state event arrives with the same meeting_id
+    //     (the IDLE→ACTIVE seed-from-snapshot path will auto-resume them)
+    @Published var recoverableMeetings: [RecoverableMeeting] = []
 
     let engineManager = EngineManager()
     private var cancellables = Set<AnyCancellable>()
@@ -88,6 +110,27 @@ class AppState: ObservableObject {
         case "state":
             engineStartupSettled = true
             engineState = EngineState(event.value)
+            // If the engine just transitioned to ACTIVE for a meeting that was
+            // also surfaced as recoverable, drop it from the recovery list —
+            // the IDLE→ACTIVE seed-from-snapshot path will auto-resume it and
+            // showing a manual "Recover" item alongside is confusing.
+            if event.value == "active",
+               let mid = event.meetingId,
+               !mid.isEmpty {
+                recoverableMeetings.removeAll { $0.meetingId == mid }
+            }
+        case "recovery_available":
+            guard let mid = event.meetingId, !mid.isEmpty else { break }
+            // De-dupe — the engine doesn't emit duplicates today, but if the
+            // engine restarts and the same meeting is still on disk we don't
+            // want to show two menu entries.
+            guard !recoverableMeetings.contains(where: { $0.meetingId == mid }) else { break }
+            recoverableMeetings.append(RecoverableMeeting(
+                meetingId: mid,
+                entryCount: event.entryCount ?? 0,
+                lastUpdated: event.lastUpdated ?? "",
+                slugHint: event.slugHint ?? "Recovered meeting"
+            ))
         case "done":
             engineState = .idle
             if let title = event.title {
@@ -99,6 +142,12 @@ class AppState: ObservableObject {
             // A successful "done" supersedes any prior failure for the same
             // meeting (this is what the retry path emits on success).
             lastFailedMeeting = nil
+            // And clears it from the recovery list — the user-facing
+            // outcome is the same whether the meeting was just recovered
+            // from a prior crash or completed normally.
+            if let mid = event.meetingId, !mid.isEmpty {
+                recoverableMeetings.removeAll { $0.meetingId == mid }
+            }
         case "note_failed":
             engineState = .idle
             let failure = FailedMeeting(
@@ -132,6 +181,15 @@ class AppState: ObservableObject {
         let target = failure ?? lastFailedMeeting
         guard let target else { return }
         engineManager.sendCommand(["cmd": "retry", "meeting_id": target.meetingId])
+    }
+
+    /// Recover a meeting whose in-progress accumulator survived a prior crash.
+    /// Mechanically identical to retry — the engine routes both through
+    /// `_trigger_retry`. The two are kept distinct as separate stdin commands
+    /// so the protocol intent stays explicit and the engine can later add
+    /// recovery-only telemetry without entangling it with retry.
+    func recoverMeeting(_ meeting: RecoverableMeeting) {
+        engineManager.sendCommand(["cmd": "recover", "meeting_id": meeting.meetingId])
     }
 
     // MARK: - Notifications
