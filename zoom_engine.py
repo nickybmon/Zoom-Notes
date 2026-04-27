@@ -13,7 +13,7 @@ JSON events emitted to stdout:
   {"event": "state", "value": "active", "meeting_id": "<id>"}
   {"event": "state", "value": "generating"}
   {"event": "done", "title": "...", "path": "...", "transcript_path": "...", "attendees": [...], "meeting_id": "..."}
-  {"event": "recovery_available", "meeting_id": "...", "entry_count": N, "last_updated": "...", "slug_hint": "..."}
+  {"event": "recovery_available", "meeting_id": "...", "entry_count": N, "last_updated": "...", "slug_hint": "...", "location": "root|failed", "title": "...?", "failed_at": "...?", "last_error": "...?"}
   {"event": "error", "message": "..."}
 
 stdin commands accepted (one JSON object per line):
@@ -78,6 +78,7 @@ from zoom_notes import (
     delete_persisted_accumulator,
     purge_stale_accumulators,
     list_recoverable_meetings,
+    mark_meeting_failed,
 )
 
 
@@ -332,13 +333,25 @@ class ZoomEngine:
         # entries whose meeting_id later matches an `active` state event —
         # those will be auto-resumed via the existing IDLE→ACTIVE seed path.
         for rec in self._recoverable_at_startup:
-            emit({
+            evt = {
                 "event": "recovery_available",
                 "meeting_id": rec["meeting_id"],
                 "entry_count": rec["entry_count"],
                 "last_updated": rec["last_updated"],
                 "slug_hint": rec["slug_hint"],
-            })
+                "location": rec.get("location", "root"),
+            }
+            # Confirmed-failed snapshots (in `failed/`) carry sidecar metadata
+            # — pass through what we have so the menu bar can render a richer
+            # label like "Sales Sync — failed 3 days ago" instead of the
+            # speaker-name slug hint.
+            if rec.get("title"):
+                evt["title"] = rec["title"]
+            if rec.get("failed_at"):
+                evt["failed_at"] = rec["failed_at"]
+            if rec.get("last_error"):
+                evt["last_error"] = rec["last_error"]
+            emit(evt)
 
         emit({"event": "state", "value": EngineState.IDLE})
 
@@ -718,7 +731,7 @@ class ZoomEngine:
             )
             placeholder_path = save_note_only(placeholder, meeting_title, date_str, cfg)
             self._last_run_note_failed = True
-            self._last_failed_meeting = {
+            failed_record = {
                 "meeting_id": active_meeting_id or "",
                 "title": slug,
                 "note_path": str(placeholder_path),
@@ -727,6 +740,16 @@ class ZoomEngine:
                 "date_str": date_str,
                 "attendees": attendees,
             }
+            self._last_failed_meeting = failed_record
+            # Promote the snapshot from root cache into `failed/` so the
+            # 30-day purge applies (instead of 24h) and the menu bar can
+            # surface a labeled recovery item even after a long delay.
+            # This MUST run before the worker's post-_generate_notes
+            # cleanup — that block keeps the root snapshot intact only
+            # while `_last_run_note_failed` is True; promoting it here
+            # means root is empty afterward and `failed/` owns the data.
+            if active_meeting_id:
+                mark_meeting_failed(active_meeting_id, metadata=failed_record)
             emit({
                 "event": "note_failed",
                 "title": slug,
@@ -914,6 +937,22 @@ class ZoomEngine:
                 try:
                     summary = summarize(transcript_text, meeting_title, cfg)
                 except Exception as exc:
+                    err_msg = _friendly_error(exc)
+                    # Refresh the failed/ sidecar so the menu bar shows the
+                    # latest error and a fresh `failed_at` (the file's mtime
+                    # also gets bumped, which keeps it inside the 30-day
+                    # purge window for another month). The .json/.md moves
+                    # are no-ops when already in failed/, so this is safe
+                    # to call repeatedly.
+                    mark_meeting_failed(meeting_id, metadata={
+                        "meeting_id": meeting_id,
+                        "title": slug,
+                        "note_path": placeholder_path_str,
+                        "transcript_path": (failed or {}).get("transcript_path", ""),
+                        "message": err_msg,
+                        "date_str": date_str,
+                        "attendees": attendees,
+                    })
                     emit({
                         "event": "note_failed",
                         "title": slug,
@@ -921,7 +960,7 @@ class ZoomEngine:
                         "transcript_path": (failed or {}).get("transcript_path", ""),
                         "meeting_id": meeting_id,
                         "attendees": attendees,
-                        "message": _friendly_error(exc),
+                        "message": err_msg,
                     })
                     return
 

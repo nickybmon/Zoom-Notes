@@ -21,17 +21,42 @@ struct FailedMeeting: Equatable {
 }
 
 /// A persisted in-progress accumulator found at engine startup — the
-/// survivor of a prior crash. The transcript itself is NOT yet on disk in
-/// the user's Notes/Transcripts folders; only the cache snapshot is. The
-/// "recover" command runs the same pipeline as a normal end-of-meeting
-/// finalize: derive title, save transcript, run LLM, save note.
+/// survivor of a prior crash or a previously-failed LLM call. The
+/// transcript itself MAY already be on disk (for confirmed-failed
+/// meetings, transcript_path is populated and the user has the file in
+/// their Notes/Transcripts folder); for crashed-mid-meeting recoveries
+/// it is not. The "recover" command runs the same pipeline as a normal
+/// end-of-meeting finalize: derive title, save transcript if needed,
+/// run LLM, save note.
 struct RecoverableMeeting: Equatable, Identifiable {
+    /// Where the snapshot lives on disk, which determines retention:
+    ///   .root   — live or just-failed, 24h window
+    ///   .failed — confirmed-failed (LLM error), 30-day window, has sidecar
+    enum Location: String {
+        case root
+        case failed
+    }
+
     let meetingId: String
     let entryCount: Int
     let lastUpdated: String
     let slugHint: String
+    let location: Location
+    /// Set when location == .failed and the sidecar carried the title.
+    let title: String?
+    /// ISO timestamp when the snapshot was promoted to failed/. Used by
+    /// the menu bar to render "(failed N days ago)".
+    let failedAt: String?
+    let lastError: String?
 
     var id: String { meetingId }
+
+    /// Best human-readable label for the menu bar item. Title from sidecar
+    /// wins; otherwise fall back to the speaker/timestamp slug hint.
+    var displayLabel: String {
+        if let t = title, !t.isEmpty { return t }
+        return slugHint
+    }
 }
 
 @MainActor
@@ -125,11 +150,18 @@ class AppState: ObservableObject {
             // engine restarts and the same meeting is still on disk we don't
             // want to show two menu entries.
             guard !recoverableMeetings.contains(where: { $0.meetingId == mid }) else { break }
+            let location = RecoverableMeeting.Location(
+                rawValue: event.location ?? "root"
+            ) ?? .root
             recoverableMeetings.append(RecoverableMeeting(
                 meetingId: mid,
                 entryCount: event.entryCount ?? 0,
                 lastUpdated: event.lastUpdated ?? "",
-                slugHint: event.slugHint ?? "Recovered meeting"
+                slugHint: event.slugHint ?? "Recovered meeting",
+                location: location,
+                title: event.title,
+                failedAt: event.failedAt,
+                lastError: event.lastError
             ))
         case "done":
             engineState = .idle

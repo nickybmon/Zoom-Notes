@@ -180,6 +180,13 @@ def detect_active_meeting_id(wal_path: Path) -> str | None:
 # ── Transcript persistence ─────────────────────────────────────────────────────
 
 _CACHE_DIR = Path.home() / ".cache" / "zoom-notes"
+# Confirmed-failed snapshots get moved here from the root cache. Purge
+# window is much wider (30 days vs 24h for the root) because the user
+# may need a long time to notice / fix the underlying cause (API down,
+# quota exceeded, on vacation, etc.).
+_FAILED_SUBDIR = "failed"
+_FAILED_SIDECAR_NAME = "failed.json"
+_FAILED_PURGE_SECS = 30 * 24 * 3600
 
 
 def _atomic_write_text(path: Path, data: str) -> None:
@@ -242,11 +249,36 @@ def persist_accumulator(meeting_id: str, entries: dict) -> None:
         pass
 
 
-def load_persisted_accumulator(meeting_id: str) -> dict | None:
-    """Load a previously persisted accumulator snapshot keyed by msg_id."""
+def _failed_dir() -> Path:
+    return _CACHE_DIR / _FAILED_SUBDIR
+
+
+def _persisted_paths(meeting_id: str) -> tuple[Path | None, str]:
+    """Resolve the on-disk snapshot for `meeting_id`, checking root first
+    then `failed/`. Returns (path_or_none, location) where location is
+    'root', 'failed', or '' if not found. Used by retry/recover to find
+    the snapshot regardless of which lifecycle bucket it currently sits in.
+    """
     slug = _safe_meeting_id_slug(meeting_id)
-    path = _CACHE_DIR / f"in-progress-{slug}.json"
-    if not path.exists():
+    root_path = _CACHE_DIR / f"in-progress-{slug}.json"
+    if root_path.exists():
+        return root_path, "root"
+    failed_path = _failed_dir() / f"in-progress-{slug}.json"
+    if failed_path.exists():
+        return failed_path, "failed"
+    return None, ""
+
+
+def load_persisted_accumulator(meeting_id: str) -> dict | None:
+    """Load a previously persisted accumulator snapshot keyed by msg_id.
+
+    Searches the root cache first (live + recently-failed meetings), then
+    falls back to `failed/` (confirmed-failed meetings inside their 30-day
+    retention window). This dual-lookup is what lets retry / recover keep
+    working even after a failed meeting has been promoted out of root.
+    """
+    path, _location = _persisted_paths(meeting_id)
+    if path is None:
         return None
     try:
         entries = json.loads(path.read_text(encoding="utf-8"))
@@ -256,45 +288,111 @@ def load_persisted_accumulator(meeting_id: str) -> dict | None:
 
 
 def delete_persisted_accumulator(meeting_id: str) -> None:
-    """Remove the in-progress snapshot after successful note generation."""
+    """Remove the in-progress snapshot after successful note generation.
+
+    Clears BOTH the root and the `failed/` location. The retry success path
+    is the one common entry point that should clean up regardless of which
+    bucket the snapshot was sitting in — without this, a successfully
+    retried meeting would linger in `failed/` for 30 days and keep showing
+    up as a recoverable item in the menu.
+    """
     slug = _safe_meeting_id_slug(meeting_id)
-    for ext in (".json", ".md"):
+    targets = [
+        _CACHE_DIR / f"in-progress-{slug}.json",
+        _CACHE_DIR / f"in-progress-{slug}.md",
+        _failed_dir() / f"in-progress-{slug}.json",
+        _failed_dir() / f"in-progress-{slug}.md",
+        _failed_dir() / f"{slug}.{_FAILED_SIDECAR_NAME}",
+    ]
+    for path in targets:
         try:
-            (_CACHE_DIR / f"in-progress-{slug}{ext}").unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
         except OSError:
             pass
 
 
-def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
-    """Scan the cache dir for in-progress accumulator files left from prior runs.
+def mark_meeting_failed(meeting_id: str, metadata: dict | None = None) -> None:
+    """Promote a snapshot from the root cache into `failed/`.
 
-    Returns a list of dicts, one per recoverable meeting, sorted by
-    last-updated time descending (newest first). Each dict has:
-      - meeting_id    : the original Zoom meeting ID (extracted from inside
-                        the JSON, since the on-disk slug is lossy)
-      - entry_count   : number of unique transcript entries on disk
-      - last_updated  : ISO8601 timestamp of the snapshot's mtime
-      - last_updated_ts: float unix timestamp (for sorting / age comparisons)
-      - slug_hint     : a best-effort human-readable label derived from the
-                        first speaker + earliest timestamp, used by the UI
-                        when no full meeting title is available
-      - path          : absolute path to the JSON snapshot
+    Called from the engine's note_failed branch after the placeholder note
+    is written. Moves both the .json and .md files atomically and writes
+    a sidecar with the metadata the menu bar needs to label the recovery
+    item ("Sales Sync — failed 3 days ago", etc.).
 
-    Files with fewer than `min_entries` entries are skipped — they're either
-    empty placeholders from a meeting that ended before any speech, or
-    corrupt JSON. The caller (engine startup) uses this to decide whether to
-    emit a recovery_available event.
+    Idempotent: if the snapshot is already in `failed/` (e.g. retry
+    failed again), the .json/.md moves are no-ops and the sidecar is
+    rewritten with fresh metadata + a refreshed `failed_at` timestamp.
 
-    Critical: this function reads the meeting_id from inside the JSON rather
-    than parsing it out of the filename. `_safe_meeting_id_slug` replaces
-    non-alphanumeric chars with `_` for filesystem safety, which is lossy —
-    `abc+/=` and `abc___` would both produce the same filename. The original
-    ID is only recoverable from the entries themselves.
+    `metadata` is a dict written verbatim to the sidecar. Recommended keys:
+      title, attendees, transcript_path, note_path, message, date_str.
+    `failed_at` is always added/refreshed by this function.
     """
-    if not _CACHE_DIR.exists():
-        return []
+    slug = _safe_meeting_id_slug(meeting_id)
+    failed_dir = _failed_dir()
+    try:
+        failed_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    for ext in (".json", ".md"):
+        src = _CACHE_DIR / f"in-progress-{slug}{ext}"
+        dst = failed_dir / f"in-progress-{slug}{ext}"
+        if src.exists():
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
+
+    sidecar = dict(metadata or {})
+    sidecar["meeting_id"] = meeting_id
+    sidecar["failed_at"] = datetime.now().isoformat(timespec="seconds")
+    sidecar_path = failed_dir / f"{slug}.{_FAILED_SIDECAR_NAME}"
+    try:
+        _atomic_write_text(
+            sidecar_path,
+            json.dumps(sidecar, ensure_ascii=False),
+        )
+    except OSError:
+        pass
+
+
+def clear_failed_meeting(meeting_id: str) -> None:
+    """Remove the `failed/` snapshot + sidecar after a successful retry.
+
+    Distinct entry point from `delete_persisted_accumulator` so callers
+    that have already cleaned up root can target only the failed bucket
+    without re-touching root paths. In practice the retry path uses
+    `delete_persisted_accumulator` (clears both); this is here for tests
+    and for any future caller that wants surgical cleanup.
+    """
+    slug = _safe_meeting_id_slug(meeting_id)
+    failed_dir = _failed_dir()
+    targets = [
+        failed_dir / f"in-progress-{slug}.json",
+        failed_dir / f"in-progress-{slug}.md",
+        failed_dir / f"{slug}.{_FAILED_SIDECAR_NAME}",
+    ]
+    for path in targets:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _scan_recoverable_in_dir(
+    directory: Path, min_entries: int, location: str
+) -> list[dict]:
+    """Scan one cache directory for in-progress accumulator files.
+
+    Helper for `list_recoverable_meetings` — extracted so we can scan the
+    root and `failed/` buckets with the same logic but tag the results
+    with their location and (for failed/) merge sidecar metadata.
+    """
     out: list[dict] = []
-    for json_path in _CACHE_DIR.glob("in-progress-*.json"):
+    if not directory.exists():
+        return out
+
+    for json_path in directory.glob("in-progress-*.json"):
         try:
             entries = json.loads(json_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -309,10 +407,6 @@ def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
         if not meeting_ids:
             continue
         if len(meeting_ids) > 1:
-            # Multiple meetings in one snapshot would be a bug elsewhere — we
-            # never persist mixed accumulators on purpose. Pick the most
-            # frequent and log nothing (this is an error-recovery code path,
-            # not a place to drop data).
             from collections import Counter
             counter = Counter(
                 e.get("meeting_id") for e in entries
@@ -345,24 +439,114 @@ def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
             slug_hint_parts.append(earliest_ts)
         slug_hint = " — ".join(slug_hint_parts) if slug_hint_parts else "Recovered meeting"
 
-        out.append({
+        record = {
             "meeting_id": meeting_id,
             "entry_count": len(entries),
             "last_updated": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
             "last_updated_ts": mtime,
             "slug_hint": slug_hint,
             "path": str(json_path),
-        })
+            "location": location,
+        }
 
+        if location == "failed":
+            slug = _safe_meeting_id_slug(meeting_id)
+            sidecar_path = directory / f"{slug}.{_FAILED_SIDECAR_NAME}"
+            if sidecar_path.exists():
+                try:
+                    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    if isinstance(sidecar, dict):
+                        if sidecar.get("title"):
+                            record["title"] = sidecar["title"]
+                            record["slug_hint"] = sidecar["title"]
+                        if sidecar.get("failed_at"):
+                            record["failed_at"] = sidecar["failed_at"]
+                        if sidecar.get("message"):
+                            record["last_error"] = sidecar["message"]
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+        out.append(record)
+
+    return out
+
+
+def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
+    """Scan the cache dir for in-progress accumulator files left from prior runs.
+
+    Returns a list of dicts, one per recoverable meeting, sorted by
+    last-updated time descending (newest first). Each dict has:
+      - meeting_id     : the original Zoom meeting ID (extracted from inside
+                         the JSON, since the on-disk slug is lossy)
+      - entry_count    : number of unique transcript entries on disk
+      - last_updated   : ISO8601 timestamp of the snapshot's mtime
+      - last_updated_ts: float unix timestamp (for sorting / age comparisons)
+      - slug_hint      : a best-effort human-readable label derived from the
+                         first speaker + earliest timestamp (or the title
+                         from the failed/ sidecar when present)
+      - path           : absolute path to the JSON snapshot
+      - location       : 'root' (live or just-failed) or 'failed' (confirmed-
+                         failed, sitting in `failed/` inside its 30-day window)
+
+    For `location == 'failed'` records, additional fields populated from the
+    sidecar when present:
+      - title          : the human meeting title at the time of failure
+      - failed_at      : ISO8601 timestamp the snapshot was promoted to failed/
+      - last_error     : the LLM error message that triggered the failure
+
+    Files with fewer than `min_entries` entries are skipped — they're either
+    empty placeholders from a meeting that ended before any speech, or
+    corrupt JSON. The caller (engine startup) uses this to decide whether to
+    emit a recovery_available event.
+
+    De-duplication: if the same meeting_id appears in BOTH root and failed/
+    (briefly possible during the move, or after a snapshot was re-persisted
+    after a failed retry started), the failed/ entry wins — its sidecar has
+    the title metadata that produces a better menu bar label.
+
+    Critical: this function reads the meeting_id from inside the JSON rather
+    than parsing it out of the filename. `_safe_meeting_id_slug` replaces
+    non-alphanumeric chars with `_` for filesystem safety, which is lossy —
+    `abc+/=` and `abc___` would both produce the same filename. The original
+    ID is only recoverable from the entries themselves.
+    """
+    if not _CACHE_DIR.exists():
+        return []
+    root = _scan_recoverable_in_dir(_CACHE_DIR, min_entries, "root")
+    failed = _scan_recoverable_in_dir(_failed_dir(), min_entries, "failed")
+
+    by_id: dict[str, dict] = {}
+    for record in root:
+        by_id[record["meeting_id"]] = record
+    for record in failed:
+        by_id[record["meeting_id"]] = record
+
+    out = list(by_id.values())
     out.sort(key=lambda d: d["last_updated_ts"], reverse=True)
     return out
 
 
-def purge_stale_accumulators(max_age_secs: int = 24 * 3600) -> None:
-    """Delete in-progress cache files older than max_age_secs (default 24h).
+def purge_stale_accumulators(
+    max_age_secs: int = 24 * 3600,
+    failed_max_age_secs: int = _FAILED_PURGE_SECS,
+) -> None:
+    """Delete in-progress cache files older than the appropriate retention window.
 
-    24h is wide enough that a same-day retry always has the cache available,
-    while still cleaning up forgotten snapshots from prior days.
+    Two separate windows govern the two cache buckets:
+
+      ROOT (`~/.cache/zoom-notes/in-progress-*`)
+        Default: 24h. Wide enough that a same-day retry always has the cache
+        available, while still cleaning up forgotten snapshots from prior
+        days. Live meetings that just ended sit here briefly before being
+        either deleted (success) or promoted to failed/ (LLM error).
+
+      FAILED (`~/.cache/zoom-notes/failed/in-progress-*` + sidecars)
+        Default: 30 days. Confirmed failures need a much wider window
+        because the user may not notice / fix the underlying cause for
+        days (API quota, vacation, broken model config). The transcript
+        is already on disk in the user's Notes/Transcripts folder, but
+        the cache snapshot is the only way to retry note generation
+        without re-parsing the WAL — we can't reconstruct it later.
     """
     if not _CACHE_DIR.exists():
         return
@@ -371,6 +555,22 @@ def purge_stale_accumulators(max_age_secs: int = 24 * 3600) -> None:
         for f in _CACHE_DIR.glob(pattern):
             try:
                 if now - f.stat().st_mtime > max_age_secs:
+                    f.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    failed_dir = _failed_dir()
+    if not failed_dir.exists():
+        return
+    for pattern in (
+        "in-progress-*.json",
+        "in-progress-*.md",
+        "in-progress-*.tmp",
+        f"*.{_FAILED_SIDECAR_NAME}",
+    ):
+        for f in failed_dir.glob(pattern):
+            try:
+                if now - f.stat().st_mtime > failed_max_age_secs:
                     f.unlink(missing_ok=True)
             except OSError:
                 pass
