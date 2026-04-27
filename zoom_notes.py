@@ -265,6 +265,99 @@ def delete_persisted_accumulator(meeting_id: str) -> None:
             pass
 
 
+def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
+    """Scan the cache dir for in-progress accumulator files left from prior runs.
+
+    Returns a list of dicts, one per recoverable meeting, sorted by
+    last-updated time descending (newest first). Each dict has:
+      - meeting_id    : the original Zoom meeting ID (extracted from inside
+                        the JSON, since the on-disk slug is lossy)
+      - entry_count   : number of unique transcript entries on disk
+      - last_updated  : ISO8601 timestamp of the snapshot's mtime
+      - last_updated_ts: float unix timestamp (for sorting / age comparisons)
+      - slug_hint     : a best-effort human-readable label derived from the
+                        first speaker + earliest timestamp, used by the UI
+                        when no full meeting title is available
+      - path          : absolute path to the JSON snapshot
+
+    Files with fewer than `min_entries` entries are skipped — they're either
+    empty placeholders from a meeting that ended before any speech, or
+    corrupt JSON. The caller (engine startup) uses this to decide whether to
+    emit a recovery_available event.
+
+    Critical: this function reads the meeting_id from inside the JSON rather
+    than parsing it out of the filename. `_safe_meeting_id_slug` replaces
+    non-alphanumeric chars with `_` for filesystem safety, which is lossy —
+    `abc+/=` and `abc___` would both produce the same filename. The original
+    ID is only recoverable from the entries themselves.
+    """
+    if not _CACHE_DIR.exists():
+        return []
+    out: list[dict] = []
+    for json_path in _CACHE_DIR.glob("in-progress-*.json"):
+        try:
+            entries = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(entries, list) or len(entries) < min_entries:
+            continue
+
+        meeting_ids = {
+            e.get("meeting_id") for e in entries
+            if isinstance(e, dict) and e.get("meeting_id")
+        }
+        if not meeting_ids:
+            continue
+        if len(meeting_ids) > 1:
+            # Multiple meetings in one snapshot would be a bug elsewhere — we
+            # never persist mixed accumulators on purpose. Pick the most
+            # frequent and log nothing (this is an error-recovery code path,
+            # not a place to drop data).
+            from collections import Counter
+            counter = Counter(
+                e.get("meeting_id") for e in entries
+                if isinstance(e, dict) and e.get("meeting_id")
+            )
+            meeting_id = counter.most_common(1)[0][0]
+        else:
+            meeting_id = next(iter(meeting_ids))
+
+        try:
+            mtime = json_path.stat().st_mtime
+        except OSError:
+            continue
+
+        first_speaker = next(
+            (e.get("speaker") for e in entries
+             if isinstance(e, dict) and e.get("speaker") and e.get("speaker") != "Unknown"),
+            None,
+        )
+        timestamps = sorted(
+            e.get("timestamp") for e in entries
+            if isinstance(e, dict) and e.get("timestamp")
+        )
+        earliest_ts = timestamps[0] if timestamps else None
+
+        slug_hint_parts = []
+        if first_speaker:
+            slug_hint_parts.append(first_speaker)
+        if earliest_ts:
+            slug_hint_parts.append(earliest_ts)
+        slug_hint = " — ".join(slug_hint_parts) if slug_hint_parts else "Recovered meeting"
+
+        out.append({
+            "meeting_id": meeting_id,
+            "entry_count": len(entries),
+            "last_updated": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+            "last_updated_ts": mtime,
+            "slug_hint": slug_hint,
+            "path": str(json_path),
+        })
+
+    out.sort(key=lambda d: d["last_updated_ts"], reverse=True)
+    return out
+
+
 def purge_stale_accumulators(max_age_secs: int = 24 * 3600) -> None:
     """Delete in-progress cache files older than max_age_secs (default 24h).
 

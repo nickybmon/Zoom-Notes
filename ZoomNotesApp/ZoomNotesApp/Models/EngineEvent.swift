@@ -35,6 +35,12 @@ struct EngineEvent: Decodable {
     let kind: String?
     let count: Int?
 
+    // Present on "recovery_available" events (one per persisted accumulator
+    // found at engine startup — survivors of a prior crash).
+    let entryCount: Int?
+    let lastUpdated: String?
+    let slugHint: String?
+
     enum CodingKeys: String, CodingKey {
         case event
         case value
@@ -49,6 +55,9 @@ struct EngineEvent: Decodable {
         case walPath = "wal_path"
         case kind
         case count
+        case entryCount = "entry_count"
+        case lastUpdated = "last_updated"
+        case slugHint = "slug_hint"
     }
 }
 
