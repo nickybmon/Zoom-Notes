@@ -245,12 +245,30 @@ def persist_accumulator(meeting_id: str, entries: dict) -> None:
 
     Both files are written atomically (write-tmp, fsync, rename) so a crash
     during the write can never leave a half-written file on disk.
+
+    Cross-meeting contamination guard: the in-memory accumulator in
+    zoom_engine is intentionally permissive (it captures everything
+    parse_transcript yields, even when current_meeting_id might be wrong,
+    so a stale meeting ID can never silently drop new utterances). At the
+    persistence boundary we tighten that contract — the on-disk snapshot
+    keyed under `meeting_id` must only contain entries whose own
+    meeting_id matches (or is missing, since early WAL pages may not yet
+    carry the meetingId field). Without this filter, when two meetings'
+    entries co-exist in the WAL — which is normal during the first few
+    seconds of a back-to-back meeting — the snapshot under meeting B's
+    slug ends up holding entries from meeting A, and that file then
+    surfaces forever as a "Recover unfinished meeting" ghost on every
+    engine startup.
     """
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         slug = _safe_meeting_id_slug(meeting_id)
+        filtered_values = [
+            e for e in entries.values()
+            if not e.get("meeting_id") or e.get("meeting_id") == meeting_id
+        ]
         sorted_entries = sorted(
-            entries.values(), key=lambda e: e.get("timestamp") or ""
+            filtered_values, key=lambda e: e.get("timestamp") or ""
         )
         json_path = _CACHE_DIR / f"in-progress-{slug}.json"
         _atomic_write_text(

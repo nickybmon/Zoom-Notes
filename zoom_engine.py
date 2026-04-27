@@ -509,6 +509,22 @@ class ZoomEngine:
                 # and clear the accumulator so we don't mix the two meetings.
                 _, _, _, current_tracking_id = self._read_tracking()
                 if current_tracking_id and meeting_id != current_tracking_id:
+                    # Delete the OLD meeting's on-disk snapshot. By definition
+                    # we now know that meeting was a misidentification — the
+                    # scoring just promoted a different meeting to active —
+                    # so the old slug's cache file is at best stale and at
+                    # worst contaminated with entries that actually belong to
+                    # the new meeting (since `_persist_accumulator_now` writes
+                    # whatever's in the in-memory accumulator under the old
+                    # slug). Leaving it on disk causes it to perpetually
+                    # resurface as a "Recover unfinished meeting" item on
+                    # every engine startup until the 24h purge kicks in
+                    # (which it often doesn't, because the file's mtime gets
+                    # bumped by every subsequent persist).
+                    try:
+                        delete_persisted_accumulator(current_tracking_id)
+                    except Exception:
+                        pass
                     self._write_tracking(meeting_id=meeting_id)
                     with self._accumulated_lock:
                         self._accumulated = {}
