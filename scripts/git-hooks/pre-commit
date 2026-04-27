@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# pre-commit — block accidental commits of unsafe files.
+#
+# Catches:
+#   - Captured Zoom WAL/SQLite files (real meeting content)
+#   - Generated meeting notes & transcripts (real names, real speech)
+#   - .env files and common secret filenames
+#   - High-confidence API key strings inside any staged text file
+#   - Unexpectedly large binary files (>1 MB) that are not on the allowlist
+#
+# Bypass (use sparingly, only after manually verifying the file is safe):
+#   git commit --no-verify
+#
+# Install once per clone:
+#   make install-hooks
+
+set -euo pipefail
+
+RED=$'\033[31m'
+YELLOW=$'\033[33m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+fail() {
+    echo "${RED}${BOLD}pre-commit: BLOCKED${RESET}" >&2
+    echo "${RED}$*${RESET}" >&2
+    echo "" >&2
+    echo "${YELLOW}If this is a false positive, you can bypass with:${RESET}" >&2
+    echo "    git commit --no-verify" >&2
+    echo "${YELLOW}…but verify manually that the file is actually safe to commit first.${RESET}" >&2
+    exit 1
+}
+
+# Files staged for this commit. We read NUL-delimited paths so spaces and
+# newlines in filenames don't break us. macOS ships bash 3.2 (no `mapfile`),
+# so we use the portable `while IFS= read -r -d ''` form.
+STAGED=()
+while IFS= read -r -d '' f; do
+    STAGED+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [[ ${#STAGED[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+# ── 1. Filename / extension blocklist ────────────────────────────────────────
+# Patterns are bash globs matched against the full repo-relative path.
+BLOCKED_PATTERNS=(
+    # Zoom WAL / SQLite files — captured real meeting content
+    '*.sqlite3'
+    '*.sqlite3-wal'
+    '*.sqlite3-shm'
+    '*.sqlite3-journal'
+
+    # Local config & cache
+    'settings.json'
+    'in-progress-*.json'
+    'in-progress-*.md'
+
+    # Secrets
+    '.env'
+    '.env.*'
+    '*.pem'
+    '*.key'
+    '*.p12'
+    '*.cer'
+    '*credentials*.json'
+    '*secrets*.json'
+)
+
+# .env.example is a documented template, allow it.
+ALLOWED_EXACT=(
+    '.env.example'
+)
+
+is_allowed_exact() {
+    local f="$1"
+    for a in "${ALLOWED_EXACT[@]}"; do
+        if [[ "$f" == "$a" ]]; then return 0; fi
+    done
+    return 1
+}
+
+for f in "${STAGED[@]}"; do
+    if is_allowed_exact "$f"; then continue; fi
+    base="$(basename "$f")"
+    for pat in "${BLOCKED_PATTERNS[@]}"; do
+        # shellcheck disable=SC2053  # we want glob match, not literal
+        if [[ "$base" == $pat ]] || [[ "$f" == $pat ]]; then
+            fail "Refusing to commit '$f' — matches forbidden pattern '$pat'."
+        fi
+    done
+done
+
+# ── 2. Path blocklist (entire directories) ───────────────────────────────────
+# Catches generated meeting notes / transcripts even if filenames look benign.
+BLOCKED_PATH_PREFIXES=(
+    'tests/fixtures/'   # fixtures are local-only
+    'Meeting Notes/'
+    'Notes/'
+    'Transcripts/'
+    'zoom-notes-cache/'
+)
+
+for f in "${STAGED[@]}"; do
+    for prefix in "${BLOCKED_PATH_PREFIXES[@]}"; do
+        if [[ "$f" == "$prefix"* ]]; then
+            # tests/fixtures/README.md is the only intentionally-tracked file
+            # under tests/fixtures/. Allow it; block everything else.
+            if [[ "$f" == 'tests/fixtures/README.md' ]]; then continue 2; fi
+            fail "Refusing to commit '$f' — under forbidden path '$prefix'."
+        fi
+    done
+done
+
+# ── 3. Large binary files (>1 MB) ────────────────────────────────────────────
+# Catches accidental commits of WALs renamed to .bin, recordings, etc.
+SIZE_LIMIT=$((1024 * 1024))  # 1 MB
+
+# Files we explicitly allow to be large (icons, images, model assets).
+LARGE_ALLOWLIST=(
+    'ZoomNotesApp/ZoomNotesApp/Resources/Assets.xcassets'
+    'scripts/dmg-assets'
+)
+
+is_large_allowlisted() {
+    local f="$1"
+    for prefix in "${LARGE_ALLOWLIST[@]}"; do
+        if [[ "$f" == "$prefix"* ]]; then return 0; fi
+    done
+    return 1
+}
+
+for f in "${STAGED[@]}"; do
+    [[ -f "$f" ]] || continue
+    if is_large_allowlisted "$f"; then continue; fi
+    size=$(wc -c <"$f" | tr -d ' ')
+    if (( size > SIZE_LIMIT )); then
+        human=$(awk "BEGIN { printf \"%.1f\", $size / 1048576 }")
+        fail "Refusing to commit '$f' — ${human} MB exceeds 1 MB limit. If this file genuinely belongs in the repo, add its prefix to LARGE_ALLOWLIST in scripts/git-hooks/pre-commit."
+    fi
+done
+
+# ── 4. Secret content scan ───────────────────────────────────────────────────
+# High-confidence patterns only — false positives here are very disruptive.
+SECRET_PATTERNS=(
+    'sk-ant-api03-[A-Za-z0-9_-]{20,}'                  # Anthropic
+    'sk-proj-[A-Za-z0-9_-]{20,}'                       # OpenAI project keys
+    'sk-[A-Za-z0-9]{32,}'                              # OpenAI legacy
+    'AIza[0-9A-Za-z_-]{35}'                            # Google / Gemini
+    'AKIA[0-9A-Z]{16}'                                 # AWS access key
+    'ghp_[A-Za-z0-9]{36}'                              # GitHub personal token
+    'xox[baprs]-[A-Za-z0-9-]{10,}'                     # Slack
+    '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'            # any PEM private key
+)
+
+is_binary() {
+    # Portable binary check: ask `file` whether the result mentions "text".
+    # Falls back to 'no' (treat as text) if `file` isn't available, which is
+    # the safe default — text files are the only ones we scan, and a false
+    # negative here just means we scan a binary unnecessarily.
+    local mime
+    mime=$(file -b --mime-encoding -- "$1" 2>/dev/null || echo "")
+    case "$mime" in
+        binary) return 0 ;;
+        *)      return 1 ;;
+    esac
+}
+
+for f in "${STAGED[@]}"; do
+    [[ -f "$f" ]] || continue
+    # The hook script itself contains these patterns by design — skip it.
+    if [[ "$f" == 'scripts/git-hooks/pre-commit' ]]; then continue; fi
+    if is_binary "$f"; then continue; fi
+
+    for pat in "${SECRET_PATTERNS[@]}"; do
+        # Use -e so patterns starting with `-` (e.g. PEM headers) aren't
+        # parsed as grep flags by BSD grep.
+        if grep -E -q -e "$pat" -- "$f"; then
+            fail "Possible secret in '$f' matching pattern: $pat"
+        fi
+    done
+done
+
+exit 0

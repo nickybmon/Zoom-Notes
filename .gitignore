@@ -37,5 +37,41 @@ python-runtime/
 # Test fixtures: captured WALs contain real meeting content (names, speech).
 # Never commit them. Use tools/capture_wal.py to seed fresh fixtures locally.
 tests/fixtures/*/
+*.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+*.sqlite3-journal
+
+# Generated meeting notes / transcripts — personal content, never commit.
+# Even if someone configures their notes_dir inside the repo by accident.
+Meeting Notes/
+Notes/
+Transcripts/
+*.transcript.md
+
+# Local config and runtime cache that may contain personal paths or keys
+settings.json
+settings.json.tmp
+zoom-notes-cache/
+in-progress-*.json
+in-progress-*.md
+in-progress-*.tmp
+
+# Secrets / credentials — common filenames and patterns
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.cer
+*credentials*.json
+*secrets*.json
+*api_key*
+*api-key*
+
+# Editor / OS scratch
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

@@ -205,6 +205,24 @@ No rumps, no LangChain, no heavy dependencies.
 
 ---
 
+## Pre-commit hook
+
+This repo ships a pre-commit hook at `scripts/git-hooks/pre-commit` that blocks accidental commits of unsafe files. **Install it once per clone:**
+
+```bash
+make install-hooks
+```
+
+It refuses any commit that includes:
+
+- Captured Zoom data: `*.sqlite3`, `*.sqlite3-wal`, `*.sqlite3-shm`
+- Generated meeting content: anything under `Meeting Notes/`, `Notes/`, `Transcripts/`, `tests/fixtures/<name>/`, `zoom-notes-cache/`
+- Local config / secrets: `settings.json`, `.env*` (except `.env.example`), `*.pem`, `*.key`, `*credentials*.json`, `*secrets*.json`
+- Files >1 MB outside the asset/icon allowlist
+- High-confidence API key strings inside any staged text file (Anthropic, OpenAI, Google, AWS, GitHub, Slack, PEM private keys)
+
+If you ever hit a false positive, verify the file is genuinely safe and bypass with `git commit --no-verify`. To permanently allow a new pattern, edit `BLOCKED_PATTERNS` / `LARGE_ALLOWLIST` in the hook script.
+
 ## Testing
 
 The Python engine and parser are covered by a pytest suite at `tests/`. Run before any release:

@@ -1,7 +1,7 @@
 PYTHON ?= ./venv/bin/python3
 PYTEST ?= ./venv/bin/pytest
 
-.PHONY: test test-quick test-verbose lint check capture-fixture
+.PHONY: test test-quick test-verbose lint check capture-fixture install-hooks
 
 test:
 	$(PYTEST) -v
@@ -22,3 +22,13 @@ check: lint test
 capture-fixture:
 	@if [ -z "$(NAME)" ]; then echo "Usage: make capture-fixture NAME=<fixture-name>"; exit 1; fi
 	$(PYTHON) tools/capture_wal.py $(NAME)
+
+# Symlink the tracked pre-commit hook into .git/hooks/. Run once per clone.
+# The hook blocks accidental commits of WALs, generated meeting notes,
+# .env files, and high-confidence API key strings.
+install-hooks:
+	@mkdir -p .git/hooks
+	@ln -sf ../../scripts/git-hooks/pre-commit .git/hooks/pre-commit
+	@chmod +x scripts/git-hooks/pre-commit
+	@echo "Installed pre-commit hook -> .git/hooks/pre-commit"
+	@echo "Bypass (sparingly): git commit --no-verify"
