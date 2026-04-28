@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -49,15 +50,57 @@ MY_NOTES_ORIGINS = (
 # ── WAL Discovery ──────────────────────────────────────────────────────────────
 
 def find_origin_dir() -> Path | None:
-    """Find the docs.zoom.us origin directory (hash-named folder)."""
+    """Find the docs.zoom.us origin directory (hash-named folder).
+
+    Most users have a single origin hash, but multi-account / multi-profile
+    Zoom setups can leave several behind in `MY_NOTES_ORIGINS`. Prefer the
+    one whose transcript WAL has been modified most recently — the origin
+    whose Zoom is actively writing to it. Fall back to "first match" when
+    no candidate has a transcript WAL yet (cold-start, or after a fresh
+    re-install where Zoom hasn't begun writing).
+    """
     if not MY_NOTES_ORIGINS.exists():
         return None
+
+    candidates: list[Path] = []
     for top in MY_NOTES_ORIGINS.iterdir():
         if top.is_dir():
             nested = top / top.name
             if (nested / "IndexedDB").exists():
-                return nested
-    return None
+                candidates.append(nested)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Resolve the freshest transcript WAL across all candidates. We avoid
+    # importing zoom_config here (circular) so we look up the prefix
+    # directly from its dataclass default — callers that override the
+    # prefix in settings.json will still get a working WAL because
+    # `find_wal` is invoked separately downstream with the configured
+    # prefix; this picker just needs to know which origin is alive.
+    try:
+        from zoom_config import ZoomNotesConfig
+        prefix = ZoomNotesConfig().transcript_db_prefix
+    except Exception:
+        prefix = "1CB477F679D6"
+
+    def freshness(origin: Path) -> float:
+        wal = find_wal(origin, prefix)
+        if wal is None:
+            return -1.0
+        try:
+            return wal.stat().st_mtime
+        except OSError:
+            return -1.0
+
+    scored = [(freshness(c), c) for c in candidates]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    if scored[0][0] >= 0:
+        return scored[0][1]
+    # No candidate has a transcript WAL yet — fall back to first match
+    # (preserves previous behaviour on fresh installs).
+    return candidates[0]
 
 
 def find_wal(origin: Path, db_prefix: str) -> Path | None:
@@ -867,6 +910,7 @@ def summarize_with_claude(
     model: str = "claude-sonnet-4-6",
     api_url: str = "https://api.anthropic.com/v1/messages",
     system_prompt: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Call Claude (Anthropic) API to summarize the transcript."""
     prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -896,7 +940,7 @@ def summarize_with_claude(
         },
         method="POST",
     )
-    return _http_retry(req, lambda body: body["content"][0]["text"])
+    return _http_retry(req, lambda body: body["content"][0]["text"], cancel_event=cancel_event)
 
 
 def summarize_with_openai(
@@ -906,6 +950,7 @@ def summarize_with_openai(
     model: str = "gpt-4o",
     api_url: str = "https://api.openai.com/v1/chat/completions",
     system_prompt: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Call OpenAI Chat Completions API to summarize the transcript."""
     prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -933,7 +978,11 @@ def summarize_with_openai(
         },
         method="POST",
     )
-    return _http_retry(req, lambda body: body["choices"][0]["message"]["content"])
+    return _http_retry(
+        req,
+        lambda body: body["choices"][0]["message"]["content"],
+        cancel_event=cancel_event,
+    )
 
 
 def summarize_with_gemini(
@@ -943,6 +992,7 @@ def summarize_with_gemini(
     model: str = "gemini-2.0-flash",
     base_url: str = "https://generativelanguage.googleapis.com/v1beta/models",
     system_prompt: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Call Google Gemini generateContent API to summarize the transcript."""
     prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -974,6 +1024,7 @@ def summarize_with_gemini(
     return _http_retry(
         req,
         lambda body: body["candidates"][0]["content"]["parts"][0]["text"],
+        cancel_event=cancel_event,
     )
 
 
@@ -983,6 +1034,7 @@ def summarize_with_ollama(
     model: str = "llama3.2",
     base_url: str = "http://localhost:11434",
     system_prompt: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Call Ollama /api/chat to summarize the transcript (no API key needed)."""
     prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -1009,18 +1061,69 @@ def summarize_with_ollama(
         headers={"content-type": "application/json"},
         method="POST",
     )
-    return _http_retry(req, lambda body: body["message"]["content"])
+    return _http_retry(req, lambda body: body["message"]["content"], cancel_event=cancel_event)
 
 
-def _http_retry(req: urllib.request.Request, extract_fn, retries: int = 4) -> str:
-    """Shared retry loop for all LLM HTTP calls."""
+class CancelledError(RuntimeError):
+    """Raised when a cancel_event fires mid-generation. Distinct type so callers
+    can disambiguate cancellation from genuine LLM errors when surfacing
+    messages to the user (cancellation is silent — a placeholder note for
+    cancelled work is just noise)."""
+
+
+def _cancel_sleep(seconds: float, cancel_event: threading.Event | None) -> None:
+    """Sleep for `seconds` total, but abort early when `cancel_event` fires.
+
+    Plain `time.sleep` blocks until the timer expires; the backoff path used
+    to sleep up to 60s, which dominated cancellation latency. Splitting into
+    1s chunks via `Event.wait` cuts the worst-case to ~1s while keeping the
+    same overall pacing on the happy path.
+    """
+    if cancel_event is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if cancel_event.wait(min(1.0, remaining)):
+            raise CancelledError("LLM call cancelled")
+
+
+# Per-attempt urllib timeout. 90s is comfortably above the longest legitimate
+# LLM call we observe in the wild while keeping cancellation latency bounded
+# (cancel_event set during an in-flight HTTP request can only be observed
+# when urlopen returns or times out — so this number IS the cancel ceiling).
+_HTTP_TIMEOUT_SECS = 90
+
+
+def _http_retry(
+    req: urllib.request.Request,
+    extract_fn,
+    retries: int = 4,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    """Shared retry loop for all LLM HTTP calls.
+
+    `cancel_event`, when set, aborts the loop at the next checkpoint:
+      - between attempts (before sleep)
+      - during the inter-attempt backoff sleep
+      - just before the next urlopen
+    Already in-flight HTTP requests still run to their `_HTTP_TIMEOUT_SECS`
+    ceiling because urllib doesn't expose a cooperative interrupt.
+    """
     _RETRYABLE = {429, 500, 502, 503, 504}
     last_exc: Exception | None = None
     for attempt in range(retries):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("LLM call cancelled")
         if attempt:
-            time.sleep(15 * (2 ** (attempt - 1)))  # 15s, 30s, 60s
+            _cancel_sleep(15 * (2 ** (attempt - 1)), cancel_event)  # 15s, 30s, 60s
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("LLM call cancelled")
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECS) as resp:
                 body = json.loads(resp.read())
             try:
                 return extract_fn(body)
@@ -1040,10 +1143,15 @@ def summarize(
     transcript: str,
     meeting_title: str,
     cfg: ZoomNotesConfig | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """
     Dispatch to the correct LLM backend based on cfg.llm_provider.
     cfg defaults to get_config() if not provided.
+
+    `cancel_event`, when set, aborts retries / backoff sleeps with
+    `CancelledError`. Already in-flight HTTP calls run to the per-attempt
+    `_HTTP_TIMEOUT_SECS` ceiling (urllib has no cooperative interrupt).
     """
     if cfg is None:
         cfg = get_config()
@@ -1059,7 +1167,10 @@ def summarize(
                 "No Anthropic API key found. Set it in Settings or ANTHROPIC_API_KEY env var."
             )
         api_url = os.environ.get("ZOOM_NOTES_API_URL", "https://api.anthropic.com/v1/messages")
-        return summarize_with_claude(transcript, meeting_title, api_key, model, api_url, system_prompt)
+        return summarize_with_claude(
+            transcript, meeting_title, api_key, model, api_url, system_prompt,
+            cancel_event=cancel_event,
+        )
 
     if provider == "openai":
         api_key = get_api_key("openai")
@@ -1067,7 +1178,10 @@ def summarize(
             raise RuntimeError(
                 "No OpenAI API key found. Set it in Settings or OPENAI_API_KEY env var."
             )
-        return summarize_with_openai(transcript, meeting_title, api_key, model, cfg.openai_base_url, system_prompt)
+        return summarize_with_openai(
+            transcript, meeting_title, api_key, model, cfg.openai_base_url, system_prompt,
+            cancel_event=cancel_event,
+        )
 
     if provider == "gemini":
         api_key = get_api_key("gemini")
@@ -1075,10 +1189,16 @@ def summarize(
             raise RuntimeError(
                 "No Gemini API key found. Set it in Settings or GEMINI_API_KEY env var."
             )
-        return summarize_with_gemini(transcript, meeting_title, api_key, model, cfg.gemini_base_url, system_prompt)
+        return summarize_with_gemini(
+            transcript, meeting_title, api_key, model, cfg.gemini_base_url, system_prompt,
+            cancel_event=cancel_event,
+        )
 
     if provider == "ollama":
-        return summarize_with_ollama(transcript, meeting_title, model, cfg.ollama_base_url, system_prompt)
+        return summarize_with_ollama(
+            transcript, meeting_title, model, cfg.ollama_base_url, system_prompt,
+            cancel_event=cancel_event,
+        )
 
     raise RuntimeError(f"Unknown LLM provider: {provider!r}")
 
@@ -1156,7 +1276,7 @@ def save_transcript_only(
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
     transcript_path = _next_available_path(transcripts_dir / transcript_filename)
-    transcript_path.write_text(transcript_content, encoding="utf-8")
+    _atomic_write_text(transcript_path, transcript_content)
     return transcript_path
 
 
@@ -1179,7 +1299,7 @@ def save_note_only(
     notes_dir.mkdir(parents=True, exist_ok=True)
     note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
     note_path = _next_available_path(notes_dir / note_filename)
-    note_path.write_text(note_content, encoding="utf-8")
+    _atomic_write_text(note_path, note_content)
     return note_path
 
 
@@ -1188,7 +1308,7 @@ def overwrite_note(
     note_content: str,
 ) -> None:
     """Overwrite an existing note file in place (used by retry to replace placeholder)."""
-    note_path.write_text(note_content, encoding="utf-8")
+    _atomic_write_text(note_path, note_content)
 
 
 def save_note(

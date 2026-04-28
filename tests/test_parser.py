@@ -105,3 +105,73 @@ class TestUtilities:
     def test_safe_meeting_id_slug_replaces_unsafe_chars(self):
         assert _safe_meeting_id_slug("a/b+c=d==") == "a_b_c_d__"
         assert _safe_meeting_id_slug("AbC-123_") == "AbC-123_"
+
+
+class TestFindOriginDir:
+    """Phase 1 #5 regression guard.
+
+    `find_origin_dir` used to return the FIRST matching origin hash, which
+    on multi-account / multi-profile Zoom setups could lock onto a stale
+    origin whose WAL hasn't been touched in weeks. The fix scores
+    candidates by the freshness of their transcript WAL.
+    """
+
+    def _make_origin(self, root, name: str, *, wal_mtime: float | None,
+                     prefix: str = "1CB477F679D6"):
+        """Build a fake origin layout matching Zoom's expected nesting.
+
+        Result: <root>/<name>/<name>/IndexedDB/<prefix>...01/IndexedDB.sqlite3-wal
+        with the WAL stat'd to `wal_mtime` if provided.
+        """
+        nested = root / name / name
+        idb = nested / "IndexedDB" / f"{prefix}_FAKE01"
+        idb.mkdir(parents=True, exist_ok=True)
+        wal = idb / "IndexedDB.sqlite3-wal"
+        wal.write_bytes(b"x" * 1024)  # >256 bytes so find_wal accepts it
+        if wal_mtime is not None:
+            import os
+            os.utime(wal, (wal_mtime, wal_mtime))
+        return nested
+
+    def test_picks_freshest_wal_when_multiple_origins_exist(self, tmp_path, monkeypatch):
+        from zoom_notes import find_origin_dir
+        import zoom_notes
+
+        origins_root = tmp_path / "Origins"
+        origins_root.mkdir()
+        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", origins_root)
+
+        stale = self._make_origin(origins_root, "aaaaa_stale", wal_mtime=1000.0)
+        fresh = self._make_origin(origins_root, "bbbbb_fresh", wal_mtime=999_000.0)
+
+        chosen = find_origin_dir()
+        assert chosen == fresh, \
+            f"expected freshest origin {fresh}, got {chosen} (would have been wrong with first-match)"
+
+    def test_falls_back_to_first_match_when_no_wal_yet(self, tmp_path, monkeypatch):
+        """Fresh install / cold-start: no transcript WAL exists yet. We
+        should still return SOMETHING rather than None."""
+        from zoom_notes import find_origin_dir
+        import zoom_notes
+
+        origins_root = tmp_path / "Origins"
+        origins_root.mkdir()
+        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", origins_root)
+
+        # IndexedDB exists but no matching WAL — find_wal returns None
+        # for both candidates.
+        nested_a = origins_root / "aaaaa" / "aaaaa"
+        (nested_a / "IndexedDB").mkdir(parents=True)
+        nested_b = origins_root / "bbbbb" / "bbbbb"
+        (nested_b / "IndexedDB").mkdir(parents=True)
+
+        chosen = find_origin_dir()
+        assert chosen in (nested_a, nested_b), "must return some valid origin"
+
+    def test_returns_none_when_no_origins(self, tmp_path, monkeypatch):
+        from zoom_notes import find_origin_dir
+        import zoom_notes
+
+        empty = tmp_path / "DoesNotExist"
+        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", empty)
+        assert find_origin_dir() is None

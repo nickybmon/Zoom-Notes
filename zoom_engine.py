@@ -59,6 +59,7 @@ from zoom_config import (
     resolve_filename,
 )
 from zoom_notes import (
+    CancelledError,
     find_origin_dir,
     find_wal,
     parse_transcript,
@@ -136,17 +137,32 @@ class ZoomEngine:
         self._last_size: int | None = None
         self._last_active_ts: float | None = None
         self._active_meeting_id: str | None = None
+        # WAL mtime captured when the current ACTIVE session first started
+        # (the IDLE→ACTIVE transition tick). Combined with `_active_meeting_id`
+        # it forms a session fingerprint that distinguishes recurring Zoom
+        # meetings (same meeting_id, different start time) from a checkpoint
+        # mutation of the same meeting we just generated for.
+        self._active_session_mtime: float | None = None
 
-        # Last meeting_id we successfully generated notes for. Guards against
-        # duplicate generation when Zoom checkpoints/mutates the WAL after a
-        # meeting ends — the post-meeting WAL still contains the same entries,
-        # so we'd otherwise re-summarize the same conversation.
-        self._last_generated_meeting_id: str | None = None
+        # Fingerprint of the last successfully-generated meeting session.
+        # Tuple of (meeting_id, session_start_mtime). Guards against:
+        #   1. Zoom's post-meeting WAL checkpoint replaying the same meeting.
+        #   2. False suppression of recurring meetings that reuse the same
+        #      Zoom meeting_id — a new IDLE→ACTIVE produces a different
+        #      session_start_mtime so the guard correctly lets it through.
+        self._last_generated_session: tuple[str, float] | None = None
 
         # Set by _generate_notes when it writes a placeholder note instead of
         # a final note. Read by the worker so it knows to keep the persisted
         # accumulator (for retry) rather than deleting it.
         self._last_run_note_failed: bool = False
+
+        # Cooperative cancellation signal for in-flight note generation.
+        # Cleared at the start of every _trigger_generate / _trigger_retry
+        # and set when the outer 5-min wall-clock timeout fires (so the
+        # still-running summarize() thread can abort at its next checkpoint
+        # instead of zombie-running until the urllib per-call timeout).
+        self._cancel_event = threading.Event()
 
         # Most recent failed-note metadata, used to drive a retry without
         # asking the user to remember the meeting ID. Cleared on retry success.
@@ -168,6 +184,14 @@ class ZoomEngine:
         # SQLite WAL checkpoint truncates the file without producing parser
         # output that flips `changed_in_acc` true.
         self._ticks_since_persist: int = 0
+
+        # Streak counter for change-ticks while ACTIVE that yielded zero
+        # new accumulator entries. A growing streak strongly suggests a
+        # parser regression vs. a Zoom WAL format change — the WAL is
+        # being written (mtime/size moved) but our parser sees nothing.
+        # Emitted via diag at threshold so a degraded session is visible
+        # in logs without re-creating the issue.
+        self._empty_parse_streak: int = 0
 
         # Purge stale in-progress cache files left over from prior crashes.
         # Order matters: purge first so the recovery scan that follows only
@@ -210,7 +234,11 @@ class ZoomEngine:
                 self._active_meeting_id,
             )
 
-    def _write_tracking(self, *, mtime=..., size=..., active_ts=..., meeting_id=...):
+    def _read_session_mtime(self) -> float | None:
+        with self._tracking_lock:
+            return self._active_session_mtime
+
+    def _write_tracking(self, *, mtime=..., size=..., active_ts=..., meeting_id=..., session_mtime=...):
         with self._tracking_lock:
             if mtime is not ...:
                 self._last_mtime = mtime
@@ -220,6 +248,8 @@ class ZoomEngine:
                 self._last_active_ts = active_ts
             if meeting_id is not ...:
                 self._active_meeting_id = meeting_id
+            if session_mtime is not ...:
+                self._active_session_mtime = session_mtime
 
     def _reset_tracking(self) -> None:
         with self._tracking_lock:
@@ -227,10 +257,13 @@ class ZoomEngine:
             self._last_size = None
             self._last_active_ts = None
             self._active_meeting_id = None
+            self._active_session_mtime = None
         # Reset the periodic-persist counter alongside tracking — its meaning
         # is "ticks since last persist while ACTIVE", and a tracking reset
-        # always implies we're leaving ACTIVE.
+        # always implies we're leaving ACTIVE. Same reasoning for the
+        # empty-parse streak.
         self._ticks_since_persist = 0
+        self._empty_parse_streak = 0
 
     # ── State helpers ───────────────────────────────────────────────────────
 
@@ -473,7 +506,11 @@ class ZoomEngine:
                 meeting_id = None
 
             if state == EngineState.IDLE:
-                self._write_tracking(meeting_id=meeting_id)
+                # Stamp the session fingerprint as we enter ACTIVE. `mtime`
+                # is the current WAL mtime; combined with meeting_id it lets
+                # the post-success dedupe distinguish a recurring meeting's
+                # new session from a checkpoint of the one we just finished.
+                self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
                 # Fresh ACTIVE period — restart the periodic-persist clock so
                 # we don't immediately force a snapshot on the very first
                 # change tick before the accumulator has any new content.
@@ -525,7 +562,8 @@ class ZoomEngine:
                         delete_persisted_accumulator(current_tracking_id)
                     except Exception:
                         pass
-                    self._write_tracking(meeting_id=meeting_id)
+                    # New active meeting → new session fingerprint.
+                    self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
                     with self._accumulated_lock:
                         self._accumulated = {}
                     self._emit_diag(
@@ -574,8 +612,29 @@ class ZoomEngine:
                 # matter for retry just as much as new utterances.
                 if changed_in_acc and current_meeting_id:
                     self._persist_accumulator_now(current_meeting_id, reason="changed")
-            except Exception:
-                pass
+
+                # Empty-parse streak: WAL moved (mtime/size) but the parser
+                # found nothing new. Reset on real changes; emit a diag at
+                # threshold so a degraded session shows up in logs.
+                if changed_in_acc:
+                    self._empty_parse_streak = 0
+                else:
+                    self._empty_parse_streak += 1
+                    if self._empty_parse_streak in (5, 20, 60):
+                        self._emit_diag(
+                            "empty_parse_streak",
+                            count=self._empty_parse_streak,
+                            meeting_id=current_meeting_id or "",
+                        )
+            except Exception as exc:
+                # Previously a silent `pass`. Surface as a diag event so
+                # parser regressions are visible in logs without users
+                # having to recreate the issue.
+                self._emit_diag(
+                    "parse_error",
+                    error=str(exc)[:200],
+                    meeting_id=(self._read_tracking()[3] or ""),
+                )
         else:
             if state == EngineState.ACTIVE and last_active_ts is not None:
                 idle_secs = now - last_active_ts
@@ -584,9 +643,21 @@ class ZoomEngine:
                     # already finished. Zoom checkpoints the WAL after the
                     # meeting ends, which mutates mtime/size and would
                     # otherwise look like a new active period.
+                    #
+                    # The fingerprint is (meeting_id, session_start_mtime).
+                    # Using just meeting_id wrongly suppresses recurring
+                    # meetings that reuse the same Zoom ID across days —
+                    # those re-enter IDLE→ACTIVE with a new mtime and so
+                    # produce a different fingerprint. A checkpoint-only
+                    # mutation keeps the same session_start_mtime (which
+                    # was captured at IDLE→ACTIVE, not on every tick) and
+                    # so still matches.
                     _, _, _, current_meeting_id = self._read_tracking()
+                    current_session_mtime = self._read_session_mtime()
                     if current_meeting_id is not None and \
-                       current_meeting_id == self._last_generated_meeting_id:
+                       current_session_mtime is not None and \
+                       self._last_generated_session is not None and \
+                       (current_meeting_id, current_session_mtime) == self._last_generated_session:
                         self._write_tracking(active_ts=None)
                         self._set_state(EngineState.IDLE)
                         return
@@ -618,24 +689,33 @@ class ZoomEngine:
         # back in a coherent ACTIVE-but-disarmed state.
         saved_mtime, saved_size, _, _ = self._read_tracking()
 
-        # Snapshot the meeting_id we're processing so the worker can record
-        # it on success even after _reset_tracking would have cleared it.
+        # Snapshot the meeting_id and session-start mtime we're processing
+        # so the worker can stamp the success fingerprint even after
+        # _reset_tracking has cleared the live tracking state.
         _, _, _, processing_meeting_id = self._read_tracking()
+        processing_session_mtime = self._read_session_mtime()
 
         # Reset the per-run note_failed flag so the worker can detect whether
         # _generate_notes wrote a placeholder (LLM failure) or a final note.
         self._last_run_note_failed = False
+
+        # Reset cancellation so this run starts clean. Any cancel signal
+        # raised below targets THIS generation only.
+        self._cancel_event.clear()
 
         def worker():
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(self._generate_notes, origin, cfg)
             try:
                 future.result(timeout=_GENERATE_TIMEOUT_SECS)
-                # Remember which meeting we just processed so we don't
+                # Remember which session we just processed so we don't
                 # re-trigger if Zoom mutates the WAL on checkpoint. We do
                 # this even on note_failed — the user retries via the menu
                 # bar, not by waiting for another idle period.
-                self._last_generated_meeting_id = processing_meeting_id
+                if processing_meeting_id and processing_session_mtime is not None:
+                    self._last_generated_session = (
+                        processing_meeting_id, processing_session_mtime
+                    )
                 # Clean up the in-memory accumulator. Keep the persisted
                 # disk snapshot if note generation failed — it's the source
                 # of truth for the retry flow.
@@ -669,6 +749,12 @@ class ZoomEngine:
                     self._reset_tracking()
             except concurrent.futures.TimeoutError:
                 emit({"event": "error", "message": "Note generation timed out — try again"})
+                # future.cancel() is a no-op once the work has started, so
+                # signal cooperative cancellation. The summarize() thread
+                # will observe this between retries / during backoff sleep
+                # and bail out with CancelledError. Worst-case latency is
+                # bounded by the urllib per-call timeout (_HTTP_TIMEOUT_SECS).
+                self._cancel_event.set()
                 future.cancel()
                 self._write_tracking(
                     mtime=saved_mtime, size=saved_size,
@@ -697,6 +783,7 @@ class ZoomEngine:
         LLM call. LLM failures produce a placeholder note (saved alongside
         the transcript) and a retryable `note_failed` event, NOT a hard error.
         """
+        gen_start = time.monotonic()
         transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
         blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
 
@@ -733,7 +820,28 @@ class ZoomEngine:
 
         # ── Stage 2: generate note via LLM ─────────────────────────────────
         try:
-            summary = summarize(transcript_text, meeting_title, cfg)
+            summary = summarize(
+                transcript_text, meeting_title, cfg, cancel_event=self._cancel_event
+            )
+        except CancelledError:
+            # A cancelled run leaves the transcript on disk (Stage 1 already
+            # ran) and the persisted accumulator intact for retry. We do NOT
+            # write a placeholder — a cancellation note in the user's vault
+            # would be confusing noise; the menu bar already surfaces the
+            # timeout via the `error` event.
+            self._last_run_note_failed = True
+            self._last_failed_meeting = {
+                "meeting_id": active_meeting_id or "",
+                "title": slugify_title(meeting_title, fallback_date=date_str),
+                "note_path": "",
+                "transcript_path": str(transcript_path),
+                "message": "Note generation cancelled (timed out)",
+                "date_str": date_str,
+                "attendees": attendees,
+            }
+            if active_meeting_id:
+                mark_meeting_failed(active_meeting_id, metadata=self._last_failed_meeting)
+            return
         except Exception as exc:
             error_msg = _friendly_error(exc)
             placeholder = build_placeholder_note(
@@ -791,6 +899,19 @@ class ZoomEngine:
             "attendees": attendees,
             "meeting_id": active_meeting_id or "",
         })
+
+        # Diag: how long did this take, how big was the transcript, which
+        # provider/model. Useful for spotting regressions ("LLM is slow this
+        # week") without instrumenting the user's machine further.
+        self._emit_diag(
+            "generation_completed",
+            duration_ms=int((time.monotonic() - gen_start) * 1000),
+            entry_count=len(entries),
+            attendee_count=len(attendees),
+            provider=cfg.llm_provider,
+            model=cfg.llm_model,
+            meeting_id=active_meeting_id or "",
+        )
 
     def _collect_entries_for_generation(self, transcript_wal, active_meeting_id):
         """Pick the best entries source: in-memory accumulator > WAL > disk snapshot.
@@ -907,6 +1028,9 @@ class ZoomEngine:
             return
 
         cfg = self._get_cfg()
+        # Reset cancellation for this retry — a prior cancelled run must
+        # not cause the retry to abort instantly.
+        self._cancel_event.clear()
 
         def worker():
             self._set_state(EngineState.GENERATING)
@@ -951,7 +1075,16 @@ class ZoomEngine:
                 slug = slugify_title(meeting_title, fallback_date=date_str)
 
                 try:
-                    summary = summarize(transcript_text, meeting_title, cfg)
+                    summary = summarize(
+                        transcript_text, meeting_title, cfg,
+                        cancel_event=self._cancel_event,
+                    )
+                except CancelledError:
+                    # Retry was cancelled (e.g. user quit the app). Leave
+                    # the failed/ snapshot intact so the next launch still
+                    # surfaces the recovery item.
+                    emit({"event": "error", "message": "Retry cancelled"})
+                    return
                 except Exception as exc:
                     err_msg = _friendly_error(exc)
                     # Refresh the failed/ sidecar so the menu bar shows the
