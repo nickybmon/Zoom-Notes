@@ -77,11 +77,21 @@ Zoom's transcript WAL lives at:
 ```
 ~/Library/Application Support/zoom.us/data/
   UnifyWebView_Cache/WebKit/UnSigned/Default/MyNotes/Origins/
-    <hash>/<hash>/IndexedDB/
-      1CB477F679D6.../IndexedDB.sqlite3-wal   ← transcript store
-      DDEC8414E29A.../IndexedDB.sqlite3-wal   ← blocks/title store
+    <origin-hash>/<origin-hash>/IndexedDB/
+      <db-hash-A>/IndexedDB.sqlite3-wal   ← transcript store
+      <db-hash-B>/IndexedDB.sqlite3-wal   ← blocks/title store
 ```
-The `<hash>` is stable per Zoom account. `find_origin_dir()` discovers it dynamically — never hardcode it.
+
+**Both the `<origin-hash>` and the per-DB `<db-hash-*>` folder names are per-account hashes that vary across machines, Zoom accounts, and Zoom profiles.** The original codebase hardcoded `transcript_db_prefix=1CB477F679D6` and `blocks_db_prefix=DDEC8414E29A` as defaults — these match the original developer's account but nobody else's. v1.1.2 fixed this by adding content-based discovery.
+
+WAL location is resolved in two steps, both fully dynamic:
+
+1. `find_origin_dir()` — discovers the origin folder by walking `MY_NOTES_ORIGINS`. When multiple origins exist (multi-account / multi-profile setups), prefers the one whose transcript WAL has the freshest mtime.
+2. `find_wal(origin, prefix)` — tries the configured `prefix` first as a fast path, then falls back to `find_wal_by_content(origin, kind)`, which identifies each WAL by counting signature tokens (`messageId` for the transcript store, `title` for the blocks store). **Content discovery is the source of truth**; the prefix is just a hint kept for backward compatibility with existing settings files.
+
+The engine caches the resolved WAL path per `(origin, kind)` pair on first successful resolution. The cache is cleared when origin is invalidated (settings reload via `SIGHUP`, or `_consume_origin_invalidated()` flips). Negative results are intentionally NOT cached — the common cold-start state is "Notetaker not yet used, no transcript WAL exists yet," and we want to keep retrying every poll until one appears.
+
+When the origin exists but no transcript WAL can be resolved (Notetaker disabled, or never used on this account), the engine emits a one-shot `error` event with a message about enabling AI Companion / Notetaker. This surfaces the misconfiguration to the user instead of silently sitting in IDLE forever.
 
 ### WAL parsing
 The WAL stores V8-serialized blobs but WAL pages contain raw UTF-8. `strings(1)` extracts them. Each transcript entry follows this pattern in the strings output:

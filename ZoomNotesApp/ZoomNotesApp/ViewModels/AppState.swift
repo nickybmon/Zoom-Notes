@@ -135,6 +135,14 @@ class AppState: ObservableObject {
         case "state":
             engineStartupSettled = true
             engineState = EngineState(event.value)
+            // Reaching ACTIVE means the WAL was resolved and a meeting is in
+            // progress — any prior setup error (e.g. "couldn't find Zoom's
+            // transcript database") is by definition stale, so clear it.
+            // This is what lets the user fix Notetaker / Zoom config without
+            // restarting the app to dismiss the warning banner.
+            if event.value == "active" {
+                engineError = nil
+            }
             // If the engine just transitioned to ACTIVE for a meeting that was
             // also surfaced as recoverable, drop it from the recovery list —
             // the IDLE→ACTIVE seed-from-snapshot path will auto-resume it and
