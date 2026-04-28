@@ -103,8 +103,30 @@ def find_origin_dir() -> Path | None:
     return candidates[0]
 
 
-def find_wal(origin: Path, db_prefix: str) -> Path | None:
-    """Find the WAL file for a given IndexedDB prefix."""
+def find_wal(
+    origin: Path,
+    db_prefix: str,
+    kind: str | None = None,
+) -> Path | None:
+    """Find the WAL file for a given IndexedDB prefix.
+
+    Tries the configured `db_prefix` first (fast path — historically the
+    correct match on the original developer's account). When no folder
+    matches the prefix, falls back to scanning the WAL contents to
+    identify the right database — see `find_wal_by_content`. The IndexedDB
+    folder name is a per-account hash that varies across Zoom accounts and
+    profiles, so the prefix can't be relied on for any user but the one it
+    was captured against.
+
+    `kind` (`"transcript"` or `"blocks"`) is required for correct
+    fallback when the user has overridden the prefix in settings to
+    something that matches neither default. When omitted, kind is inferred
+    from the prefix matching one of the built-in defaults; if the prefix
+    matches neither default and kind is omitted, the function assumes
+    `"transcript"` because that's the more common call site (single
+    `kind` arg covers most uses; the CLI's `--list` command queries
+    transcript first and is the only legacy caller).
+    """
     idb_dir = origin / "IndexedDB"
     if not idb_dir.exists():
         return None
@@ -114,9 +136,91 @@ def find_wal(origin: Path, db_prefix: str) -> Path | None:
             wal = db_dir / "IndexedDB.sqlite3-wal"
             if wal.exists() and wal.stat().st_size > 256:
                 candidates.append(wal)
-    if not candidates:
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    # Prefix didn't match any folder. Fall back to identifying the WAL by
+    # the tokens it contains. This is the path that any non-developer user
+    # actually hits — the configured prefix is effectively a hint for the
+    # one machine it was originally captured on.
+    if kind is None:
+        if db_prefix == "DDEC8414E29A":
+            kind = "blocks"
+        else:
+            # Includes both "1CB477F679D6" (the legacy transcript prefix)
+            # and any user-supplied custom prefix. The latter is the bug
+            # we're explicitly fixing — the safest default is transcript,
+            # and engine callers always pass `kind` explicitly anyway.
+            kind = "transcript"
+    return find_wal_by_content(origin, kind)
+
+
+# Tokens that mark a WAL as belonging to a particular IndexedDB store.
+# `messageId` is emitted once per transcript utterance, so the transcript
+# WAL contains many of them. `title` appears around each Zoom Notes block
+# header, so the blocks WAL contains many. Other Zoom IndexedDB stores
+# (e.g. caches, settings) don't cluster either token.
+_TRANSCRIPT_SIGNATURE_TOKEN = "messageId"
+_BLOCKS_SIGNATURE_TOKEN = "title"
+_MIN_SIGNATURE_HITS = 2  # require at least 2 hits to count as a match —
+# guards against a single stray `title` literal landing in a non-blocks
+# store from JSON metadata or similar.
+
+
+def _score_wal_for_kind(wal_path: Path, kind: str) -> int:
+    """Count signature-token occurrences in a WAL.
+
+    Returns 0 on read error. The caller picks the highest-scoring WAL.
+    """
+    token = (
+        _TRANSCRIPT_SIGNATURE_TOKEN
+        if kind == "transcript"
+        else _BLOCKS_SIGNATURE_TOKEN
+    )
+    try:
+        lines = read_wal_strings(wal_path)
+    except Exception:
+        return 0
+    return sum(1 for ln in lines if ln == token)
+
+
+def find_wal_by_content(origin: Path, kind: str) -> Path | None:
+    """Find the transcript or blocks WAL by scanning every WAL's contents.
+
+    `kind` is `"transcript"` or `"blocks"`. Walks every `IndexedDB.sqlite3-wal`
+    under `origin/IndexedDB/`, scores each by the count of the kind's
+    signature token, and returns the highest-scoring WAL with at least
+    `_MIN_SIGNATURE_HITS` hits. Ties are broken by mtime (freshest wins).
+
+    Returns None if no WAL has any signature hits — that's the signal for
+    "Zoom is installed but the user hasn't run a meeting with this kind of
+    data yet" (e.g. AI Notetaker not enabled). The caller should surface a
+    setup error in that case rather than silently sitting in IDLE forever.
+    """
+    idb_dir = origin / "IndexedDB"
+    if not idb_dir.exists():
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    scored: list[tuple[int, float, Path]] = []
+    for db_dir in idb_dir.iterdir():
+        if not db_dir.is_dir():
+            continue
+        wal = db_dir / "IndexedDB.sqlite3-wal"
+        if not wal.exists() or wal.stat().st_size <= 256:
+            continue
+        score = _score_wal_for_kind(wal, kind)
+        if score >= _MIN_SIGNATURE_HITS:
+            try:
+                mtime = wal.stat().st_mtime
+            except OSError:
+                continue
+            scored.append((score, mtime, wal))
+
+    if not scored:
+        return None
+    # Highest score wins; mtime breaks ties (freshest writes are the
+    # in-progress meeting).
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return scored[0][2]
 
 
 # ── WAL Parsing ────────────────────────────────────────────────────────────────
@@ -1517,8 +1621,8 @@ note: {_yaml_quote(note_link)}
 
 def cmd_list(origin: Path) -> None:
     cfg = get_config()
-    blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
-    transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
+    blocks_wal = find_wal(origin, cfg.blocks_db_prefix, kind="blocks")
+    transcript_wal = find_wal(origin, cfg.transcript_db_prefix, kind="transcript")
 
     print("Zoom Meeting Notes — Recent Meetings\n")
     if blocks_wal:
@@ -1540,7 +1644,7 @@ def cmd_list(origin: Path) -> None:
 
 def cmd_dump(origin: Path) -> None:
     cfg = get_config()
-    wal = find_wal(origin, cfg.transcript_db_prefix)
+    wal = find_wal(origin, cfg.transcript_db_prefix, kind="transcript")
     if not wal:
         print("No transcript WAL found. Is a meeting with My Notes active?", file=sys.stderr)
         sys.exit(1)
@@ -1553,7 +1657,7 @@ def cmd_dump(origin: Path) -> None:
 
 def cmd_watch(origin: Path) -> None:
     cfg = get_config()
-    wal = find_wal(origin, cfg.transcript_db_prefix)
+    wal = find_wal(origin, cfg.transcript_db_prefix, kind="transcript")
     if not wal:
         print("No transcript WAL found. Start a Zoom meeting with My Notes enabled.", file=sys.stderr)
         sys.exit(1)
@@ -1578,8 +1682,8 @@ def cmd_watch(origin: Path) -> None:
 def cmd_notes(origin: Path, dry_run: bool = False) -> None:
     cfg = get_config()
 
-    transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
-    blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
+    transcript_wal = find_wal(origin, cfg.transcript_db_prefix, kind="transcript")
+    blocks_wal = find_wal(origin, cfg.blocks_db_prefix, kind="blocks")
 
     if not transcript_wal:
         print("No transcript WAL found.", file=sys.stderr)

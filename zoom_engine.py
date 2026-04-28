@@ -217,6 +217,22 @@ class ZoomEngine:
         # prefixes / a Zoom install relocation on the next tick.
         self._origin_invalidated = False
 
+        # Resolved WAL paths, keyed by (origin_str, kind). Populated lazily on
+        # first successful resolution and reused on every subsequent poll —
+        # the underlying IndexedDB folder structure is stable for the life of
+        # an engine session. Cleared whenever origin is invalidated (settings
+        # reload, Zoom relocation) so a config change picks up fresh paths.
+        # Only positive results are cached — `None` is intentionally NOT
+        # cached so we keep retrying when the user enables Notetaker / starts
+        # their first meeting after launching the app.
+        self._wal_cache: dict[tuple[str, str], Path] = {}
+
+        # One-shot guard for the "Zoom installed but no transcript WAL"
+        # setup error. Without this, a misconfigured Zoom would re-emit the
+        # error every 5-second poll and spam the user. Reset on origin
+        # invalidation so settings changes give us a fresh chance to retry.
+        self._setup_error_emitted = False
+
         signal.signal(signal.SIGHUP, self._on_sighup)
 
     def _on_sighup(self, signum, frame):
@@ -317,7 +333,81 @@ class ZoomEngine:
         with self._cfg_lock:
             was = self._origin_invalidated
             self._origin_invalidated = False
-            return was
+        if was:
+            # Drop cached WAL paths and re-arm the one-shot setup error so a
+            # settings change (or a Zoom reinstall mid-session) gets a fresh
+            # resolution and a fresh chance to surface a real diagnostic.
+            self._wal_cache.clear()
+            self._setup_error_emitted = False
+        return was
+
+    # ── WAL resolution (with cache and setup-error fallback) ────────────────
+
+    def _resolve_wal(self, origin, cfg, kind: str) -> Path | None:
+        """Resolve the transcript or blocks WAL, caching positive results.
+
+        `kind` is `"transcript"` or `"blocks"`. Calls into `find_wal()` —
+        which tries the configured prefix first and falls back to scanning
+        WAL contents — and caches the resolved Path in memory. Subsequent
+        polls re-use the cached path until the file disappears or origin is
+        invalidated. Negative results (None) are NOT cached: that's the
+        common cold-start state for users who haven't yet run a meeting
+        with AI Notetaker, and we want every poll to keep trying until the
+        WAL appears.
+        """
+        if origin is None:
+            return None
+        cache_key = (str(origin), kind)
+        cached = self._wal_cache.get(cache_key)
+        if cached is not None:
+            try:
+                if cached.exists() and cached.stat().st_size > 256:
+                    return cached
+            except OSError:
+                pass
+            # Stale cache — Zoom rotated the WAL or the user reinstalled.
+            self._wal_cache.pop(cache_key, None)
+
+        prefix = (
+            cfg.transcript_db_prefix
+            if kind == "transcript"
+            else cfg.blocks_db_prefix
+        )
+        wal = find_wal(origin, prefix, kind=kind)
+        if wal is not None:
+            self._wal_cache[cache_key] = wal
+            via = "prefix" if wal.parent.name.startswith(prefix) else "content"
+            self._emit_diag(
+                "wal_resolved",
+                wal_kind=kind,
+                path=str(wal),
+                via=via,
+            )
+        return wal
+
+    def _maybe_emit_setup_error(self, origin) -> None:
+        """Emit a one-shot UI error when origin is found but no transcript
+        WAL exists.
+
+        This is the failure mode that previously left the engine silently
+        stuck in IDLE forever: Zoom is installed (we have an origin), but
+        none of its IndexedDB stores contain transcript data — typically
+        because AI Companion / Notetaker is disabled or has never been
+        used on this account. Surfacing this in the UI tells the user
+        what to fix instead of leaving them staring at "Waiting for
+        meeting..." through an entire call.
+        """
+        if origin is None or self._setup_error_emitted:
+            return
+        self._setup_error_emitted = True
+        emit({
+            "event": "error",
+            "message": (
+                "Couldn't find Zoom's transcript database. Make sure "
+                "AI Companion / Notetaker is enabled in your Zoom client "
+                "and has been used at least once on this account."
+            ),
+        })
 
     # ── Persistence helpers ─────────────────────────────────────────────────
 
@@ -414,8 +504,17 @@ class ZoomEngine:
         if origin is None:
             return
 
-        wal = find_wal(origin, cfg.transcript_db_prefix)
+        wal = self._resolve_wal(origin, cfg, "transcript")
         if not wal:
+            # Zoom is installed but we can't find a transcript-shaped WAL.
+            # Surface the diagnostic the first time we hit this so the user
+            # sees a real error instead of silently sitting in IDLE. We
+            # only emit when we've never been ACTIVE — once a meeting has
+            # been seen, a transient WAL-gone window is the existing
+            # "checkpoint mid-meeting" path below and shouldn't trigger a
+            # setup-error message.
+            if self._get_state() == EngineState.IDLE:
+                self._maybe_emit_setup_error(origin)
             state = self._get_state()
             if state == EngineState.ACTIVE:
                 with self._accumulated_lock:
@@ -734,7 +833,7 @@ class ZoomEngine:
                 # next poll's mtime/size will match these and `changed`
                 # stays False until a NEW meeting starts.
                 try:
-                    wal = find_wal(origin, cfg.transcript_db_prefix)
+                    wal = self._resolve_wal(origin, cfg, "transcript")
                     if wal is not None:
                         s = wal.stat()
                         self._write_tracking(
@@ -784,8 +883,8 @@ class ZoomEngine:
         the transcript) and a retryable `note_failed` event, NOT a hard error.
         """
         gen_start = time.monotonic()
-        transcript_wal = find_wal(origin, cfg.transcript_db_prefix)
-        blocks_wal = find_wal(origin, cfg.blocks_db_prefix)
+        transcript_wal = self._resolve_wal(origin, cfg, "transcript")
+        blocks_wal = self._resolve_wal(origin, cfg, "blocks")
 
         _, _, _, active_meeting_id = self._read_tracking()
 
@@ -1057,8 +1156,8 @@ class ZoomEngine:
                     placeholder_path_str = failed.get("note_path") or ""
                 else:
                     origin = find_origin_dir()
-                    blocks_wal = find_wal(origin, cfg.blocks_db_prefix) if origin else None
-                    transcript_wal = find_wal(origin, cfg.transcript_db_prefix) if origin else None
+                    blocks_wal = self._resolve_wal(origin, cfg, "blocks") if origin else None
+                    transcript_wal = self._resolve_wal(origin, cfg, "transcript") if origin else None
                     meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
                     m = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
                     date_str = m.group(1) if m else datetime.now().strftime("%Y-%m-%d")
