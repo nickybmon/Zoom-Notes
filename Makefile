@@ -1,7 +1,8 @@
 PYTHON ?= ./venv/bin/python3
 PYTEST ?= ./venv/bin/pytest
+BUNDLED_PYTHON ?= ./python-runtime/bin/python3.12
 
-.PHONY: test test-quick test-verbose lint check capture-fixture install-hooks install-cli install uninstall-cli
+.PHONY: test test-quick test-verbose lint check check-bundled capture-fixture install-hooks install-cli install uninstall-cli
 
 test:
 	$(PYTEST) -v
@@ -16,6 +17,26 @@ lint:
 	$(PYTHON) -m py_compile zoom_notes.py zoom_engine.py zoom_config.py
 
 check: lint test
+
+# Run the same checks under the BUNDLED Python 3.12 runtime — the one
+# that actually ships inside the .app bundle. Catches bugs that 3.14's
+# deferred-annotation behavior (PEP 649) hides from the venv suite,
+# such as missing type imports referenced in method signatures.
+# This is the gate that should pass before any release build.
+check-bundled:
+	@if [ ! -x "$(BUNDLED_PYTHON)" ]; then \
+		echo "✗ Bundled Python not found at $(BUNDLED_PYTHON)"; \
+		echo "  Run scripts/fetch-python-runtime.sh first."; \
+		exit 1; \
+	fi
+	@if ! $(BUNDLED_PYTHON) -c "import pytest" 2>/dev/null; then \
+		echo "▶ Installing pytest into bundled runtime (one-time)…"; \
+		$(BUNDLED_PYTHON) -m pip install --quiet pytest; \
+	fi
+	$(BUNDLED_PYTHON) -m py_compile zoom_notes.py zoom_engine.py zoom_config.py
+	$(BUNDLED_PYTHON) -c "import zoom_engine, zoom_notes, zoom_config" \
+		|| (echo "✗ Module import failed on bundled Python — check for missing type imports"; exit 1)
+	$(BUNDLED_PYTHON) -m pytest -q
 
 # Capture a fresh WAL fixture during a live meeting:
 #   make capture-fixture NAME=single_meeting
