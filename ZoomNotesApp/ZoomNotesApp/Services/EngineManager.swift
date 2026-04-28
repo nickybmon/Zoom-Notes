@@ -47,6 +47,7 @@ class EngineManager: ObservableObject {
         log("[EngineManager] Stopping engine (PID \(proc.processIdentifier))", level: .info)
         intentionalStop = true
         (proc.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        (proc.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         proc.terminate()
         DispatchQueue.global(qos: .utility).async {
             let deadline = Date().addingTimeInterval(3.0)
@@ -153,9 +154,10 @@ class EngineManager: ObservableObject {
         proc.environment = env
 
         let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
         let stdinPipe = Pipe()
         proc.standardOutput = stdoutPipe
-        proc.standardError = Pipe()  // discard stderr (Python writes logs to its own file)
+        proc.standardError = stderrPipe
         proc.standardInput = stdinPipe
 
         // Read stdout line by line and decode JSON events
@@ -170,6 +172,29 @@ class EngineManager: ObservableObject {
                 lineBuffer = lineBuffer[lineBuffer.index(after: nl)...]
                 guard !lineData.isEmpty else { continue }
                 self?.handleLine(lineData)
+            }
+        }
+
+        // Drain stderr into our debug log. The pipe must be read; otherwise
+        // an unexpectedly noisy Python (a deprecation warning loop, an
+        // unraisable exception spammed by a daemon thread) will fill the
+        // ~64KB pipe buffer and block the engine on its next stderr write —
+        // which manifests as the menu bar app "freezing" with no visible
+        // cause. We log at .debug because stderr is expected to be quiet
+        // in normal operation; if it ever isn't, the log file shows why.
+        var stderrBuffer = Data()
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            stderrBuffer.append(chunk)
+            while let nl = stderrBuffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let lineData = stderrBuffer[stderrBuffer.startIndex..<nl]
+                stderrBuffer = stderrBuffer[stderrBuffer.index(after: nl)...]
+                guard !lineData.isEmpty,
+                      let raw = String(data: lineData, encoding: .utf8),
+                      !raw.trimmingCharacters(in: .whitespaces).isEmpty
+                else { continue }
+                log("[Engine stderr] \(raw)", level: .debug)
             }
         }
 
