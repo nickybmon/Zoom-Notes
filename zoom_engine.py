@@ -762,6 +762,42 @@ class ZoomEngine:
                         self._set_state(EngineState.IDLE)
                         return
 
+                    # Late-joiner / WAL-noise gate. WAL filesystem activity
+                    # alone (you joining the room, Notetaker initializing,
+                    # Zoom checkpoints, presence updates) can elapse the
+                    # idle threshold without producing any real transcript
+                    # entries for the active meeting. Triggering generation
+                    # in that state would either:
+                    #   - hand the LLM whatever stale cross-meeting data
+                    #     the WAL still has (the 2026-04-29 contamination
+                    #     where an Anna Punihaole [13:07:23] fragment from
+                    #     a meeting hours earlier ended up as an entire
+                    #     "Mike Nick" note), or
+                    #   - fail with "No transcript entries found." now
+                    #     that we've removed the unfiltered fallback in
+                    #     _collect_entries_for_generation.
+                    # Either way: don't trigger. Disarm and return to IDLE;
+                    # the next genuine WAL change will re-arm us, and as
+                    # soon as the late participant speaks, the accumulator
+                    # will hold a real entry for the active meeting and the
+                    # gate will open on the following idle elapse.
+                    if current_meeting_id:
+                        with self._accumulated_lock:
+                            has_real_content = any(
+                                e.get("meeting_id") == current_meeting_id
+                                for e in self._accumulated.values()
+                            )
+                        if not has_real_content:
+                            self._emit_diag(
+                                "idle_trigger_skipped_no_content",
+                                meeting_id=current_meeting_id,
+                                idle_secs=int(idle_secs),
+                                accumulator_size=len(self._accumulated),
+                            )
+                            self._write_tracking(active_ts=None)
+                            self._set_state(EngineState.IDLE)
+                            return
+
                     provider = cfg.llm_provider
                     if provider != "ollama":
                         from zoom_config import get_api_key as _get_key
@@ -1017,9 +1053,21 @@ class ZoomEngine:
         """Pick the best entries source: in-memory accumulator > WAL > disk snapshot.
 
         Filter by active_meeting_id at this stage (not at poll time) so a stale
-        ID at IDLE→ACTIVE transition never silently drops new utterances. Falls
-        back to unfiltered if the filter would wipe everything (e.g. entries
-        captured before the meetingId field appeared in the WAL).
+        ID at IDLE→ACTIVE transition never silently drops new utterances.
+
+        Strict filter: if no accumulator entries match the active meeting,
+        return []. The previous "fallback to unfiltered" branch was the
+        2026-04-29 contamination bug — when the idle trigger fired before a
+        late participant had joined, the accumulator held only stale
+        cross-meeting WAL entries (e.g. an Anna Punihaole [13:07:23] fragment
+        from a meeting hours earlier), and the fallback handed all of it to
+        the LLM. The right answer is "no entries to summarize" — the caller
+        raises a clean error instead of producing a contaminated note.
+
+        Entries with no meeting_id are kept: those are early WAL pages that
+        haven't yet attached a meetingId field, and dropping them would lose
+        real opening utterances from the active meeting. This mirrors the
+        same rule `persist_accumulator` already applies at the disk boundary.
         """
         with self._accumulated_lock:
             acc_snapshot = dict(self._accumulated)
@@ -1029,9 +1077,8 @@ class ZoomEngine:
                 acc_entries = [
                     e for e in acc_snapshot.values()
                     if e.get("meeting_id") == active_meeting_id
+                    or not e.get("meeting_id")
                 ]
-                if not acc_entries:
-                    acc_entries = list(acc_snapshot.values())
             else:
                 acc_entries = list(acc_snapshot.values())
             return sorted(acc_entries, key=lambda e: e.get("timestamp") or "")
