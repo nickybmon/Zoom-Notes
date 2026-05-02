@@ -482,13 +482,21 @@ class TestCollectEntriesForGenerationFiltersStrictly:
                 "stale2": _make_entry("stale2", "more anna",
                                       meeting_id="meetingA", speaker="Anna"),
             }
-        result = engine._collect_entries_for_generation(
+        # No session_mtime is set — without a session-start anchor the
+        # self-heal path refuses to recover, so this falls back to the
+        # original strict-filter contract: return [] rather than hand the
+        # unrelated meetingA entries to the LLM.
+        entries, recovered_id = engine._collect_entries_for_generation(
             transcript_wal=None, active_meeting_id="meetingB"
         )
-        assert result == [], (
+        assert entries == [], (
             "must return [] when no accumulator entries match the active "
             "meeting; falling back to the unfiltered snapshot was the "
             "2026-04-29 contamination bug"
+        )
+        assert recovered_id is None, (
+            "recovered_id must be None when self-heal cannot identify a "
+            "fresh in-session meeting (no session anchor + no matches)"
         )
 
     def test_returns_filtered_entries_when_some_match(self, isolated_cache):
@@ -500,12 +508,15 @@ class TestCollectEntriesForGenerationFiltersStrictly:
                 "real1":  _make_entry("real1", "alex",
                                       meeting_id="meetingB", speaker="Alex"),
             }
-        result = engine._collect_entries_for_generation(
+        entries, recovered_id = engine._collect_entries_for_generation(
             transcript_wal=None, active_meeting_id="meetingB"
         )
-        assert len(result) == 1
-        assert result[0]["msg_id"] == "real1"
-        assert result[0]["meeting_id"] == "meetingB"
+        assert len(entries) == 1
+        assert entries[0]["msg_id"] == "real1"
+        assert entries[0]["meeting_id"] == "meetingB"
+        assert recovered_id == "meetingB", (
+            "no self-heal happened: tracking was already correct"
+        )
 
     def test_includes_entries_with_no_meeting_id(self, isolated_cache):
         """Early-WAL-page entries (meeting_id=None) must be kept — they're
@@ -521,10 +532,10 @@ class TestCollectEntriesForGenerationFiltersStrictly:
                 "real1":  _make_entry("real1", "thanks",
                                       meeting_id="meetingB", speaker="Alex"),
             }
-        result = engine._collect_entries_for_generation(
+        entries, _recovered_id = engine._collect_entries_for_generation(
             transcript_wal=None, active_meeting_id="meetingB"
         )
-        msg_ids = {e["msg_id"] for e in result}
+        msg_ids = {e["msg_id"] for e in entries}
         assert msg_ids == {"early1", "real1"}, (
             "entries with meeting_id=None (early WAL pages) must be kept "
             "alongside entries that match the active_meeting_id"

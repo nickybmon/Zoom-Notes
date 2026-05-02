@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-zoom_engine.py — Headless WAL poller for Zoom Meeting Notes Assistant.
+zoom_engine.py — Headless WAL poller for Zoom Notes.
 
 Replaces zoom_menu_bar.py. No rumps, no UI — designed to run as a child process
 of the Swift ZoomNotesApp. Emits newline-delimited JSON events to stdout and
@@ -153,6 +153,18 @@ class ZoomEngine:
         #      session_start_mtime so the guard correctly lets it through.
         self._last_generated_session: tuple[str, float] | None = None
 
+        # `(meeting_id, latest_ts_secs)` for the session we most recently
+        # generated notes for, where `latest_ts_secs` is the wall-clock
+        # seconds-since-midnight of the last transcript entry we wrote.
+        # Passed to `detect_active_meeting_id` on the next IDLE -> ACTIVE
+        # transition so the just-completed meeting can't trap detection
+        # while its data is still resident in the WAL (the 2026-04-30
+        # back-to-back-meeting overwrite scenario). Distinct from
+        # `_last_generated_session`: the fingerprint there guards against
+        # re-summarizing the same checkpoint, this guards against picking
+        # up the wrong meeting when a NEW one starts immediately after.
+        self._last_completed_boundary: tuple[str, int] | None = None
+
         # Set by _generate_notes when it writes a placeholder note instead of
         # a final note. Read by the worker so it knows to keep the persisted
         # accumulator (for retry) rather than deleting it.
@@ -254,6 +266,32 @@ class ZoomEngine:
     def _read_session_mtime(self) -> float | None:
         with self._tracking_lock:
             return self._active_session_mtime
+
+    def _latest_acc_ts_secs_for(self, meeting_id: str) -> int | None:
+        """Latest accumulator timestamp for `meeting_id`, in seconds-since-midnight.
+
+        Used to stamp `_last_completed_boundary` after generation. Returns
+        None if the accumulator has no entries for that meeting (we won't
+        block detection on a non-existent boundary).
+        """
+        latest = -1
+        with self._accumulated_lock:
+            for e in self._accumulated.values():
+                if e.get("meeting_id") != meeting_id:
+                    continue
+                ts = e.get("timestamp")
+                if not ts:
+                    continue
+                try:
+                    parts = [int(x) for x in ts.split(":")]
+                except ValueError:
+                    continue
+                if len(parts) != 3:
+                    continue
+                secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                if secs > latest:
+                    latest = secs
+        return latest if latest >= 0 else None
 
     def _write_tracking(self, *, mtime=..., size=..., active_ts=..., meeting_id=..., session_mtime=...):
         with self._tracking_lock:
@@ -600,8 +638,39 @@ class ZoomEngine:
 
         if changed:
             self._write_tracking(active_ts=now)
+            # On IDLE -> ACTIVE we ask detection to ignore the meeting we
+            # just finished generating notes for. Without this the still-
+            # resident WAL data from that meeting (huge entry count + still
+            # within the recency window) outscores the one or two entries
+            # the freshly-starting meeting has produced, and tracking locks
+            # onto the wrong id for the rest of the session — the 2026-04-30
+            # back-to-back-meeting failure mode.
+            #
+            # Boundary filter applies in TWO cases (the 2026-04-30 PM lesson):
+            #   1. The IDLE -> ACTIVE transition tick (original case).
+            #   2. While ACTIVE but with no tracked meeting_id yet — i.e. we
+            #      went ACTIVE on a tick where Zoom hadn't written its
+            #      `meetingId` token yet, so detection returned None. On
+            #      subsequent ticks, while tracking is still empty, the
+            #      boundary filter must STILL apply or the just-ended
+            #      meeting (whose data is still resident in the WAL) gets
+            #      promoted to active and contaminates the new session.
+            _, _, _, current_tracking_id = self._read_tracking()
+            tracking_is_empty = not current_tracking_id
+            apply_boundary = (
+                state == EngineState.IDLE
+                or (state == EngineState.ACTIVE and tracking_is_empty)
+            )
+            exclude_id = None
+            freshness_floor = None
+            if apply_boundary and self._last_completed_boundary is not None:
+                exclude_id, freshness_floor = self._last_completed_boundary
             try:
-                meeting_id = detect_active_meeting_id(wal)
+                meeting_id = detect_active_meeting_id(
+                    wal,
+                    exclude_meeting_id=exclude_id,
+                    freshness_floor_secs=freshness_floor,
+                )
             except Exception:
                 meeting_id = None
 
@@ -611,6 +680,13 @@ class ZoomEngine:
                 # the post-success dedupe distinguish a recurring meeting's
                 # new session from a checkpoint of the one we just finished.
                 self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
+                # Only clear the boundary anchor once we've successfully
+                # tracked the new meeting. If meeting_id is None here (Zoom
+                # hadn't written meetingId yet), keep the boundary in place
+                # so subsequent ACTIVE-with-empty-tracking ticks can still
+                # apply it.
+                if meeting_id:
+                    self._last_completed_boundary = None
                 # Fresh ACTIVE period — restart the periodic-persist clock so
                 # we don't immediately force a snapshot on the very first
                 # change tick before the accumulator has any new content.
@@ -640,29 +716,60 @@ class ZoomEngine:
                     accumulator_size=acc_size,
                 )
             elif state == EngineState.ACTIVE and meeting_id:
-                # Re-evaluate the active meeting ID on every tick. If the WAL
-                # now scores a different meeting as best (new meeting started
-                # while old meeting's data was still in the WAL), switch to it
-                # and clear the accumulator so we don't mix the two meetings.
-                _, _, _, current_tracking_id = self._read_tracking()
-                if current_tracking_id and meeting_id != current_tracking_id:
+                # Re-evaluate the active meeting ID on every tick. Two distinct
+                # cases to handle:
+                #
+                # (A) Upgrade-from-empty: tracking is currently empty (because
+                #     IDLE -> ACTIVE happened before Zoom wrote `meetingId`),
+                #     and detection has now produced a real id. Adopt it
+                #     WITHOUT clearing the accumulator — the entries we
+                #     captured during the empty-tracking window are real
+                #     for this same meeting; their `meeting_id` field was
+                #     just None at parse time. The generation-time filter
+                #     keeps no-id entries alongside matching-id entries.
+                #     This is the 2026-04-30 PM Brand Team Meeting fix.
+                #
+                # (B) Meeting actually changed: tracking has a real id but
+                #     the WAL now scores a different one as best. A new
+                #     meeting started while the old one's data was still
+                #     in the WAL — switch and clear the accumulator so the
+                #     two don't mix.
+                if tracking_is_empty:
+                    # Case A: upgrade without clearing.
+                    self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
+                    self._last_completed_boundary = None
+                    with self._accumulated_lock:
+                        # Stamp the late-arriving meeting_id onto any entries
+                        # that lacked one so they survive the strict filter
+                        # at generation time even if anything later changes
+                        # the inclusion rules.
+                        for entry in self._accumulated.values():
+                            if not entry.get("meeting_id"):
+                                entry["meeting_id"] = meeting_id
+                        acc_size = len(self._accumulated)
+                    self._emit_diag(
+                        "meeting_id_changed",
+                        from_id="", to_id=meeting_id,
+                        reason="upgrade_from_empty",
+                        accumulator_preserved=True,
+                    )
+                    self._set_state(
+                        EngineState.ACTIVE,
+                        meeting_id=meeting_id,
+                        accumulator_size=acc_size,
+                    )
+                elif meeting_id != current_tracking_id:
+                    # Case B: real meeting change.
                     # Delete the OLD meeting's on-disk snapshot. By definition
                     # we now know that meeting was a misidentification — the
                     # scoring just promoted a different meeting to active —
                     # so the old slug's cache file is at best stale and at
                     # worst contaminated with entries that actually belong to
-                    # the new meeting (since `_persist_accumulator_now` writes
-                    # whatever's in the in-memory accumulator under the old
-                    # slug). Leaving it on disk causes it to perpetually
-                    # resurface as a "Recover unfinished meeting" item on
-                    # every engine startup until the 24h purge kicks in
-                    # (which it often doesn't, because the file's mtime gets
-                    # bumped by every subsequent persist).
+                    # the new meeting.
                     try:
                         delete_persisted_accumulator(current_tracking_id)
                     except Exception:
                         pass
-                    # New active meeting → new session fingerprint.
                     self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
                     with self._accumulated_lock:
                         self._accumulated = {}
@@ -852,6 +959,15 @@ class ZoomEngine:
                     self._last_generated_session = (
                         processing_meeting_id, processing_session_mtime
                     )
+                # Stamp the boundary anchor: the latest transcript timestamp
+                # we just summarized. The next IDLE -> ACTIVE will pass this
+                # to `detect_active_meeting_id` so the just-completed
+                # meeting (whose entries are still resident in the WAL)
+                # cannot be re-detected as the new active meeting.
+                if processing_meeting_id:
+                    latest = self._latest_acc_ts_secs_for(processing_meeting_id)
+                    if latest is not None:
+                        self._last_completed_boundary = (processing_meeting_id, latest)
                 # Clean up the in-memory accumulator. Keep the persisted
                 # disk snapshot if note generation failed — it's the source
                 # of truth for the retry flow.
@@ -925,7 +1041,23 @@ class ZoomEngine:
 
         _, _, _, active_meeting_id = self._read_tracking()
 
-        entries = self._collect_entries_for_generation(transcript_wal, active_meeting_id)
+        entries, recovered_meeting_id = self._collect_entries_for_generation(
+            transcript_wal, active_meeting_id
+        )
+        # If self-heal recovered a different meeting_id, treat it as the
+        # canonical id from here on. Update tracking so the post-success
+        # boundary anchor + frontmatter + diag events all reflect what
+        # actually got summarized — not the misidentified id we entered
+        # generation with.
+        if recovered_meeting_id and recovered_meeting_id != active_meeting_id:
+            self._emit_diag(
+                "active_id_self_healed",
+                from_id=active_meeting_id or "",
+                to_id=recovered_meeting_id,
+                entry_count=len(entries),
+            )
+            self._write_tracking(meeting_id=recovered_meeting_id)
+            active_meeting_id = recovered_meeting_id
 
         if not transcript_wal and not entries:
             raise RuntimeError("Transcript WAL not found during generation.")
@@ -950,8 +1082,20 @@ class ZoomEngine:
         cfg = self._get_cfg()
 
         # ── Stage 1: save transcript (durability boundary) ─────────────────
-        transcript_content = build_transcript_content(transcript_text, meeting_title, date_str, cfg)
-        transcript_path = save_transcript_only(transcript_content, meeting_title, date_str, cfg)
+        # Thread `active_meeting_id` through so a same-day same-title
+        # collision (e.g. two unrelated Zoom calls that both slug to
+        # "Daily Standup" because the second one had no AI Notetaker
+        # title) lands as a `-2` sibling instead of clobbering the first
+        # meeting's note. The 2026-04-30 incident was exactly this:
+        # a follow-up 1:1 wiped the morning standup's saved note.
+        transcript_content = build_transcript_content(
+            transcript_text, meeting_title, date_str, cfg,
+            meeting_id=active_meeting_id,
+        )
+        transcript_path = save_transcript_only(
+            transcript_content, meeting_title, date_str, cfg,
+            meeting_id=active_meeting_id,
+        )
         slug = slugify_title(meeting_title, fallback_date=date_str)
 
         # ── Stage 2: generate note via LLM ─────────────────────────────────
@@ -989,7 +1133,10 @@ class ZoomEngine:
                 meeting_id=active_meeting_id or "",
                 cfg=cfg,
             )
-            placeholder_path = save_note_only(placeholder, meeting_title, date_str, cfg)
+            placeholder_path = save_note_only(
+                placeholder, meeting_title, date_str, cfg,
+                meeting_id=active_meeting_id,
+            )
             self._last_run_note_failed = True
             failed_record = {
                 "meeting_id": active_meeting_id or "",
@@ -1023,9 +1170,13 @@ class ZoomEngine:
 
         # ── Stage 3: save the final note ───────────────────────────────────
         note_content = build_note_content(
-            summary, meeting_title, date_str, attendees, created_iso, cfg
+            summary, meeting_title, date_str, attendees, created_iso, cfg,
+            meeting_id=active_meeting_id,
         )
-        note_path = save_note_only(note_content, meeting_title, date_str, cfg)
+        note_path = save_note_only(
+            note_content, meeting_title, date_str, cfg,
+            meeting_id=active_meeting_id,
+        )
 
         emit({
             "event": "done",
@@ -1055,14 +1206,27 @@ class ZoomEngine:
         Filter by active_meeting_id at this stage (not at poll time) so a stale
         ID at IDLE→ACTIVE transition never silently drops new utterances.
 
-        Strict filter: if no accumulator entries match the active meeting,
-        return []. The previous "fallback to unfiltered" branch was the
-        2026-04-29 contamination bug — when the idle trigger fired before a
-        late participant had joined, the accumulator held only stale
-        cross-meeting WAL entries (e.g. an Anna Punihaole [13:07:23] fragment
-        from a meeting hours earlier), and the fallback handed all of it to
-        the LLM. The right answer is "no entries to summarize" — the caller
-        raises a clean error instead of producing a contaminated note.
+        Three-way decision when the strict filter returns 0 entries (the
+        2026-04-30 lesson):
+
+          1) The accumulator contains real content for ANOTHER meeting whose
+             entries are at least as recent as the active session window —
+             this means tracking misidentified the active meeting (e.g. it
+             locked onto the just-ended meeting because its data was still
+             resident at IDLE -> ACTIVE). Recompute `active_meeting_id` from
+             accumulator content (most-common meeting_id among entries
+             whose timestamp is on or after the engine's session-start
+             wall-clock), and use those entries. Returns
+             `(entries, recovered_meeting_id)` so the caller can update
+             tracking + frontmatter to match.
+
+          2) The accumulator only holds stale entries (timestamps before
+             session start, or no meeting_id matches) — the late-joiner gate
+             upstream should have caught this, but be defensive: return
+             `([], None)`.
+
+          3) No accumulator at all — fall back to parse_transcript or the
+             persisted snapshot, same as before.
 
         Entries with no meeting_id are kept: those are early WAL pages that
         haven't yet attached a meetingId field, and dropping them would lose
@@ -1073,27 +1237,120 @@ class ZoomEngine:
             acc_snapshot = dict(self._accumulated)
 
         if acc_snapshot:
-            if active_meeting_id:
-                acc_entries = [
-                    e for e in acc_snapshot.values()
-                    if e.get("meeting_id") == active_meeting_id
-                    or not e.get("meeting_id")
-                ]
-            else:
-                acc_entries = list(acc_snapshot.values())
-            return sorted(acc_entries, key=lambda e: e.get("timestamp") or "")
+            # Self-heal first when we have no tracked meeting_id (the
+            # 2026-04-30 PM scenario: Zoom wrote `meetingId` so late that
+            # both IDLE -> ACTIVE detection and the upgrade-from-empty
+            # tick missed it). Without this branch, the `else` path below
+            # used to return EVERY accumulator entry — including stale
+            # cross-day fragments like Anna Punihaole's [13:07:23] from
+            # yesterday — which then poisoned title parsing and the LLM
+            # input. With this branch we recover the right id from
+            # accumulator content (most-common id with a session-fresh
+            # timestamp); if we can't, we return an empty list rather
+            # than gambling on stale content.
+            if not active_meeting_id:
+                recovered = self._recover_active_meeting_id(acc_snapshot)
+                if recovered:
+                    recovered_entries = [
+                        e for e in acc_snapshot.values()
+                        if e.get("meeting_id") == recovered
+                        or not e.get("meeting_id")
+                    ]
+                    recovered_entries.sort(key=lambda e: e.get("timestamp") or "")
+                    return recovered_entries, recovered
+                # No anchor or no fresh-enough id found. Better to fail
+                # cleanly than to summarize yesterday's Anna fragment.
+                return [], None
+
+            acc_entries = [
+                e for e in acc_snapshot.values()
+                if e.get("meeting_id") == active_meeting_id
+                or not e.get("meeting_id")
+            ]
+            if not acc_entries:
+                # Self-heal path #2: tracking has the wrong meeting_id
+                # (e.g. trapped on a just-ended meeting). Pick the
+                # most-common meeting_id in the accumulator that has
+                # at least one timestamp at or after session start,
+                # and return THOSE entries. Caller is expected to
+                # update tracking + frontmatter to the recovered id.
+                recovered = self._recover_active_meeting_id(acc_snapshot)
+                if recovered:
+                    recovered_entries = [
+                        e for e in acc_snapshot.values()
+                        if e.get("meeting_id") == recovered
+                        or not e.get("meeting_id")
+                    ]
+                    recovered_entries.sort(key=lambda e: e.get("timestamp") or "")
+                    return recovered_entries, recovered
+                return [], None
+            return sorted(acc_entries, key=lambda e: e.get("timestamp") or ""), active_meeting_id
 
         if transcript_wal:
-            return parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
+            return parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id), active_meeting_id
 
         if active_meeting_id:
             persisted = load_persisted_accumulator(active_meeting_id)
             if persisted:
                 return sorted(
                     persisted.values(), key=lambda e: e.get("timestamp") or ""
-                )
+                ), active_meeting_id
 
-        return []
+        return [], active_meeting_id
+
+    def _recover_active_meeting_id(self, acc_snapshot: dict) -> str | None:
+        """Pick the meeting_id most plausibly matching the active session.
+
+        Strategy: count entries by meeting_id, restrict to ids whose latest
+        timestamp is at or after the engine's session start mtime (HH:MM:SS
+        wall-clock). Among those, return the one with the most entries.
+
+        Returns None if (a) we have no session-start anchor (engine isn't
+        ACTIVE), or (b) no meeting_id in the accumulator has a fresh-enough
+        timestamp. Without an anchor we can't tell stale from fresh, so we
+        refuse to "recover" — better to return no entries than to gamble.
+        """
+        session_mtime = self._read_session_mtime()
+        if session_mtime is None:
+            return None
+        session_floor_secs = self._wallclock_secs_from_mtime(session_mtime)
+
+        # Group entries by meeting_id, tracking max-ts per group.
+        from collections import Counter
+        counts: Counter[str] = Counter()
+        max_ts: dict[str, int] = {}
+        for e in acc_snapshot.values():
+            mid = e.get("meeting_id")
+            if not mid:
+                continue
+            counts[mid] += 1
+            ts = e.get("timestamp")
+            if ts:
+                try:
+                    parts = [int(x) for x in ts.split(":")]
+                    if len(parts) == 3:
+                        secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                        if secs > max_ts.get(mid, -1):
+                            max_ts[mid] = secs
+                except ValueError:
+                    pass
+
+        eligible = [mid for mid, c in counts.items()
+                    if max_ts.get(mid, -1) >= session_floor_secs]
+        if not eligible:
+            return None
+        # Of the eligible, pick the one with the most entries.
+        eligible.sort(key=lambda m: counts[m], reverse=True)
+        return eligible[0]
+
+    @staticmethod
+    def _wallclock_secs_from_mtime(mtime: float) -> int:
+        """Convert a unix mtime to seconds-since-midnight in the local
+        timezone. Used to compare WAL mtimes against transcript HH:MM:SS
+        timestamps, which are themselves local-time.
+        """
+        d = datetime.fromtimestamp(mtime)
+        return d.hour * 3600 + d.minute * 60 + d.second
 
     def _derive_meeting_title(self, blocks_wal, transcript_wal, entries) -> str:
         meeting_title = None
@@ -1261,18 +1518,22 @@ class ZoomEngine:
                     return
 
                 note_content = build_note_content(
-                    summary, meeting_title, date_str, attendees, created_iso, cfg
+                    summary, meeting_title, date_str, attendees, created_iso, cfg,
+                    meeting_id=meeting_id,
                 )
 
                 # Overwrite the placeholder note in place if we know its path,
                 # otherwise write a fresh note (which save_note_only will
-                # disambiguate via _next_available_path).
+                # disambiguate via _resolve_save_path using meeting_id).
                 from pathlib import Path as _Path
                 if placeholder_path_str and _Path(placeholder_path_str).exists():
                     overwrite_note(_Path(placeholder_path_str), note_content)
                     note_path = _Path(placeholder_path_str)
                 else:
-                    note_path = save_note_only(note_content, meeting_title, date_str, cfg)
+                    note_path = save_note_only(
+                        note_content, meeting_title, date_str, cfg,
+                        meeting_id=meeting_id,
+                    )
 
                 # Cleanup: drop the persisted accumulator and forget the
                 # last-failed meeting so the menu bar Retry item disappears.

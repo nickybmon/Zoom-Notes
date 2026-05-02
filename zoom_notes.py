@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Zoom Meeting Notes Assistant
+Zoom Notes
 Reads Zoom's live AI Notetaker WAL files to extract transcripts,
 then summarizes them via your configured LLM and saves to your output directory.
 
@@ -279,8 +279,13 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
 
     Weights:
     - Base: 1 point per WAL entry
-    - Recency bonus: +50 if any entry has a timestamp within 2 hours of now
-    - Speaker bonus: +1000 if ZOOM_NOTES_USER_NAME matches a speaker in the meeting
+    - Recency bonus: +100,000 if any entry has a timestamp within 30 min of now
+    - Speaker bonus: +1,000,000 if ZOOM_NOTES_USER_NAME matches a speaker in the meeting
+
+    Also returns auxiliary fields used by `detect_active_meeting_id` for
+    boundary-aware filtering: `latest_ts_secs` is the max wall-clock timestamp
+    seen for the meeting (HH:MM:SS converted to seconds-since-midnight), used
+    to drop a meeting that has already finished from active-meeting selection.
 
     Returns {meetingId: score}. Use max(scores, key=scores.get) to pick best.
     """
@@ -304,12 +309,19 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
             mid = lines[i + 1]
             if mid and len(mid) > 8:
                 if mid not in meeting_data:
-                    meeting_data[mid] = {"count": 0, "has_recent": False, "has_user": False}
+                    meeting_data[mid] = {
+                        "count": 0,
+                        "has_recent": False,
+                        "has_user": False,
+                        "latest_ts_secs": -1,
+                    }
                 meeting_data[mid]["count"] += 1
                 for back in range(i - 1, max(i - 60, -1), -1):
                     if lines[back] == "timeStampContent" and back + 1 < len(lines):
                         try:
                             ts_secs = sum(int(x) * m for x, m in zip(lines[back + 1].split(":"), [3600, 60, 1]))
+                            if ts_secs > meeting_data[mid]["latest_ts_secs"]:
+                                meeting_data[mid]["latest_ts_secs"] = ts_secs
                             if abs(now_secs - ts_secs) <= _RECENCY_WINDOW_SECS:
                                 meeting_data[mid]["has_recent"] = True
                         except (ValueError, AttributeError):
@@ -333,15 +345,102 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
     return scores
 
 
-def detect_active_meeting_id(wal_path: Path) -> str | None:
+def score_meeting_ids_detailed(wal_path: Path) -> dict[str, dict]:
+    """Like `score_meeting_ids` but returns the full per-meeting record.
+
+    Each value is `{"count": int, "has_recent": bool, "has_user": bool,
+    "latest_ts_secs": int, "score": float}`. `detect_active_meeting_id` uses
+    this when callers pass a `freshness_floor_secs` to filter out meetings
+    whose data is entirely older than the floor.
+
+    Implementation reuses `score_meeting_ids` to avoid duplicating the WAL
+    scan; the extra dict-building is cheap relative to the strings(1) call.
+    """
+    user_name = os.environ.get("ZOOM_NOTES_USER_NAME", "").strip().lower()
+    lines = read_wal_strings(wal_path)
+    meeting_data: dict[str, dict] = {}
+    _RECENCY_WINDOW_SECS = 30 * 60
+    now_hms = datetime.now().strftime("%H:%M:%S")
+    try:
+        now_secs = sum(int(x) * m for x, m in zip(now_hms.split(":"), [3600, 60, 1]))
+    except ValueError:
+        now_secs = 0
+
+    i = 0
+    while i < len(lines):
+        if lines[i] == "meetingId" and i + 1 < len(lines):
+            mid = lines[i + 1]
+            if mid and len(mid) > 8:
+                if mid not in meeting_data:
+                    meeting_data[mid] = {
+                        "count": 0, "has_recent": False, "has_user": False,
+                        "latest_ts_secs": -1,
+                    }
+                meeting_data[mid]["count"] += 1
+                for back in range(i - 1, max(i - 60, -1), -1):
+                    if lines[back] == "timeStampContent" and back + 1 < len(lines):
+                        try:
+                            ts_secs = sum(int(x) * m for x, m in zip(lines[back + 1].split(":"), [3600, 60, 1]))
+                            if ts_secs > meeting_data[mid]["latest_ts_secs"]:
+                                meeting_data[mid]["latest_ts_secs"] = ts_secs
+                            if abs(now_secs - ts_secs) <= _RECENCY_WINDOW_SECS:
+                                meeting_data[mid]["has_recent"] = True
+                        except (ValueError, AttributeError):
+                            pass
+                    elif lines[back] == "username" and back + 1 < len(lines):
+                        if user_name and lines[back + 1].strip().lower() == user_name:
+                            meeting_data[mid]["has_user"] = True
+        i += 1
+
+    for mid, data in meeting_data.items():
+        score = float(data["count"])
+        if data["has_recent"]:
+            score += 100_000
+        if data["has_user"]:
+            score += 1_000_000
+        data["score"] = score
+    return meeting_data
+
+
+def detect_active_meeting_id(
+    wal_path: Path,
+    *,
+    exclude_meeting_id: str | None = None,
+    freshness_floor_secs: int | None = None,
+) -> str | None:
     """Return the best-scoring meetingId from the WAL.
 
     Uses score_meeting_ids() which factors in entry count, timestamp recency,
     and whether ZOOM_NOTES_USER_NAME appears as a speaker — preventing a
     ghost/double-booked meeting from crowding out the one you actually attended.
+
+    Boundary-aware filtering (the 2026-04-30 lesson):
+      `exclude_meeting_id` drops a specific id from contention. The engine
+      passes the just-completed meeting here so its still-resident WAL data
+      can't trap detection on the next IDLE -> ACTIVE transition.
+
+      `freshness_floor_secs` drops any meeting whose latest WAL timestamp is
+      <= this floor (HH:MM:SS converted to seconds-since-midnight). When the
+      engine knows a session ended at 11:21, a meeting whose newest entry is
+      11:21 or older can't be the *new* active meeting — it's by definition
+      from a session that finished. Without this, the just-ended meeting's
+      huge entry count + recency bonus dominates the freshly-starting one's
+      few-entry count, and the engine locks onto the wrong id.
     """
-    scores = score_meeting_ids(wal_path)
-    return max(scores, key=lambda k: scores[k]) if scores else None
+    if exclude_meeting_id is None and freshness_floor_secs is None:
+        scores = score_meeting_ids(wal_path)
+        return max(scores, key=lambda k: scores[k]) if scores else None
+
+    detailed = score_meeting_ids_detailed(wal_path)
+    eligible: dict[str, float] = {}
+    for mid, data in detailed.items():
+        if exclude_meeting_id and mid == exclude_meeting_id:
+            continue
+        if freshness_floor_secs is not None and data["latest_ts_secs"] >= 0 \
+                and data["latest_ts_secs"] <= freshness_floor_secs:
+            continue
+        eligible[mid] = data["score"]
+    return max(eligible, key=lambda k: eligible[k]) if eligible else None
 
 
 # ── Transcript persistence ─────────────────────────────────────────────────────
@@ -926,6 +1025,22 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
     Zoom start-time (YYYY-MM-DD HH:MM) is closest to the transcript's own
     timestamps, so we pick the right meeting when the WAL holds multiple sessions.
     Falls back to the last title found if no time-based match is possible.
+
+    Tight matching window (the 2026-04-30 lesson):
+      Previously this used a 2-hour window and grabbed the closest title
+      within it. When two unrelated meetings ran back-to-back on the same
+      morning, and the second meeting's AI Notetaker never wrote a fresh
+      title to the blocks WAL (e.g. Notetaker was off, or hadn't reached
+      block-creation yet), the parser cheerfully matched the FIRST
+      meeting's stale title (31 minutes off) and the second meeting got
+      saved as "Daily Standup", overwriting the actual standup's note.
+
+      Now: the window is 10 minutes, AND a candidate title is only
+      eligible if its embedded start time is at or before the transcript's
+      earliest entry by no more than that window. A title can't post-date
+      the meeting it's supposed to label. If nothing matches, the caller
+      gets None and falls back to the generic "Zoom Meeting <date> <time>"
+      label — better a generic name than a wrong-meeting name.
     """
     lines = read_wal_strings(blocks_wal)
     titles = []
@@ -962,9 +1077,12 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
         return titles[-1]
 
     # Parse the date+time embedded in each Zoom title: "Name YYYY-MM-DD HH:MM(GMT...)"
-    # Only accept titles whose embedded start time is within 2 hours of the transcript.
+    # Only accept titles whose embedded start time is within 10 minutes BEFORE
+    # the transcript's earliest entry (with 60s slack on the future side for
+    # clock skew between Zoom's title timestamp and the first parsed utterance).
     _zoom_time_re = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})")
-    _MAX_TITLE_DELTA_SECS = 2 * 3600
+    _TITLE_LATE_TOLERANCE_SECS = 10 * 60
+    _TITLE_FUTURE_SLACK_SECS = 60
     best_title = None
     best_delta = None
     for t in titles:
@@ -975,12 +1093,22 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
             title_dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M")
         except ValueError:
             continue
-        delta = abs((ref_dt - title_dt).total_seconds())
-        if delta <= _MAX_TITLE_DELTA_SECS and (best_delta is None or delta < best_delta):
-            best_delta = delta
+        # Signed delta: positive when title is BEFORE the transcript (the
+        # normal case — Zoom stamps the meeting start, which precedes the
+        # first utterance). Negative would mean the title is from a meeting
+        # that started AFTER the transcript's first entry, which is
+        # physically impossible for the active meeting.
+        delta = (ref_dt - title_dt).total_seconds()
+        if delta < -_TITLE_FUTURE_SLACK_SECS:
+            continue
+        if delta > _TITLE_LATE_TOLERANCE_SECS:
+            continue
+        abs_delta = abs(delta)
+        if best_delta is None or abs_delta < best_delta:
+            best_delta = abs_delta
             best_title = t
 
-    # If no title matched within the time window, fall back to the last title
+    # If no title matched within the tight window, fall back to the last title
     # only if it has no parseable timestamp (i.e. a custom/renamed meeting title).
     if best_title is None:
         for t in reversed(titles):
@@ -1331,34 +1459,124 @@ def slugify_title(title: str, fallback_date: str | None = None) -> str:
 
 _RECENT_OVERWRITE_WINDOW_SECS = 60
 
+# Read at most this many bytes when sniffing an existing file's frontmatter.
+# Frontmatter blocks are always at the top; a few KB is more than enough and
+# bounds memory if a user points us at a large file.
+_FRONTMATTER_SNIFF_BYTES = 8192
 
-def _next_available_path(target: Path) -> Path:
-    """If target was modified within the last `_RECENT_OVERWRITE_WINDOW_SECS`,
-    return a `-2`, `-3`, ... suffixed sibling so we don't silently overwrite a
-    freshly-saved note.
 
-    The window is intentionally short (60s): legitimate same-second reruns from
-    a manual "Generate Notes Now" should disambiguate, but a runaway engine
-    loop must NOT be allowed to produce dozens of `-N.md` siblings — the
-    real fix for that lives in zoom_engine._trigger_generate (last-meeting-id
-    guard + tracking anchor on success).
+def _read_existing_meeting_id(path: Path) -> str | None:
+    """Extract `meeting_id` from a file's YAML frontmatter, if present.
 
-    Older files are allowed to be overwritten — repeat invocations of the same
-    recurring meeting on different days land in different dated subfolders, so
-    a same-day path collision usually means the user wants to refresh.
+    Returns:
+      - the meeting id string (possibly empty if the field exists but is blank),
+      - None if the file doesn't exist, isn't readable, has no frontmatter,
+        or has no `meeting_id` key.
+
+    Implementation note: we don't pull in PyYAML — the engine intentionally
+    stays stdlib-only — so this is a tiny line-oriented scan of the leading
+    `---` block. Frontmatter values are emitted by `_yaml_quote`, so the
+    serialization is either a plain scalar or a JSON-quoted string. Both are
+    handled. Anything past the closing `---` is ignored.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(_FRONTMATTER_SNIFF_BYTES)
+    except OSError:
+        return None
+    if not head.startswith("---"):
+        return None
+    # Walk lines after the opening fence until the closing one.
+    body = head.split("\n", 1)[1] if "\n" in head else ""
+    for line in body.splitlines():
+        if line.strip() == "---":
+            return None
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        if key.strip() != "meeting_id":
+            continue
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value[1:-1]
+        return value
+    return None
+
+
+def _resolve_save_path(target: Path, meeting_id: str | None) -> Path:
+    """Return the path to save to, never silently overwriting a different meeting.
+
+    Decision tree:
+      1. Target doesn't exist → use it.
+      2. Target exists AND BOTH the new and existing meeting_ids are
+         non-empty AND equal → use it (same meeting refreshing itself,
+         e.g. retry-after-LLM-failure).
+      3. Target exists AND new meeting_id is non-empty AND existing file's
+         meeting_id is non-empty but different → search siblings.
+      4. Target exists AND either side has an empty/missing meeting_id →
+         we cannot prove same-meeting; ALWAYS create a sibling.
+
+         The only carve-out for the 60-second legacy window is callers
+         passing `meeting_id=None` (CLI `--notes`, manual recovery). For
+         engine-driven saves with empty `meeting_id` (=""), we treat the
+         empty values as "unprovable" and create a sibling — that closes
+         the 2026-04-30 PM regression where two engine-generated files
+         both had `meeting_id: ""` (because Zoom hadn't written its
+         meetingId field at IDLE->ACTIVE) and the second silently
+         overwrote the first.
+
+    The distinction matters: `meeting_id=None` is "the caller doesn't have
+    one to give" (CLI tool); `meeting_id=""` is "the engine had one but it
+    was empty at the time of save" (bug we're guarding against).
     """
     if not target.exists():
         return target
-    age = time.time() - target.stat().st_mtime
-    if age >= _RECENT_OVERWRITE_WINDOW_SECS:
+
+    new_is_empty = meeting_id is None or meeting_id == ""
+    existing_id = _read_existing_meeting_id(target)
+    existing_is_empty = existing_id is None or existing_id == ""
+
+    if not new_is_empty and not existing_is_empty and existing_id == meeting_id:
+        # Same meeting refreshing itself. Overwrite is the right thing.
         return target
+
+    if meeting_id is None and existing_is_empty:
+        # CLI / recovery path AND existing file also has no meeting_id
+        # frontmatter (e.g. a prior CLI run): preserve the 60-second
+        # window so a quick rerun (`python zoom_notes.py --notes` twice
+        # while iterating on a prompt) replaces rather than piles up
+        # siblings. After 60s, we assume the user moved on and create
+        # a sibling instead of silently overwriting older work.
+        age = time.time() - target.stat().st_mtime
+        if age < _RECENT_OVERWRITE_WINDOW_SECS:
+            return target
+
+    # Every other case → create a sibling. We can't prove same-meeting:
+    #   - new id is empty but engine-driven (treat as different);
+    #   - existing file has no meeting_id (legacy / hand-authored / engine-
+    #     bug-era) and we must never clobber it;
+    #   - both ids are non-empty but different (the original Daily-Standup
+    #     overwrite scenario).
     stem, suffix = target.stem, target.suffix
     parent = target.parent
-    for n in range(2, 100):
+    for n in range(2, 1000):
         candidate = parent / f"{stem}-{n}{suffix}"
         if not candidate.exists():
             return candidate
+        if not new_is_empty:
+            cand_id = _read_existing_meeting_id(candidate)
+            if cand_id and cand_id == meeting_id:
+                return candidate
     return target  # give up; overwrite rather than fail
+
+
+# Back-compat shim. Old callers (and tests that mock this name) still work,
+# but new code should use `_resolve_save_path` so the meeting_id check applies.
+def _next_available_path(target: Path) -> Path:
+    return _resolve_save_path(target, meeting_id=None)
 
 
 def save_transcript_only(
@@ -1366,11 +1584,20 @@ def save_transcript_only(
     meeting_title: str,
     date_str: str,
     cfg: ZoomNotesConfig | None = None,
+    *,
+    meeting_id: str | None = None,
 ) -> Path:
     """Save just the transcript to the user's Transcripts/ folder.
 
     This is the durability boundary: once this returns, the meeting's
     content is safe on disk regardless of whether note generation succeeds.
+
+    `meeting_id` is used to make path resolution collision-safe: a second
+    meeting that happens to slugify to the same filename on the same day
+    (different Zoom meeting, same derived title) will land in a `-2`
+    sibling instead of silently overwriting the first. Callers that don't
+    have a meeting_id (CLI `--notes`) pass None and fall back to the
+    legacy 60-second overwrite window.
     """
     if cfg is None:
         cfg = get_config()
@@ -1379,7 +1606,9 @@ def save_transcript_only(
     transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
-    transcript_path = _next_available_path(transcripts_dir / transcript_filename)
+    transcript_path = _resolve_save_path(
+        transcripts_dir / transcript_filename, meeting_id=meeting_id
+    )
     _atomic_write_text(transcript_path, transcript_content)
     return transcript_path
 
@@ -1389,11 +1618,16 @@ def save_note_only(
     meeting_title: str,
     date_str: str,
     cfg: ZoomNotesConfig | None = None,
+    *,
+    meeting_id: str | None = None,
 ) -> Path:
     """Save just the note to the user's Notes/ folder.
 
     Used both for the final LLM-generated note and for the placeholder note
     written when LLM generation fails.
+
+    See `save_transcript_only` for `meeting_id` semantics — it's the same
+    collision-safety contract.
     """
     if cfg is None:
         cfg = get_config()
@@ -1402,7 +1636,9 @@ def save_note_only(
     notes_dir = cfg.notes_path / subfolder if subfolder else cfg.notes_path
     notes_dir.mkdir(parents=True, exist_ok=True)
     note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
-    note_path = _next_available_path(notes_dir / note_filename)
+    note_path = _resolve_save_path(
+        notes_dir / note_filename, meeting_id=meeting_id
+    )
     _atomic_write_text(note_path, note_content)
     return note_path
 
@@ -1421,6 +1657,8 @@ def save_note(
     meeting_title: str,
     date_str: str,
     cfg: ZoomNotesConfig | None = None,
+    *,
+    meeting_id: str | None = None,
 ) -> Path:
     """Write note and transcript to their respective dated vault subfolders.
 
@@ -1428,8 +1666,8 @@ def save_note(
     Engine code should prefer save_transcript_only + save_note_only so a
     transcript is preserved even when note generation fails.
     """
-    save_transcript_only(transcript_content, meeting_title, date_str, cfg)
-    return save_note_only(note_content, meeting_title, date_str, cfg)
+    save_transcript_only(transcript_content, meeting_title, date_str, cfg, meeting_id=meeting_id)
+    return save_note_only(note_content, meeting_title, date_str, cfg, meeting_id=meeting_id)
 
 
 _YAML_UNSAFE_CHARS = set(":#[]{},&*?|>\"'%@`")
@@ -1482,6 +1720,8 @@ def build_note_content(
     attendees: list[str],
     created_iso: str,
     cfg: ZoomNotesConfig | None = None,
+    *,
+    meeting_id: str | None = None,
 ) -> str:
     if cfg is None:
         cfg = get_config()
@@ -1500,13 +1740,21 @@ def build_note_content(
 
     custom_lines = _build_custom_frontmatter(cfg, slug, date_str)
 
+    # `meeting_id` is the canonical identity of this Zoom session and is
+    # what `_resolve_save_path` reads back to decide whether a same-day
+    # filename collision is the same meeting refreshing itself (overwrite
+    # OK) or a different meeting that must not be clobbered (write a -2
+    # sibling). Always emit the field, even when empty, so the absence of
+    # a Zoom-Notes-owned file is unambiguous.
+    meeting_id_line = f"meeting_id: {_yaml_quote(meeting_id or '')}\n"
+
     return f"""---
 title: {_yaml_quote(slug)}
 type: meeting
 source: zoom-notes
 date: {date_str}
 created: {created_iso}
-attendees:
+{meeting_id_line}attendees:
 {attendees_yaml}
 transcript: {_yaml_quote(transcript_link)}
 daily_note: {_yaml_quote(daily_link)}
@@ -1572,6 +1820,7 @@ type: meeting
 source: zoom-notes
 date: {date_str}
 created: {created_iso}
+meeting_id: {_yaml_quote(meeting_id)}
 status: note-generation-failed
 attendees:
 {attendees_yaml}
@@ -1589,6 +1838,8 @@ def build_transcript_content(
     meeting_title: str,
     date_str: str,
     cfg: ZoomNotesConfig | None = None,
+    *,
+    meeting_id: str | None = None,
 ) -> str:
     if cfg is None:
         cfg = get_config()
@@ -1603,12 +1854,13 @@ def build_transcript_content(
         else f"[[Meetings/Notes/{note_filename}]]"
     )
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
+    meeting_id_line = f"meeting_id: {_yaml_quote(meeting_id or '')}\n"
     return f"""---
 title: {_yaml_quote(transcript_filename)}
 type: transcript
 source: zoom-notes
 date: {date_str}
-note: {_yaml_quote(note_link)}
+{meeting_id_line}note: {_yaml_quote(note_link)}
 ---
 
 # {transcript_filename}
@@ -1754,7 +2006,7 @@ def cmd_notes(origin: Path, dry_run: bool = False) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Zoom Meeting Notes Assistant — extract and summarize Zoom transcripts",
+        description="Zoom Notes — extract and summarize Zoom transcripts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
