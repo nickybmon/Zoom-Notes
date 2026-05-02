@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-zoom_config.py — Configuration management for Zoom Meeting Notes Assistant.
+zoom_config.py — Configuration management for Zoom Notes.
 
 All user-configurable settings live here. Settings are split into two stores:
   - Non-sensitive prefs: ~/Library/Application Support/zoom-notes/settings.json

@@ -1,4 +1,4 @@
-# CLAUDE.md — Zoom Meeting Notes Assistant
+# CLAUDE.md — Zoom Notes
 
 ## What this project is
 

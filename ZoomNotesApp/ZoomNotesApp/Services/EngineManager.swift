@@ -342,13 +342,6 @@ class EngineManager: ObservableObject {
             }
         }
 
-        // Strategy 4: Known repo location (last resort for dev machines)
-        let known = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/Cursor/Zoom Meeting Notes Assistant")
-        if FileManager.default.fileExists(atPath: known.appendingPathComponent("zoom_engine.py").path) {
-            return known
-        }
-
         log("[EngineManager] Could not find project root", level: .error)
         return nil
     }

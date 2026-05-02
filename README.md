@@ -1,4 +1,4 @@
-# Zoom Meeting Notes Assistant
+# Zoom Notes
 
 A macOS menu bar app that watches Zoom's AI Notetaker in real time, detects when a meeting ends, and automatically generates structured meeting notes via Claude, OpenAI, Gemini, or Ollama — saved directly to your configured output directory (Obsidian vault, Desktop folder, or anywhere you like).
 
@@ -121,7 +121,7 @@ No Python install required — Python 3.12 is bundled inside the app.
 
 ## Installation
 
-1. **[Download the latest release](https://github.com/nickybmon/Zoom-Meeting-Assistant/releases/latest)** (`Zoom Notes-1.0.dmg`)
+1. **[Download the latest release](https://github.com/nickybmon/Zoom-Notes/releases/latest)** (`Zoom Notes-1.0.dmg`)
 2. Open the DMG and drag **Zoom Notes** into your Applications folder
 3. Launch the app — a menu bar icon appears
 4. On first launch, an onboarding window walks you through setup:
@@ -134,8 +134,8 @@ No Python install required — Python 3.12 is bundled inside the app.
 ### Building from source
 
 ```bash
-git clone https://github.com/nickybmon/Zoom-Meeting-Assistant.git
-cd Zoom-Meeting-Assistant
+git clone https://github.com/nickybmon/Zoom-Notes.git
+cd Zoom-Notes
 
 # Fetch the bundled Python runtime (arm64 + x86_64 universal)
 ./scripts/fetch-python-runtime.sh
