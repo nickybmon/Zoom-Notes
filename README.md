@@ -121,7 +121,7 @@ No Python install required — Python 3.12 is bundled inside the app.
 
 ## Installation
 
-1. **[Download the latest release](https://github.com/nickybmon/Zoom-Notes/releases/latest)** (`Zoom Notes-1.0.dmg`)
+1. **[Download the latest release](https://github.com/nickybmon/Zoom-Notes/releases/latest)** (`Zoom Notes-<version>.dmg`)
 2. Open the DMG and drag **Zoom Notes** into your Applications folder
 3. Launch the app — a menu bar icon appears
 4. On first launch, an onboarding window walks you through setup:
