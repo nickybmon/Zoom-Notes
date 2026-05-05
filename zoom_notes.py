@@ -911,6 +911,10 @@ def parse_transcript(wal_path: Path, meeting_id_filter: str | None = None) -> li
         "meetingId", "speaker", "speakerId", "username", "userId",
         "originalName", "avatarUrl", "avatarName", "message",
     }
+    # Strict HH:MM:SS form. Rejects partial values like "16:33:" that occur
+    # when `strings -n 2` truncates the seconds digits — those would
+    # otherwise sort to the wrong place and corrupt title resolution.
+    _TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 
     i = 0
     while i < len(lines):
@@ -923,12 +927,27 @@ def parse_transcript(wal_path: Path, meeting_id_filter: str | None = None) -> li
                 speaker = None
                 meeting_id = None
 
-                for j in range(i + 3, min(i + 60, len(lines))):
-                    if lines[j] == "timeStampContent" and j + 1 < len(lines):
-                        timestamp = lines[j + 1]
-                    if lines[j] == "username" and j + 1 < len(lines):
+                # Forward-walk for this entry's metadata. Start AFTER the
+                # entry's own message text (i + 4) and stop the moment we
+                # cross into the next entry — `messageId` or `message` are
+                # the boundary markers. The 2026-05-04 Quick-Chat-on-PnP
+                # incident: when `strings -n 2` ate the leading bytes of
+                # the next entry's `messageId` line down to a fragment,
+                # the old loop continued past the boundary and slurped the
+                # next entry's username / timestamp / meetingId into this
+                # one, producing a Nick utterance attributed to Michael
+                # Huard from a totally different (Brand MLT) meeting.
+                for j in range(i + 4, min(i + 60, len(lines))):
+                    line = lines[j]
+                    if line == "messageId" or line == "message":
+                        break
+                    if line == "timeStampContent" and j + 1 < len(lines):
+                        cand = lines[j + 1]
+                        if _TS_RE.match(cand):
+                            timestamp = cand
+                    elif line == "username" and j + 1 < len(lines):
                         speaker = _sanitize_speaker(lines[j + 1])
-                    if lines[j] == "meetingId" and j + 1 < len(lines):
+                    elif line == "meetingId" and j + 1 < len(lines):
                         meeting_id = lines[j + 1]
                         break
 

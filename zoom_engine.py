@@ -759,17 +759,39 @@ class ZoomEngine:
                         accumulator_size=acc_size,
                     )
                 elif meeting_id != current_tracking_id:
-                    # Case B: real meeting change.
-                    # Delete the OLD meeting's on-disk snapshot. By definition
-                    # we now know that meeting was a misidentification — the
-                    # scoring just promoted a different meeting to active —
-                    # so the old slug's cache file is at best stale and at
-                    # worst contaminated with entries that actually belong to
-                    # the new meeting.
-                    try:
-                        delete_persisted_accumulator(current_tracking_id)
-                    except Exception:
-                        pass
+                    # Case B: real meeting change. Two sub-scenarios:
+                    #
+                    #   1) BACK-TO-BACK MEETINGS: the previous meeting really
+                    #      happened, has a real accumulator with real
+                    #      conversation. Auto-generate its note now (the
+                    #      2026-05-04 AEO GA fix) before clearing local
+                    #      state. Runs in a background thread so the new
+                    #      meeting's tracking proceeds without delay.
+                    #
+                    #   2) MISIDENTIFICATION: scoring just corrected itself
+                    #      after briefly tracking the wrong meeting (the
+                    #      original 2026-04-30 reason this branch existed).
+                    #      Accumulator is small / has no real speakers.
+                    #      Discard as before — generating a note from
+                    #      misidentified noise wastes an LLM call and
+                    #      produces a confusing artifact.
+                    #
+                    # `_abandoned_looks_real` is the gate between the two.
+                    with self._accumulated_lock:
+                        abandoned_snapshot = dict(self._accumulated)
+                    if self._abandoned_looks_real(abandoned_snapshot):
+                        self._trigger_abandoned_generation(
+                            current_tracking_id, abandoned_snapshot,
+                        )
+                        # Note: do NOT delete_persisted_accumulator here —
+                        # _trigger_abandoned_generation persists a fresh
+                        # snapshot synchronously and cleans up after itself
+                        # on success.
+                    else:
+                        try:
+                            delete_persisted_accumulator(current_tracking_id)
+                        except Exception:
+                            pass
                     self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
                     with self._accumulated_lock:
                         self._accumulated = {}
@@ -777,6 +799,8 @@ class ZoomEngine:
                         "meeting_id_changed",
                         from_id=current_tracking_id, to_id=meeting_id,
                         reason="active_reevaluation",
+                        abandoned_snapshot_size=len(abandoned_snapshot),
+                        abandoned_auto_generated=self._abandoned_looks_real(abandoned_snapshot),
                     )
                     self._set_state(
                         EngineState.ACTIVE,
@@ -801,16 +825,35 @@ class ZoomEngine:
                             changed_in_acc = True
                         else:
                             existing = self._accumulated[mid_key]
+                            # Cross-meeting guard (the 2026-05-04 Quick Chat
+                            # incident): if the fresh parse claims this msg_id
+                            # belongs to a different meeting than the one we
+                            # already have stamped on the accumulated entry,
+                            # treat the fresh metadata as untrustworthy and
+                            # skip the speaker/timestamp overwrites. The
+                            # `meeting_id` field is already protected by the
+                            # `not existing.get("meeting_id")` clause below;
+                            # without this guard, a parse_transcript run that
+                            # leaked metadata from an adjacent corrupted-
+                            # boundary entry could rewrite the speaker and
+                            # timestamp of an entry already stamped to the
+                            # active session via Case A upgrade-from-empty.
+                            fresh_mid = entry.get("meeting_id")
+                            existing_mid = existing.get("meeting_id")
+                            mid_conflict = bool(fresh_mid) and bool(existing_mid) \
+                                and fresh_mid != existing_mid
+
                             if len(entry.get("text", "")) > len(existing.get("text", "")):
                                 existing["text"] = entry["text"]
                                 changed_in_acc = True
-                            if entry.get("speaker") and entry["speaker"] != "Unknown" \
-                               and existing.get("speaker") != entry["speaker"]:
-                                existing["speaker"] = entry["speaker"]
-                                changed_in_acc = True
-                            if entry.get("timestamp") and existing.get("timestamp") != entry["timestamp"]:
-                                existing["timestamp"] = entry["timestamp"]
-                                changed_in_acc = True
+                            if not mid_conflict:
+                                if entry.get("speaker") and entry["speaker"] != "Unknown" \
+                                   and existing.get("speaker") != entry["speaker"]:
+                                    existing["speaker"] = entry["speaker"]
+                                    changed_in_acc = True
+                                if entry.get("timestamp") and existing.get("timestamp") != entry["timestamp"]:
+                                    existing["timestamp"] = entry["timestamp"]
+                                    changed_in_acc = True
                             if entry.get("meeting_id") and not existing.get("meeting_id"):
                                 existing["meeting_id"] = entry["meeting_id"]
                                 changed_in_acc = True
@@ -1404,6 +1447,225 @@ class ZoomEngine:
                 emit({"event": "error", "message": "recover command requires meeting_id."})
                 return
             self._trigger_retry(meeting_id)
+
+    # ── Abandoned-meeting auto-generation ───────────────────────────────────
+
+    @staticmethod
+    def _abandoned_looks_real(snapshot: dict) -> bool:
+        """Decide whether an abandoned accumulator deserves a real note.
+
+        Case B (mid-ACTIVE meeting_id change) fires for two distinct
+        scenarios:
+
+          1) BACK-TO-BACK MEETINGS: the previous meeting really happened,
+             produced a real transcript, and a new meeting just started.
+             We want to generate a note for it (the 2026-05-04 AEO GA bug).
+
+          2) MISIDENTIFICATION: the engine briefly tracked the wrong
+             meeting (e.g. stale WAL data still resident at IDLE -> ACTIVE),
+             and detection has now corrected itself. The accumulator at
+             this point is small and contains no real conversation.
+
+        We only auto-generate when the snapshot looks like (1). Heuristic:
+        at least 5 entries AND at least one non-Unknown speaker. Tuned
+        conservatively — a 30-second exchange has more than 5 entries,
+        and a misidentification typically captures 0-2 utterances before
+        Case B fires.
+        """
+        if len(snapshot) < 5:
+            return False
+        for entry in snapshot.values():
+            speaker = entry.get("speaker")
+            if speaker and speaker != "Unknown":
+                return True
+        return False
+
+    def _trigger_abandoned_generation(self, meeting_id: str, snapshot: dict) -> None:
+        """Finalize an accumulator that Case B is about to abandon.
+
+        Mirrors `_trigger_retry` but with three differences that matter for
+        the back-to-back-meetings use case:
+
+          - Saves the transcript file (Stage 1 of `_generate_notes`). Retry
+            assumes the transcript is already on disk; abandoned generation
+            is the FIRST chance to save it.
+          - Acquires `_generating_lock` with `blocking=True` so it queues
+            behind any in-flight generation instead of being rejected.
+          - Does NOT call `self._set_state(EngineState.GENERATING)`. The
+            engine is now ACTIVE for a different meeting; flipping to
+            GENERATING would freeze polling and lose transcript content
+            from the new meeting.
+
+        The caller (Case B in `_poll_once`) is expected to clear the
+        in-memory accumulator and switch tracking AFTER calling this — the
+        snapshot is captured by-value here, so the caller is free to
+        mutate live state immediately.
+        """
+        if not meeting_id or not snapshot:
+            return
+
+        # Persist a fresh snapshot to disk synchronously, BEFORE spawning
+        # the worker. If the engine crashes or quits mid-generation, the
+        # snapshot is what `find_orphaned_accumulators` will surface for
+        # menu-bar recovery on next launch.
+        try:
+            persist_accumulator(meeting_id, snapshot)
+        except Exception:
+            pass
+
+        cfg = self._get_cfg()
+        snapshot_copy = dict(snapshot)
+
+        def worker():
+            # Block until any in-flight generation finishes so two boundary
+            # events back-to-back (A -> B -> C in rapid succession) serialize
+            # cleanly through one LLM at a time.
+            self._generating_lock.acquire(blocking=True)
+            try:
+                entries = sorted(
+                    snapshot_copy.values(),
+                    key=lambda e: e.get("timestamp") or "",
+                )
+                if not entries:
+                    return
+
+                origin = find_origin_dir()
+                blocks_wal = self._resolve_wal(origin, cfg, "blocks") if origin else None
+                transcript_wal = self._resolve_wal(origin, cfg, "transcript") if origin else None
+                meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
+                m = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
+                date_str = m.group(1) if m else datetime.now().strftime("%Y-%m-%d")
+
+                seen: dict[str, None] = {}
+                for e in entries:
+                    s = e.get("speaker")
+                    if s and s != "Unknown":
+                        seen[s] = None
+                attendees = list(seen.keys())
+
+                created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                transcript_text = format_transcript(entries)
+                slug = slugify_title(meeting_title, fallback_date=date_str)
+
+                self._emit_diag(
+                    "abandoned_generation_started",
+                    meeting_id=meeting_id,
+                    entry_count=len(entries),
+                    attendee_count=len(attendees),
+                )
+
+                # Stage 1: save transcript (durability boundary). Threads
+                # `meeting_id` through so a same-day same-title collision
+                # lands as a `-2` sibling instead of clobbering an existing
+                # note.
+                transcript_content = build_transcript_content(
+                    transcript_text, meeting_title, date_str, cfg,
+                    meeting_id=meeting_id,
+                )
+                transcript_path = save_transcript_only(
+                    transcript_content, meeting_title, date_str, cfg,
+                    meeting_id=meeting_id,
+                )
+
+                # Stage 2: LLM. Use a fresh cancel event so cancellation
+                # signals targeted at the main-meeting generation don't
+                # also kill this background one.
+                local_cancel = threading.Event()
+                try:
+                    summary = summarize(
+                        transcript_text, meeting_title, cfg,
+                        cancel_event=local_cancel,
+                    )
+                except CancelledError:
+                    return
+                except Exception as exc:
+                    error_msg = _friendly_error(exc)
+                    placeholder = build_placeholder_note(
+                        meeting_title=meeting_title,
+                        date_str=date_str,
+                        attendees=attendees,
+                        created_iso=created_iso,
+                        error_message=error_msg,
+                        meeting_id=meeting_id,
+                        cfg=cfg,
+                    )
+                    placeholder_path = save_note_only(
+                        placeholder, meeting_title, date_str, cfg,
+                        meeting_id=meeting_id,
+                    )
+                    failed_record = {
+                        "meeting_id": meeting_id,
+                        "title": slug,
+                        "note_path": str(placeholder_path),
+                        "transcript_path": str(transcript_path),
+                        "message": error_msg,
+                        "date_str": date_str,
+                        "attendees": attendees,
+                    }
+                    # Promote into failed/ so the menu bar surfaces a retry
+                    # item — same recovery flow as a regular LLM failure.
+                    mark_meeting_failed(meeting_id, metadata=failed_record)
+                    emit({
+                        "event": "note_failed",
+                        "title": slug,
+                        "note_path": str(placeholder_path),
+                        "transcript_path": str(transcript_path),
+                        "meeting_id": meeting_id,
+                        "attendees": attendees,
+                        "message": error_msg,
+                    })
+                    return
+
+                # Stage 3: save final note.
+                note_content = build_note_content(
+                    summary, meeting_title, date_str, attendees, created_iso, cfg,
+                    meeting_id=meeting_id,
+                )
+                note_path = save_note_only(
+                    note_content, meeting_title, date_str, cfg,
+                    meeting_id=meeting_id,
+                )
+
+                # Stamp boundary anchor so the next IDLE -> ACTIVE pass
+                # cannot re-detect this meeting from leftover WAL data.
+                latest_ts_secs = -1
+                for e in entries:
+                    ts = e.get("timestamp") or ""
+                    try:
+                        parts = [int(x) for x in ts.split(":")]
+                        if len(parts) == 3:
+                            secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                            if secs > latest_ts_secs:
+                                latest_ts_secs = secs
+                    except (ValueError, AttributeError):
+                        continue
+                if latest_ts_secs >= 0:
+                    self._last_completed_boundary = (meeting_id, latest_ts_secs)
+
+                # Cleanup persisted snapshot — the note is now safe on disk.
+                delete_persisted_accumulator(meeting_id)
+
+                emit({
+                    "event": "done",
+                    "title": slug,
+                    "path": str(note_path),
+                    "transcript_path": str(transcript_path),
+                    "attendees": attendees,
+                    "meeting_id": meeting_id,
+                })
+                self._emit_diag(
+                    "abandoned_generation_completed",
+                    meeting_id=meeting_id,
+                    entry_count=len(entries),
+                )
+            except Exception as exc:
+                # Don't lose the snapshot on unexpected error — leave it on
+                # disk so menu-bar recovery can surface it next launch.
+                emit({"event": "error", "message": _friendly_error(exc)})
+            finally:
+                self._generating_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── Retry flow ──────────────────────────────────────────────────────────
 

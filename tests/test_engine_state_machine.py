@@ -156,6 +156,141 @@ class TestPollingStateMachine:
             f"engine should have switched to the higher-scoring meeting ID ({best}), got {after_id}"
 
 
+class TestAccumulatorCrossMeetingGuard:
+    """Regression test for the 2026-05-04 Quick Chat on PnP Assets incident.
+
+    The parser bug (entry-boundary leak in `parse_transcript`) is the root
+    cause and is fixed at the source in `tests/test_parser.py`. The engine
+    layer adds defense in depth: when a fresh parse for an existing
+    accumulated entry shows a CONFLICTING `meeting_id` (i.e. the parser
+    leaked metadata from a different meeting), the accumulator must
+    refuse to overwrite the trusted `speaker` / `timestamp` it already
+    has stamped.
+
+    Without this guard, even with the parser fix, a single bad parse
+    output could rewrite an entry's speaker — because Case A
+    (upgrade-from-empty) had already stamped the entry with the active
+    meeting's id, the existing `meeting_id`-protection clause on its own
+    would let the rest of the metadata silently drift.
+    """
+
+    def _drive_change_tick_with_parse(self, engine, origin, cfg, *, wal, mtime, size, parse_result):
+        """Drive a single change-tick that returns `parse_result` from
+        parse_transcript. Bumps mtime so the engine's change-detection
+        branch fires and calls parse_transcript."""
+        os.utime(wal, (mtime, mtime))
+        from unittest.mock import patch
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "parse_transcript", return_value=parse_result):
+            engine._poll_once(origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+
+    def test_skips_overwrite_when_fresh_parse_meeting_id_conflicts(
+        self, fake_origin, tmp_path, isolated_cache
+    ):
+        # No real WAL needed — we patch parse_transcript to inject payloads
+        # directly. Engine just needs a file it can stat for change detection.
+        wal = tmp_path / "synthetic.sqlite3-wal"
+        wal.write_bytes(b"x" * 1024)
+        engine = ZoomEngine()
+        cfg = engine._get_cfg()
+
+        # Anchor + flip to ACTIVE so the change-tick branch runs.
+        size = wal.stat().st_size
+        _drive_tick(engine, fake_origin, cfg, mtime=1000.0, size=size, fixture_wal=wal)
+        _drive_tick(engine, fake_origin, cfg, mtime=1005.0, size=size + 1, fixture_wal=wal)
+
+        # Seed the accumulator with a "trusted" entry: stamped to the
+        # active meeting (this is what Case A upgrade-from-empty produces
+        # in real flow), with a real speaker and a sane timestamp.
+        msg_id = "synthetic-msg-1"
+        active_id = "ACTIVE-MEETING-ID=="
+        with engine._accumulated_lock:
+            engine._accumulated[msg_id] = {
+                "msg_id": msg_id,
+                "text": "Just using the Slack AI features.",
+                "speaker": "Nick Blackmon",
+                "timestamp": "16:33:08",
+                "meeting_id": active_id,
+            }
+
+        # Drive a change tick where parse_transcript "leaks" metadata from
+        # a totally different meeting onto the same msg_id (same physical
+        # WAL utterance) — username, timestamp, and meeting_id all slurped
+        # across a corrupted entry boundary.
+        leaked = [{
+            "msg_id": msg_id,
+            "text": "Just using the Slack AI features.",
+            "speaker": "Michael Huard",
+            "timestamp": "14:56:05",
+            "meeting_id": "OTHER-MEETING-ID==",
+        }]
+        self._drive_change_tick_with_parse(
+            engine, fake_origin, cfg,
+            wal=wal, mtime=1010.0, size=size + 2, parse_result=leaked,
+        )
+
+        with engine._accumulated_lock:
+            after = engine._accumulated[msg_id]
+
+        # The trusted speaker/timestamp/meeting_id MUST survive a parse
+        # that disagrees about which meeting this entry belongs to.
+        assert after["speaker"] == "Nick Blackmon", (
+            f"speaker overwritten by conflicting-meeting parse: {after['speaker']}"
+        )
+        assert after["timestamp"] == "16:33:08", (
+            f"timestamp overwritten by conflicting-meeting parse: {after['timestamp']}"
+        )
+        assert after["meeting_id"] == active_id, (
+            f"meeting_id overwritten (this guard already existed): {after['meeting_id']}"
+        )
+
+    def test_still_overwrites_when_meeting_id_matches(
+        self, fake_origin, tmp_path, isolated_cache
+    ):
+        """Inverse: when the fresh parse's meeting_id matches the existing
+        entry's, it's a normal incremental update (Zoom streaming the
+        utterance word-by-word, refining speaker recognition, etc.) and
+        the new metadata SHOULD win. The guard must not over-fire."""
+        wal = tmp_path / "synthetic.sqlite3-wal"
+        wal.write_bytes(b"x" * 1024)
+        engine = ZoomEngine()
+        cfg = engine._get_cfg()
+
+        size = wal.stat().st_size
+        _drive_tick(engine, fake_origin, cfg, mtime=1000.0, size=size, fixture_wal=wal)
+        _drive_tick(engine, fake_origin, cfg, mtime=1005.0, size=size + 1, fixture_wal=wal)
+
+        msg_id = "synthetic-msg-2"
+        active_id = "ACTIVE-MEETING-ID=="
+        with engine._accumulated_lock:
+            engine._accumulated[msg_id] = {
+                "msg_id": msg_id,
+                "text": "Hello",
+                "speaker": "Unknown",
+                "timestamp": "10:00:00",
+                "meeting_id": active_id,
+            }
+
+        # Same meeting, longer text + real speaker resolved by Zoom.
+        refined = [{
+            "msg_id": msg_id,
+            "text": "Hello world, longer text",
+            "speaker": "Alice",
+            "timestamp": "10:00:01",
+            "meeting_id": active_id,
+        }]
+        self._drive_change_tick_with_parse(
+            engine, fake_origin, cfg,
+            wal=wal, mtime=1010.0, size=size + 2, parse_result=refined,
+        )
+
+        with engine._accumulated_lock:
+            after = engine._accumulated[msg_id]
+        assert after["text"] == "Hello world, longer text"
+        assert after["speaker"] == "Alice"
+        assert after["timestamp"] == "10:00:01"
+
+
 class TestRecurringMeetingDedupe:
     """Phase 1 #4 regression guard.
 
