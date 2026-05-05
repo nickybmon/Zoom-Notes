@@ -5,6 +5,7 @@ WAL containing multiple meetings, deduplicates entries, and behaves
 sensibly under edge cases. The parser is the single most fragile part of
 the system because it depends on Zoom's internal byte layout.
 """
+import zoom_notes
 from zoom_notes import (
     deduplicate,
     parse_transcript,
@@ -53,6 +54,143 @@ class TestParseTranscript:
     def test_filter_with_unknown_id_returns_empty(self, multi_meeting_wal):
         filtered = parse_transcript(multi_meeting_wal, meeting_id_filter="nonexistent==")
         assert filtered == []
+
+
+class TestEntryBoundaryRespected:
+    """Regression tests for the 2026-05-04 Quick Chat on PnP Assets incident.
+
+    `strings -n 2` occasionally truncates the leading bytes of the next WAL
+    entry's `messageId` line down to a fragment (the prefix bytes of the id
+    are short or non-printable). Pre-fix, the parser's forward-walk would
+    sail past the boundary and slurp the next entry's `username`,
+    `timeStampContent`, and `meetingId` into the previous entry, producing
+    catastrophically misattributed transcripts (Nick's first utterance
+    showed up as Michael Huard from a totally different meeting, the title
+    resolver then saw a stale earliest timestamp and fell back to the
+    wrong meeting's title).
+    """
+
+    def _patch_strings(self, monkeypatch, lines):
+        """Make `read_wal_strings` return a fixed list — lets us synthesize
+        the corrupted-boundary layout without needing a real WAL fixture."""
+        monkeypatch.setattr(zoom_notes, "read_wal_strings", lambda _path: lines)
+
+    def test_does_not_leak_username_meetingid_across_truncated_boundary(self, monkeypatch, tmp_path):
+        # Synthetic layout mirroring the real 2026-05-04 WAL byte pattern:
+        # entry A's `messageId\n<id>\nmessage\n<text>\ntimeStampContent\n<ts>`
+        # then a truncated fragment where entry B's `messageId\n<id>` should
+        # have been (the prefix bytes were eaten), then entry B's full
+        # message/username/meetingId block.
+        lines = [
+            "messageId",
+            "4:0:16787456:0:599398745",   # entry A id (Nick's utterance)
+            "message",
+            "Just using the Slack AI features to skip channel noise.",
+            "timeStampContent",
+            "16:33:08",
+            # ── corrupted boundary: entry B's `messageId\n<id>` got eaten;
+            # only a fragment of the id survived `strings -n 2`.
+            "3n",
+            "dO",
+            "Y80:0:1951987897",
+            # ── entry B starts here (wrong attribution territory):
+            "message",
+            "I've, uh, emailed, we just need to follow up on it.",
+            "timeStampContent",
+            "14:56:05",
+            "timeStampSeconds",
+            "i",
+            "uniqueUserId",
+            "16788480-0",
+            "username",
+            "Michael Huard",
+            "meetingId",
+            "HA1Kj2+mQDqLrOwX2pQIfA==",
+        ]
+        self._patch_strings(monkeypatch, lines)
+
+        entries = parse_transcript(tmp_path / "fake.wal")
+        a = next(e for e in entries if e["msg_id"] == "4:0:16787456:0:599398745")
+
+        # The crux of the regression: entry A must NOT inherit entry B's
+        # username, timestamp, or meetingId.
+        assert a["speaker"] == "Unknown", (
+            f"entry A leaked speaker from entry B across boundary: {a['speaker']}"
+        )
+        assert a["meeting_id"] is None, (
+            f"entry A leaked meeting_id from entry B across boundary: {a['meeting_id']}"
+        )
+        assert a["timestamp"] == "16:33:08", (
+            f"entry A's own timestamp got overwritten by entry B's: {a['timestamp']}"
+        )
+        # And entry A's text is preserved correctly.
+        assert "Slack AI" in a["text"]
+
+    def test_rejects_malformed_timestamp_without_seconds(self, monkeypatch, tmp_path):
+        """When `strings -n 2` truncates the seconds digits, the value is
+        unusable (it will lexicographically sort to the wrong place and
+        poison title resolution). The parser must drop it as if it were
+        missing entirely."""
+        lines = [
+            "messageId",
+            "msg-1",
+            "message",
+            "Hello there.",
+            "timeStampContent",
+            "16:33:",  # malformed — seconds digits got eaten
+            "username",
+            "Alice",
+            "meetingId",
+            "real-meeting-id",
+        ]
+        self._patch_strings(monkeypatch, lines)
+
+        entries = parse_transcript(tmp_path / "fake.wal")
+        assert len(entries) == 1
+        assert entries[0]["timestamp"] is None, (
+            f"malformed timestamp '16:33:' should be rejected, got {entries[0]['timestamp']}"
+        )
+        # The other valid metadata should still be picked up.
+        assert entries[0]["speaker"] == "Alice"
+        assert entries[0]["meeting_id"] == "real-meeting-id"
+
+    def test_clean_entry_still_parses_correctly(self, monkeypatch, tmp_path):
+        """Sanity check: the boundary-stop must NOT break the common case
+        where the WAL is well-formed."""
+        lines = [
+            "messageId",
+            "msg-1",
+            "message",
+            "First utterance.",
+            "timeStampContent",
+            "10:00:00",
+            "timeStampSeconds",
+            "i",
+            "uniqueUserId",
+            "1-0",
+            "username",
+            "Alice",
+            "meetingId",
+            "meeting-A",
+            "messageId",
+            "msg-2",
+            "message",
+            "Second utterance.",
+            "timeStampContent",
+            "10:00:05",
+            "username",
+            "Bob",
+            "meetingId",
+            "meeting-A",
+        ]
+        self._patch_strings(monkeypatch, lines)
+
+        entries = parse_transcript(tmp_path / "fake.wal")
+        assert len(entries) == 2
+        a = next(e for e in entries if e["msg_id"] == "msg-1")
+        b = next(e for e in entries if e["msg_id"] == "msg-2")
+        assert (a["speaker"], a["timestamp"], a["meeting_id"]) == ("Alice", "10:00:00", "meeting-A")
+        assert (b["speaker"], b["timestamp"], b["meeting_id"]) == ("Bob", "10:00:05", "meeting-A")
 
 
 class TestDeduplicate:

@@ -125,6 +125,14 @@ The polling loop accumulates entries in memory (`_accumulated`, keyed by `msg_id
 2. **Save transcript** to the user's `Transcripts/` folder. This is the durability boundary — once it lands, the meeting's content is safe regardless of LLM outcome.
 3. **Generate note** via LLM. On success: write the final note. On failure: write a placeholder note (with retry metadata in YAML frontmatter) and emit `note_failed`. The cached accumulator is preserved so the menu bar's "Retry note generation" item can re-run only the LLM stage.
 
+### Abandoned-meeting auto-generation (back-to-back meetings)
+When `_poll_once` detects mid-`ACTIVE` that scoring has promoted a *different* `meeting_id` than the one currently tracked ("Case B"), it now distinguishes two scenarios before clearing local state:
+
+- **Real back-to-back meeting**: the abandoned accumulator has ≥5 entries with at least one non-Unknown speaker (`_abandoned_looks_real`). The engine snapshots the accumulator and dispatches `_trigger_abandoned_generation`, which runs the full 3-stage pipeline (save transcript, summarize via LLM, save note) in a daemon worker. The worker acquires `_generating_lock` with `blocking=True` so it queues behind any in-flight generation, and **does not flip engine state to `GENERATING`** — the main loop must stay `ACTIVE` to keep tracking the *new* meeting's WAL changes. On success it stamps the meeting onto `_last_completed_boundary` and deletes the persisted snapshot; on LLM failure it writes a placeholder and promotes the snapshot into `failed/` for menu-bar recovery, mirroring the standard pipeline's failure path.
+- **Misidentification**: the abandoned accumulator is small / all-Unknown (scoring corrected itself after briefly tracking the wrong meeting). The engine falls back to the original behavior — delete the persisted snapshot and clear in-memory state — to avoid wasting an LLM call on noise.
+
+This was added 2026-05-04 after the AEO GA incident: ~30 minutes of real meeting transcript was discarded by Case B because the engine treated every mid-`ACTIVE` `meeting_id` change as a misidentification. Without this path, back-to-back meetings (the app's primary use case) silently lose the first meeting's notes whenever the second meeting starts before the 90s idle threshold elapses.
+
 ### Settings reload
 When the Swift settings window closes, `EngineManager.reloadSettings()` sends `SIGHUP` to the Python process. `zoom_engine.py` catches `SIGHUP` and sets a flag to call `invalidate_config_cache()` on the next poll tick.
 
