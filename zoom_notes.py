@@ -1046,8 +1046,13 @@ _HASH_TOKEN_RE = re.compile(r'(?<!\S)[A-Za-z0-9+/=]{16,}(?!\S)')
 
 
 def _title_has_hash_token(text: str) -> bool:
-    """Return True if any space-separated word looks like a raw ID/hash."""
-    return any(_HASH_TOKEN_RE.fullmatch(w) for w in text.split())
+    """Return True if any fragment of text looks like a raw ID/hash.
+
+    Splits on any non-alphanumeric character so that hashes fused to
+    punctuation (e.g. "one?26oit2v1HSQSi5kic4VLE7kQ") are still caught.
+    """
+    fragments = re.split(r'[^A-Za-z0-9+/=]+', text)
+    return any(_HASH_TOKEN_RE.fullmatch(f) for f in fragments if f)
 
 
 def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None = None) -> str | None:
@@ -1082,7 +1087,7 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
             if (
                 len(candidate) > 5
                 and candidate not in _TITLE_JUNK
-                and not candidate.startswith(("http", "{", "BLOCK_", "PRODUCT_"))
+                and not candidate.startswith(("http", "{", "[", "BLOCK_", "PRODUCT_"))
                 and " " in candidate
                 and any(c.isalpha() for c in candidate)
                 and not _title_has_hash_token(candidate)

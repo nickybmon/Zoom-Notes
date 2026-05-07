@@ -14,6 +14,7 @@ from zoom_notes import (
     count_meeting_ids,
     slugify_title,
     _safe_meeting_id_slug,
+    _title_has_hash_token,
 )
 
 
@@ -243,6 +244,33 @@ class TestUtilities:
     def test_safe_meeting_id_slug_replaces_unsafe_chars(self):
         assert _safe_meeting_id_slug("a/b+c=d==") == "a_b_c_d__"
         assert _safe_meeting_id_slug("AbC-123_") == "AbC-123_"
+
+
+class TestTitleHashFilter:
+    """Regression guard for the 2026-05-07 garbled-title bug.
+
+    Q&A questions from Zoom note blocks get stored adjacent to meeting-ID
+    hashes in the WAL.  When strings(1) extracts them the hash fuses to the
+    last word of the question (e.g. "one?26oit2v1HSQSi5kic4VLE7kQ") and the
+    `?` punctuation previously broke the alphanumeric regex, letting the
+    candidate slip through as a meeting title.
+    """
+
+    def test_rejects_hash_fused_without_punctuation(self):
+        assert _title_has_hash_token(
+            "0How do you translate animations in another tool into this one26oit2v1HSQSi5kic4VLE7kQ"
+        )
+
+    def test_rejects_hash_fused_via_question_mark(self):
+        assert _title_has_hash_token(
+            "0How do you translate animations in another tool into this one?26oit2v1HSQSi5kic4VLE7kQ"
+        )
+
+    def test_accepts_real_meeting_title_with_slash(self):
+        assert not _title_has_hash_token("Vanessa/Nick Monthly 2026-05-07 15:01(GMT-4:00)")
+
+    def test_accepts_real_meeting_title_plain(self):
+        assert not _title_has_hash_token("Daily Standup 2026-05-07 11:00(GMT-4:00)")
 
 
 class TestFindOriginDir:
