@@ -1037,6 +1037,19 @@ _TITLE_JUNK = {
     "Zoom Meeting",
 }
 
+# Matches a space-separated token that looks like a base64/hex meeting-ID fragment
+# (≥16 chars, only alphanumeric + base64 padding — no human punctuation).
+# Zoom stores user-authored note text adjacent to meeting-ID hashes in the
+# blocks WAL; when strings(1) extracts them the hash fuses to the last word of
+# the note.  Meeting titles never contain such tokens.
+_HASH_TOKEN_RE = re.compile(r'(?<!\S)[A-Za-z0-9+/=]{16,}(?!\S)')
+
+
+def _title_has_hash_token(text: str) -> bool:
+    """Return True if any space-separated word looks like a raw ID/hash."""
+    return any(_HASH_TOKEN_RE.fullmatch(w) for w in text.split())
+
+
 def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None = None) -> str | None:
     """Extract the meeting title from the blocks WAL.
 
@@ -1072,6 +1085,7 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
                 and not candidate.startswith(("http", "{", "BLOCK_", "PRODUCT_"))
                 and " " in candidate
                 and any(c.isalpha() for c in candidate)
+                and not _title_has_hash_token(candidate)
             ):
                 titles.append(candidate)
 
