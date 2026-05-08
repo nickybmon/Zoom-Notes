@@ -131,13 +131,30 @@ def find_wal(
     if not idb_dir.exists():
         return None
     candidates = []
+    checkpointed: list[Path] = []  # prefix match but WAL currently 0-byte
     for db_dir in idb_dir.iterdir():
         if db_dir.name.startswith(db_prefix):
             wal = db_dir / "IndexedDB.sqlite3-wal"
             if wal.exists() and wal.stat().st_size > 256:
                 candidates.append(wal)
+            elif wal.exists():
+                # WAL exists but is 0-byte — Zoom checkpointed it between
+                # meetings. Check if the main DB is substantial: if so the
+                # store definitely exists and Notetaker is configured; we
+                # just aren't in a meeting right now.
+                sqlite3 = db_dir / "IndexedDB.sqlite3"
+                try:
+                    if sqlite3.exists() and sqlite3.stat().st_size > 50_000:
+                        checkpointed.append(wal)
+                except OSError:
+                    pass
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_mtime)
+    if checkpointed:
+        # Return the checkpointed WAL so callers know the DB is present and
+        # configured — prevents a false-positive "Notetaker not set up" error
+        # when the engine restarts between meetings.
+        return max(checkpointed, key=lambda p: p.stat().st_mtime)
     # Prefix didn't match any folder. Fall back to identifying the WAL by
     # the tokens it contains. This is the path that any non-developer user
     # actually hits — the configured prefix is effectively a hint for the
