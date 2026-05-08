@@ -233,6 +233,101 @@ class TestActiveMeetingDetection:
         b = count_meeting_ids(multi_meeting_wal)
         assert a == b
 
+    def test_resumed_meeting_re_detected_after_silent_period(self, monkeypatch, tmp_path):
+        """Regression guard for the 2026-05-08 FigJam/whiteboard premature-idle bug.
+
+        When a meeting has a silent collaboration period (FigJam, whiteboard,
+        screen-share) longer than the 90-second idle threshold, the engine fires
+        note generation mid-meeting and stamps a boundary:
+          _last_completed_boundary = (meeting_id, freshness_floor_secs)
+
+        On the next IDLE -> ACTIVE transition, detect_active_meeting_id is called
+        with exclude_meeting_id=meeting_id.  Before this fix, the ID was blocked
+        unconditionally, so the engine could never re-latch onto the same meeting
+        once speech resumed.  With the fix, the meeting is allowed back through
+        when its latest_ts_secs exceeds the freshness floor.
+        """
+        MID = "FigJam+SessionABC=="
+        FLOOR_SECS = 13 * 3600 + 6 * 60 + 27  # 13:06:27 — last entry before silence
+
+        # Synthetic WAL: entries from the SAME meeting but with timestamps
+        # clearly beyond the freshness floor (speech resumed at 13:12).
+        resumed_lines = [
+            "messageId",
+            "99:0:99999:0:111111",
+            "message",
+            "Great stickies everyone, let's discuss.",
+            "timeStampContent",
+            "13:12:31",
+            "timeStampSeconds",
+            "i",
+            "uniqueUserId",
+            "99-0",
+            "username",
+            "Alex Diner",
+            "meetingId",
+            MID,
+        ]
+        monkeypatch.setattr(zoom_notes, "read_wal_strings", lambda _path: resumed_lines)
+
+        fake_wal = tmp_path / "fake.wal"
+        fake_wal.write_bytes(b"x" * 64)
+
+        # Without fix: detect_active_meeting_id returns None (meeting excluded)
+        # With fix: returns MID because latest_ts_secs (13:12:31 = 47551) > floor (47187)
+        result = detect_active_meeting_id(
+            fake_wal,
+            exclude_meeting_id=MID,
+            freshness_floor_secs=FLOOR_SECS,
+        )
+        assert result == MID, (
+            f"Expected resumed meeting {MID!r} to be re-detected after silent period, "
+            f"got {result!r}. The exclude_meeting_id guard must allow re-detection "
+            f"when latest_ts_secs ({13*3600+12*60+31}) > freshness_floor ({FLOOR_SECS})."
+        )
+
+    def test_old_content_still_excluded_after_generation(self, monkeypatch, tmp_path):
+        """The freshness exception must not re-admit checkpoint replays.
+
+        If the WAL's latest timestamp for the excluded meeting is at or below
+        the freshness floor, it should remain excluded — that's old content
+        from the same session we already processed, replayed by a SQLite
+        WAL checkpoint.
+        """
+        MID = "FigJam+SessionABC=="
+        FLOOR_SECS = 13 * 3600 + 6 * 60 + 27  # 13:06:27
+
+        # WAL content: same meeting ID but timestamps OLDER than the floor
+        old_lines = [
+            "messageId",
+            "1:0:11111:0:222222",
+            "message",
+            "Let me introduce today's topic.",
+            "timeStampContent",
+            "13:05:10",  # <= floor
+            "timeStampSeconds",
+            "i",
+            "uniqueUserId",
+            "1-0",
+            "username",
+            "Alex Diner",
+            "meetingId",
+            MID,
+        ]
+        monkeypatch.setattr(zoom_notes, "read_wal_strings", lambda _path: old_lines)
+
+        fake_wal = tmp_path / "fake.wal"
+        fake_wal.write_bytes(b"x" * 64)
+
+        result = detect_active_meeting_id(
+            fake_wal,
+            exclude_meeting_id=MID,
+            freshness_floor_secs=FLOOR_SECS,
+        )
+        assert result is None, (
+            f"Old checkpoint content for {MID!r} must remain excluded; got {result!r}."
+        )
+
 
 class TestUtilities:
     def test_slugify_strips_zoom_timestamp(self):

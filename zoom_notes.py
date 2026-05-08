@@ -432,17 +432,26 @@ def detect_active_meeting_id(
     ghost/double-booked meeting from crowding out the one you actually attended.
 
     Boundary-aware filtering (the 2026-04-30 lesson):
-      `exclude_meeting_id` drops a specific id from contention. The engine
-      passes the just-completed meeting here so its still-resident WAL data
-      can't trap detection on the next IDLE -> ACTIVE transition.
+      `exclude_meeting_id` drops a specific id from contention unless its
+      latest WAL timestamp exceeds `freshness_floor_secs`.  The engine passes
+      the just-completed meeting here so its still-resident WAL data can't
+      trap detection on the next IDLE -> ACTIVE transition.
 
-      `freshness_floor_secs` drops any meeting whose latest WAL timestamp is
-      <= this floor (HH:MM:SS converted to seconds-since-midnight). When the
-      engine knows a session ended at 11:21, a meeting whose newest entry is
-      11:21 or older can't be the *new* active meeting — it's by definition
-      from a session that finished. Without this, the just-ended meeting's
-      huge entry count + recency bonus dominates the freshly-starting one's
-      few-entry count, and the engine locks onto the wrong id.
+      The freshness exception is essential for meetings with silent
+      collaboration periods (FigJam, whiteboard, screen-share reading) that
+      are long enough to trip the 90-second idle threshold mid-meeting.  Once
+      speech resumes the WAL gets new entries with timestamps beyond the
+      floor, and detection must be allowed to re-latch onto the same meeting
+      ID rather than orphaning the remaining transcript.
+
+      `freshness_floor_secs` additionally drops any meeting whose latest WAL
+      timestamp is <= this floor (HH:MM:SS converted to seconds-since-
+      midnight). When the engine knows a session ended at 11:21, a meeting
+      whose newest entry is 11:21 or older can't be the *new* active meeting
+      — it's by definition from a session that finished.  Without this, the
+      just-ended meeting's huge entry count + recency bonus dominates the
+      freshly-starting one's few-entry count, and the engine locks onto the
+      wrong id.
     """
     if exclude_meeting_id is None and freshness_floor_secs is None:
         scores = score_meeting_ids(wal_path)
@@ -452,7 +461,19 @@ def detect_active_meeting_id(
     eligible: dict[str, float] = {}
     for mid, data in detailed.items():
         if exclude_meeting_id and mid == exclude_meeting_id:
-            continue
+            # Block checkpoint replays of the just-processed session, but
+            # allow the *same* meeting to be re-detected if it has genuinely
+            # new entries beyond the freshness floor.  This handles meetings
+            # that have silent collaboration periods (FigJam, whiteboard,
+            # screen-share reading) long enough to trigger premature idle:
+            # once speech resumes the timestamps exceed the floor and the
+            # meeting can be tracked again instead of being locked out.
+            has_new_content = (
+                freshness_floor_secs is not None
+                and data["latest_ts_secs"] > freshness_floor_secs
+            )
+            if not has_new_content:
+                continue
         if freshness_floor_secs is not None and data["latest_ts_secs"] >= 0 \
                 and data["latest_ts_secs"] <= freshness_floor_secs:
             continue
