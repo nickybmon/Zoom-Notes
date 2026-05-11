@@ -1186,10 +1186,22 @@ def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None 
 
     # If no title matched within the tight window, fall back to the last title
     # only if it has no parseable timestamp (i.e. a custom/renamed meeting title).
+    #
+    # Guard: if the WAL already has at least one today-dated title for a
+    # *different* meeting, Zoom's AI Notetaker was active today and would
+    # have written a fresh dated entry for the current meeting too — unless
+    # the Notetaker simply wasn't enabled for it. In that case a stale
+    # custom-named entry (e.g. "Daily Standup" from a past session) is
+    # indistinguishable from a legitimate custom title, so we return None
+    # and let the caller fall back to the generic "Zoom Meeting" label.
     if best_title is None:
-        for t in reversed(titles):
-            if not _zoom_time_re.search(t):
-                return t
+        has_same_day_timestamped = any(
+            _zoom_time_re.search(t) and today in t for t in titles
+        )
+        if not has_same_day_timestamped:
+            for t in reversed(titles):
+                if not _zoom_time_re.search(t):
+                    return t
         return None
 
     return best_title
@@ -1746,6 +1758,26 @@ def save_note(
     return save_note_only(note_content, meeting_title, date_str, cfg, meeting_id=meeting_id)
 
 
+def _path_to_vault_link(actual_path: Path, cfg: "ZoomNotesConfig", kind: str, date_str: str) -> str:
+    """Build an Obsidian wikilink from an actual saved file path.
+
+    Uses the stem of the file (no .md extension) as the link target, so
+    collision-suffixed paths like "Daily Standup — transcript-2.md" produce
+    the correct link "[[Meetings/Transcripts/2026-05-11/Daily Standup — transcript-2]]"
+    rather than the base slug that `resolve_filename` would compute.
+    """
+    subfolder = resolve_subfolder(cfg, date_str)
+    stem = actual_path.stem
+    if kind == "transcript":
+        if subfolder:
+            return f"[[Meetings/Transcripts/{subfolder}/{stem}]]"
+        return f"[[Meetings/Transcripts/{stem}]]"
+    else:
+        if subfolder:
+            return f"[[Meetings/Notes/{subfolder}/{stem}]]"
+        return f"[[Meetings/Notes/{stem}]]"
+
+
 _YAML_UNSAFE_CHARS = set(":#[]{},&*?|>\"'%@`")
 
 
@@ -1798,19 +1830,23 @@ def build_note_content(
     cfg: ZoomNotesConfig | None = None,
     *,
     meeting_id: str | None = None,
+    transcript_link_override: str | None = None,
 ) -> str:
     if cfg is None:
         cfg = get_config()
 
     slug = slugify_title(meeting_title, fallback_date=date_str)
     subfolder = resolve_subfolder(cfg, date_str)
-    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
 
-    transcript_link = (
-        f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
-        if subfolder
-        else f"[[Meetings/Transcripts/{transcript_filename}]]"
-    )
+    if transcript_link_override:
+        transcript_link = transcript_link_override
+    else:
+        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
+        transcript_link = (
+            f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
+            if subfolder
+            else f"[[Meetings/Transcripts/{transcript_filename}]]"
+        )
     daily_link = f"[[Daily/{date_str}]]"
     attendees_yaml = "\n".join(f"  - {_yaml_quote(a)}" for a in attendees)
 
@@ -1850,6 +1886,8 @@ def build_placeholder_note(
     error_message: str,
     meeting_id: str,
     cfg: ZoomNotesConfig | None = None,
+    *,
+    transcript_link_override: str | None = None,
 ) -> str:
     """Build a placeholder note used when LLM generation fails.
 
@@ -1862,13 +1900,16 @@ def build_placeholder_note(
 
     slug = slugify_title(meeting_title, fallback_date=date_str)
     subfolder = resolve_subfolder(cfg, date_str)
-    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
 
-    transcript_link = (
-        f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
-        if subfolder
-        else f"[[Meetings/Transcripts/{transcript_filename}]]"
-    )
+    if transcript_link_override:
+        transcript_link = transcript_link_override
+    else:
+        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
+        transcript_link = (
+            f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
+            if subfolder
+            else f"[[Meetings/Transcripts/{transcript_filename}]]"
+        )
     daily_link = f"[[Daily/{date_str}]]"
     attendees_yaml = "\n".join(f"  - {_yaml_quote(a)}" for a in attendees)
     cache_slug = _safe_meeting_id_slug(meeting_id)
@@ -1916,19 +1957,23 @@ def build_transcript_content(
     cfg: ZoomNotesConfig | None = None,
     *,
     meeting_id: str | None = None,
+    note_link_override: str | None = None,
 ) -> str:
     if cfg is None:
         cfg = get_config()
 
     slug = slugify_title(meeting_title, fallback_date=date_str)
     subfolder = resolve_subfolder(cfg, date_str)
-    note_filename = resolve_filename(cfg.filename_pattern, slug, date_str)
 
-    note_link = (
-        f"[[Meetings/Notes/{date_str}/{note_filename}]]"
-        if subfolder
-        else f"[[Meetings/Notes/{note_filename}]]"
-    )
+    if note_link_override:
+        note_link = note_link_override
+    else:
+        note_filename = resolve_filename(cfg.filename_pattern, slug, date_str)
+        note_link = (
+            f"[[Meetings/Notes/{date_str}/{note_filename}]]"
+            if subfolder
+            else f"[[Meetings/Notes/{note_filename}]]"
+        )
     transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
     meeting_id_line = f"meeting_id: {_yaml_quote(meeting_id or '')}\n"
     return f"""---

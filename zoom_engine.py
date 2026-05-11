@@ -81,6 +81,8 @@ from zoom_notes import (
     purge_stale_accumulators,
     list_recoverable_meetings,
     mark_meeting_failed,
+    _path_to_vault_link,
+    _atomic_write_text,
 )
 
 
@@ -1131,6 +1133,10 @@ class ZoomEngine:
         # title) lands as a `-2` sibling instead of clobbering the first
         # meeting's note. The 2026-04-30 incident was exactly this:
         # a follow-up 1:1 wiped the morning standup's saved note.
+        #
+        # The note_link in the transcript content will be corrected once we
+        # know the actual note path (Stage 3). Write a best-guess link now
+        # so the file is immediately useful even in the failure path.
         transcript_content = build_transcript_content(
             transcript_text, meeting_title, date_str, cfg,
             meeting_id=active_meeting_id,
@@ -1140,6 +1146,10 @@ class ZoomEngine:
             meeting_id=active_meeting_id,
         )
         slug = slugify_title(meeting_title, fallback_date=date_str)
+
+        # Actual transcript link derived from the file that was just saved.
+        # This accounts for any -2/-3 suffix that _resolve_save_path assigned.
+        actual_transcript_link = _path_to_vault_link(transcript_path, cfg, "transcript", date_str)
 
         # ── Stage 2: generate note via LLM ─────────────────────────────────
         try:
@@ -1175,11 +1185,20 @@ class ZoomEngine:
                 error_message=error_msg,
                 meeting_id=active_meeting_id or "",
                 cfg=cfg,
+                transcript_link_override=actual_transcript_link,
             )
             placeholder_path = save_note_only(
                 placeholder, meeting_title, date_str, cfg,
                 meeting_id=active_meeting_id,
             )
+            # Update transcript with the actual note link now that we know where it landed.
+            actual_note_link = _path_to_vault_link(placeholder_path, cfg, "note", date_str)
+            updated_transcript = build_transcript_content(
+                transcript_text, meeting_title, date_str, cfg,
+                meeting_id=active_meeting_id,
+                note_link_override=actual_note_link,
+            )
+            _atomic_write_text(transcript_path, updated_transcript)
             self._last_run_note_failed = True
             failed_record = {
                 "meeting_id": active_meeting_id or "",
@@ -1215,11 +1234,21 @@ class ZoomEngine:
         note_content = build_note_content(
             summary, meeting_title, date_str, attendees, created_iso, cfg,
             meeting_id=active_meeting_id,
+            transcript_link_override=actual_transcript_link,
         )
         note_path = save_note_only(
             note_content, meeting_title, date_str, cfg,
             meeting_id=active_meeting_id,
         )
+
+        # Update transcript with the actual note link now that we know where it landed.
+        actual_note_link = _path_to_vault_link(note_path, cfg, "note", date_str)
+        updated_transcript = build_transcript_content(
+            transcript_text, meeting_title, date_str, cfg,
+            meeting_id=active_meeting_id,
+            note_link_override=actual_note_link,
+        )
+        _atomic_write_text(transcript_path, updated_transcript)
 
         emit({
             "event": "done",
@@ -1566,6 +1595,9 @@ class ZoomEngine:
                     transcript_content, meeting_title, date_str, cfg,
                     meeting_id=meeting_id,
                 )
+                actual_transcript_link = _path_to_vault_link(
+                    transcript_path, cfg, "transcript", date_str
+                )
 
                 # Stage 2: LLM. Use a fresh cancel event so cancellation
                 # signals targeted at the main-meeting generation don't
@@ -1588,11 +1620,21 @@ class ZoomEngine:
                         error_message=error_msg,
                         meeting_id=meeting_id,
                         cfg=cfg,
+                        transcript_link_override=actual_transcript_link,
                     )
                     placeholder_path = save_note_only(
                         placeholder, meeting_title, date_str, cfg,
                         meeting_id=meeting_id,
                     )
+                    actual_note_link = _path_to_vault_link(
+                        placeholder_path, cfg, "note", date_str
+                    )
+                    updated_transcript = build_transcript_content(
+                        transcript_text, meeting_title, date_str, cfg,
+                        meeting_id=meeting_id,
+                        note_link_override=actual_note_link,
+                    )
+                    _atomic_write_text(transcript_path, updated_transcript)
                     failed_record = {
                         "meeting_id": meeting_id,
                         "title": slug,
@@ -1620,11 +1662,19 @@ class ZoomEngine:
                 note_content = build_note_content(
                     summary, meeting_title, date_str, attendees, created_iso, cfg,
                     meeting_id=meeting_id,
+                    transcript_link_override=actual_transcript_link,
                 )
                 note_path = save_note_only(
                     note_content, meeting_title, date_str, cfg,
                     meeting_id=meeting_id,
                 )
+                actual_note_link = _path_to_vault_link(note_path, cfg, "note", date_str)
+                updated_transcript = build_transcript_content(
+                    transcript_text, meeting_title, date_str, cfg,
+                    meeting_id=meeting_id,
+                    note_link_override=actual_note_link,
+                )
+                _atomic_write_text(transcript_path, updated_transcript)
 
                 # Stamp boundary anchor so the next IDLE -> ACTIVE pass
                 # cannot re-detect this meeting from leftover WAL data.
@@ -1779,15 +1829,25 @@ class ZoomEngine:
                     })
                     return
 
+                # Derive the actual transcript link from the saved transcript path
+                # so the note points to the right file (e.g. "…-2" suffix).
+                from pathlib import Path as _Path
+                transcript_path_str = (failed or {}).get("transcript_path", "")
+                transcript_link_override = None
+                if transcript_path_str and _Path(transcript_path_str).exists():
+                    transcript_link_override = _path_to_vault_link(
+                        _Path(transcript_path_str), cfg, "transcript", date_str
+                    )
+
                 note_content = build_note_content(
                     summary, meeting_title, date_str, attendees, created_iso, cfg,
                     meeting_id=meeting_id,
+                    transcript_link_override=transcript_link_override,
                 )
 
                 # Overwrite the placeholder note in place if we know its path,
                 # otherwise write a fresh note (which save_note_only will
                 # disambiguate via _resolve_save_path using meeting_id).
-                from pathlib import Path as _Path
                 if placeholder_path_str and _Path(placeholder_path_str).exists():
                     overwrite_note(_Path(placeholder_path_str), note_content)
                     note_path = _Path(placeholder_path_str)

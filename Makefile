@@ -2,7 +2,7 @@ PYTHON ?= ./venv/bin/python3
 PYTEST ?= ./venv/bin/pytest
 BUNDLED_PYTHON ?= ./python-runtime/bin/python3.12
 
-.PHONY: test test-quick test-verbose lint check check-bundled capture-fixture install-hooks install-cli install uninstall-cli
+.PHONY: test test-quick test-verbose lint check check-bundled capture-fixture install-hooks install-cli install uninstall-cli deploy
 
 test:
 	$(PYTEST) -v
@@ -70,6 +70,16 @@ install-cli:
 uninstall-cli:
 	@rm -f "$(BIN_DIR)/zoomnotes"
 	@echo "Removed $(BIN_DIR)/zoomnotes"
+
+# Hot-swap the Python engine files into the running app without a full Xcode
+# rebuild. Safe when only zoom_notes.py / zoom_engine.py / zoom_config.py
+# changed. Kills the engine subprocess so the Swift app restarts it with the
+# new code (~2s). Use `make install` instead when the Swift binary changed.
+deploy:
+	@cp zoom_notes.py zoom_engine.py zoom_config.py \
+		"/Applications/Zoom Notes.app/Contents/Resources/"
+	@pkill -f zoom_engine.py 2>/dev/null || true
+	@echo "✓ Engine updated and restarted"
 
 # Build + install the app locally without symlinking the CLI launcher.
 install:
