@@ -83,6 +83,8 @@ from zoom_notes import (
     mark_meeting_failed,
     _path_to_vault_link,
     _atomic_write_text,
+    _CACHE_DIR,
+    _safe_meeting_id_slug,
 )
 
 
@@ -702,10 +704,26 @@ class ZoomEngine:
                     if meeting_id:
                         persisted = load_persisted_accumulator(meeting_id)
                         if persisted:
-                            self._accumulated = {
-                                k: v for k, v in persisted.items()
-                                if not v.get("meeting_id") or v.get("meeting_id") == meeting_id
-                            }
+                            # Only seed from a snapshot written today — a prior-day
+                            # snapshot is kept for manual recovery but must not
+                            # auto-load into a fresh live session.  Loading it would
+                            # cause Case-B abandoned-meeting logic to fire with stale
+                            # data and generate notes for the wrong (yesterday's)
+                            # meeting instead of the one that just started.
+                            slug = _safe_meeting_id_slug(meeting_id)
+                            snap_path = _CACHE_DIR / f"in-progress-{slug}.json"
+                            try:
+                                snap_date = datetime.fromtimestamp(
+                                    snap_path.stat().st_mtime
+                                ).date()
+                                is_today = (snap_date == datetime.now().date())
+                            except OSError:
+                                is_today = True  # no stat → treat as safe to load
+                            if is_today:
+                                self._accumulated = {
+                                    k: v for k, v in persisted.items()
+                                    if not v.get("meeting_id") or v.get("meeting_id") == meeting_id
+                                }
                     acc_size = len(self._accumulated)
                 self._emit_diag(
                     "meeting_id_changed",
