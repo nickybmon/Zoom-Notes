@@ -848,38 +848,99 @@ def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
     return out
 
 
+def _demote_snapshot_to_failed(json_path: Path) -> None:
+    """Move a prior-day root snapshot to failed/ so it surfaces for manual recovery.
+
+    Called by purge_stale_accumulators for root .json files whose mtime is
+    from a prior calendar day.  The snapshot must not auto-load into a live
+    session (that causes Case-B abandoned-meeting logic to generate notes for
+    the wrong meeting), but deleting it silently would destroy unrecovered
+    transcripts.  Moving it to failed/ is the right middle ground: the engine
+    ignores it for live detection, and the menu bar surfaces it as a
+    recoverable meeting.
+
+    Idempotent: if either destination file already exists it is left in place.
+    """
+    slug = json_path.stem[len("in-progress-"):]
+    failed_dir = _failed_dir()
+    try:
+        failed_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    for ext in (".json", ".md"):
+        src = json_path.parent / f"in-progress-{slug}{ext}"
+        dst = failed_dir / f"in-progress-{slug}{ext}"
+        if src.exists() and not dst.exists():
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
+
+    # Write a minimal sidecar only if one doesn't already exist (a real LLM
+    # failure sidecar written earlier takes precedence).
+    sidecar_path = failed_dir / f"{slug}.{_FAILED_SIDECAR_NAME}"
+    if not sidecar_path.exists():
+        try:
+            _atomic_write_text(
+                sidecar_path,
+                json.dumps({
+                    "demoted_at": datetime.now().isoformat(timespec="seconds"),
+                    "message": "Notes were not generated (auto-archived from a prior day).",
+                }, ensure_ascii=False),
+            )
+        except OSError:
+            pass
+
+
 def purge_stale_accumulators(
-    max_age_secs: int = 24 * 3600,
     failed_max_age_secs: int = _FAILED_PURGE_SECS,
 ) -> None:
-    """Delete in-progress cache files older than the appropriate retention window.
+    """Demote prior-day root snapshots to failed/ and purge aged-out failed/ entries.
 
-    Two separate windows govern the two cache buckets:
+    ROOT (`~/.cache/zoom-notes/in-progress-*`)
+        Any snapshot whose file mtime is from a prior calendar day is moved
+        to failed/ rather than deleted, preserving it for manual recovery
+        through the menu bar.  Snapshots from today stay in root for same-day
+        retry and the normal live-session seed path.  Stale .md orphans (whose
+        .json companion was already removed) and partial .tmp writes older than
+        1 hour are deleted outright since they carry no recoverable content.
 
-      ROOT (`~/.cache/zoom-notes/in-progress-*`)
-        Default: 24h. Wide enough that a same-day retry always has the cache
-        available, while still cleaning up forgotten snapshots from prior
-        days. Live meetings that just ended sit here briefly before being
-        either deleted (success) or promoted to failed/ (LLM error).
-
-      FAILED (`~/.cache/zoom-notes/failed/in-progress-*` + sidecars)
-        Default: 30 days. Confirmed failures need a much wider window
-        because the user may not notice / fix the underlying cause for
-        days (API quota, vacation, broken model config). The transcript
-        is already on disk in the user's Notes/Transcripts folder, but
-        the cache snapshot is the only way to retry note generation
-        without re-parsing the WAL — we can't reconstruct it later.
+    FAILED (`~/.cache/zoom-notes/failed/in-progress-*` + sidecars)
+        Purged after `failed_max_age_secs` (default 30 days).  Confirmed
+        failures need a wide window because the user may not notice or fix the
+        underlying cause (API quota, vacation, broken model config) for days.
     """
     if not _CACHE_DIR.exists():
         return
+
+    today = datetime.now().date()
     now = time.time()
-    for pattern in ("in-progress-*.json", "in-progress-*.md", "in-progress-*.tmp"):
-        for f in _CACHE_DIR.glob(pattern):
-            try:
-                if now - f.stat().st_mtime > max_age_secs:
-                    f.unlink(missing_ok=True)
-            except OSError:
-                pass
+
+    # Demote prior-day root .json snapshots to failed/.
+    for json_path in _CACHE_DIR.glob("in-progress-*.json"):
+        try:
+            mtime = json_path.stat().st_mtime
+            if datetime.fromtimestamp(mtime).date() < today:
+                _demote_snapshot_to_failed(json_path)
+        except OSError:
+            pass
+
+    # Clean up orphaned .md files (their .json was already demoted or deleted).
+    for md_path in _CACHE_DIR.glob("in-progress-*.md"):
+        try:
+            if not md_path.with_suffix(".json").exists():
+                md_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Delete partial .tmp writes older than 1 hour (crashed mid-write).
+    for tmp_path in _CACHE_DIR.glob("in-progress-*.tmp"):
+        try:
+            if now - tmp_path.stat().st_mtime > 3600:
+                tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     failed_dir = _failed_dir()
     if not failed_dir.exists():

@@ -284,46 +284,49 @@ def test_list_recoverable_meetings_returns_both_when_different_meetings(isolated
 # ── purge windows ────────────────────────────────────────────────────────────
 
 
-def test_purge_root_uses_24h_window_failed_uses_30day_window(isolated_cache):
-    """A 7-day-old snapshot in root gets purged (>24h) but a 7-day-old
-    snapshot in failed/ survives (<30d). This is the whole point of Phase 8."""
+def test_purge_demotes_prior_day_root_snapshots_to_failed(isolated_cache):
+    """A prior-day root snapshot is moved to failed/ (not deleted) so it
+    remains recoverable via the menu bar, while a fresh today snapshot stays
+    in root untouched.  A 7-day-old failed/ entry survives (<30d)."""
     # Write a meeting and promote it to failed
     _write_root_snapshot(isolated_cache, "M-failed-keep")
     mark_meeting_failed("M-failed-keep", metadata={"message": "x"})
 
-    # Write a fresh root snapshot for a different meeting
+    # Write a fresh root snapshot for today (should be left alone)
     _write_root_snapshot(isolated_cache, "M-root-keep")
 
-    # Backdate one root file to 25h ago and the failed/ files to 7 days ago
-    now = time.time()
-    twenty_five_hours = now - (25 * 3600)
-    seven_days = now - (7 * 24 * 3600)
-
-    # Add an old root snapshot (will be purged)
-    _write_root_snapshot(isolated_cache, "M-root-purge")
-    slug_root_purge = _safe_meeting_id_slug("M-root-purge")
+    # Write a prior-day root snapshot (should be demoted to failed/)
+    _write_root_snapshot(isolated_cache, "M-root-demote")
+    slug_root_demote = _safe_meeting_id_slug("M-root-demote")
+    yesterday = time.time() - (25 * 3600)  # always a prior calendar day
     os.utime(
-        isolated_cache / f"in-progress-{slug_root_purge}.json",
-        (twenty_five_hours, twenty_five_hours),
+        isolated_cache / f"in-progress-{slug_root_demote}.json",
+        (yesterday, yesterday),
     )
     os.utime(
-        isolated_cache / f"in-progress-{slug_root_purge}.md",
-        (twenty_five_hours, twenty_five_hours),
+        isolated_cache / f"in-progress-{slug_root_demote}.md",
+        (yesterday, yesterday),
     )
 
     slug_failed_keep = _safe_meeting_id_slug("M-failed-keep")
     failed = isolated_cache / "failed"
+    seven_days = time.time() - (7 * 24 * 3600)
     for f in failed.iterdir():
         os.utime(f, (seven_days, seven_days))
 
     purge_stale_accumulators()
 
-    # M-root-purge gone
-    assert not (isolated_cache / f"in-progress-{slug_root_purge}.json").exists()
-    # M-root-keep (fresh) still there
+    # M-root-demote moved out of root and into failed/ (with auto sidecar)
+    assert not (isolated_cache / f"in-progress-{slug_root_demote}.json").exists()
+    assert not (isolated_cache / f"in-progress-{slug_root_demote}.md").exists()
+    assert (failed / f"in-progress-{slug_root_demote}.json").exists()
+    assert (failed / f"{slug_root_demote}.{_FAILED_SIDECAR_NAME}").exists()
+
+    # M-root-keep (today's snapshot) still in root
     slug_root_keep = _safe_meeting_id_slug("M-root-keep")
     assert (isolated_cache / f"in-progress-{slug_root_keep}.json").exists()
-    # M-failed-keep (7 days old, <30d) still there
+
+    # M-failed-keep (7 days old, <30d) untouched in failed/
     assert (failed / f"in-progress-{slug_failed_keep}.json").exists()
     assert (failed / f"{slug_failed_keep}.{_FAILED_SIDECAR_NAME}").exists()
 
