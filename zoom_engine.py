@@ -1446,7 +1446,14 @@ class ZoomEngine:
         meeting_title = None
         if blocks_wal:
             try:
-                meeting_title = parse_meeting_title(blocks_wal, entries)
+                # Use only entries with a confirmed meeting_id for the
+                # timestamp anchor passed to parse_meeting_title. No-meeting-id
+                # entries are early WAL pages that may belong to a prior
+                # meeting; including them shifts the reference time backward
+                # and causes the title matcher to snap to the wrong calendar
+                # event. Fall back to all entries only when none have an id.
+                anchor_entries = [e for e in entries if e.get("meeting_id")]
+                meeting_title = parse_meeting_title(blocks_wal, anchor_entries or entries)
             except Exception:
                 pass
         if not meeting_title:
@@ -1569,10 +1576,16 @@ class ZoomEngine:
             # cleanly through one LLM at a time.
             self._generating_lock.acquire(blocking=True)
             try:
-                entries = sorted(
-                    snapshot_copy.values(),
-                    key=lambda e: e.get("timestamp") or "",
-                )
+                # Filter snapshot to only entries for this meeting_id (or
+                # entries with no meeting_id, which are early WAL pages that
+                # predate the meetingId field). Without this filter, stale
+                # entries from adjacent meetings in the WAL contaminate the
+                # title timestamp anchor and produce wrong titles.
+                raw_entries = [
+                    e for e in snapshot_copy.values()
+                    if e.get("meeting_id") == meeting_id or not e.get("meeting_id")
+                ]
+                entries = sorted(raw_entries, key=lambda e: e.get("timestamp") or "")
                 if not entries:
                     return
 
