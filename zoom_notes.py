@@ -233,6 +233,31 @@ def find_wal_by_content(origin: Path, kind: str) -> Path | None:
             scored.append((score, mtime, wal))
 
     if not scored:
+        # WAL-based discovery found nothing. For the blocks store this is
+        # common: Zoom frequently checkpoints the WAL (flushing all title
+        # data into the main .sqlite3 file), leaving the WAL at 0 bytes.
+        # Fall back to the main DB file — read_wal_strings / strings(1)
+        # works on it identically. Only makes sense for blocks (the
+        # transcript store's data is short-lived in the WAL; the DB file
+        # accumulates years of data that's too noisy to distinguish).
+        if kind == "blocks":
+            db_scored: list[tuple[int, float, Path]] = []
+            for db_dir in idb_dir.iterdir():
+                if not db_dir.is_dir():
+                    continue
+                db = db_dir / "IndexedDB.sqlite3"
+                if not db.exists() or db.stat().st_size < 4096:
+                    continue
+                score = _score_wal_for_kind(db, kind)
+                if score >= _MIN_SIGNATURE_HITS:
+                    try:
+                        mtime = db.stat().st_mtime
+                    except OSError:
+                        continue
+                    db_scored.append((score, mtime, db))
+            if db_scored:
+                db_scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+                return db_scored[0][2]
         return None
     # Highest score wins; mtime breaks ties (freshest writes are the
     # in-progress meeting).

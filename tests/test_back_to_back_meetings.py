@@ -640,27 +640,30 @@ class TestBackToBackEndToEnd:
                     mtime=base_mtime, size=10_000, entries=[],
                     detected_meeting_id="standup_meeting_id_AA")
         # Tick 2: WAL grows; IDLE -> ACTIVE under standup.
+        # 5 entries needed to clear the _abandoned_looks_real threshold
+        # that _generate_notes now enforces.
+        standup_entries = [
+            _make_entry("a1", "team status", meeting_id="standup_meeting_id_AA",
+                        speaker="Alex", timestamp="11:05:00"),
+            _make_entry("a2", "all good here", meeting_id="standup_meeting_id_AA",
+                        speaker="Nick", timestamp="11:06:00"),
+            _make_entry("a3", "shipping today", meeting_id="standup_meeting_id_AA",
+                        speaker="Alex", timestamp="11:07:00"),
+            _make_entry("a4", "nice", meeting_id="standup_meeting_id_AA",
+                        speaker="Nick", timestamp="11:08:00"),
+            _make_entry("a5", "any blockers", meeting_id="standup_meeting_id_AA",
+                        speaker="Alex", timestamp="11:09:00"),
+        ]
         _drive_tick(engine, fake_origin, cfg, wal=synthetic_wal,
                     mtime=base_mtime + 5, size=10_100,
-                    entries=[
-                        _make_entry("a1", "team status",
-                                    meeting_id="standup_meeting_id_AA",
-                                    speaker="Alex", timestamp="11:05:00"),
-                    ],
+                    entries=standup_entries,
                     detected_meeting_id="standup_meeting_id_AA")
         assert engine._get_state() == EngineState.ACTIVE
         # Tick 3: idle elapses, generation fires.
         _drive_tick_idle_to_generation(
             engine, fake_origin, cfg, wal=synthetic_wal,
             mtime=base_mtime + 5, size=10_100,
-            entries=[
-                _make_entry("a1", "team status",
-                            meeting_id="standup_meeting_id_AA",
-                            speaker="Alex", timestamp="11:05:00"),
-                _make_entry("a2", "more team status",
-                            meeting_id="standup_meeting_id_AA",
-                            speaker="Nick", timestamp="11:10:00"),
-            ],
+            entries=standup_entries,
             detected_meeting_id="standup_meeting_id_AA",
         )
 
@@ -695,13 +698,21 @@ class TestBackToBackEndToEnd:
                     mtime=base_mtime + 60, size=20_000, entries=[],
                     detected_meeting_id="marc_meeting_id_BB")
         # Tick 5: IDLE -> ACTIVE under marc.
+        marc_entries = [
+            _make_entry("b1", "marc talking",   meeting_id="marc_meeting_id_BB",
+                        speaker="Marc", timestamp="11:32:08"),
+            _make_entry("b2", "nick replying",  meeting_id="marc_meeting_id_BB",
+                        speaker="Nick", timestamp="11:33:00"),
+            _make_entry("b3", "sounds good",    meeting_id="marc_meeting_id_BB",
+                        speaker="Marc", timestamp="11:34:00"),
+            _make_entry("b4", "any updates",    meeting_id="marc_meeting_id_BB",
+                        speaker="Nick", timestamp="11:35:00"),
+            _make_entry("b5", "all clear",      meeting_id="marc_meeting_id_BB",
+                        speaker="Marc", timestamp="11:36:00"),
+        ]
         _drive_tick(engine, fake_origin, cfg, wal=synthetic_wal,
                     mtime=base_mtime + 65, size=20_100,
-                    entries=[
-                        _make_entry("b1", "marc talking",
-                                    meeting_id="marc_meeting_id_BB",
-                                    speaker="Marc", timestamp="11:32:08"),
-                    ],
+                    entries=marc_entries,
                     detected_meeting_id="marc_meeting_id_BB")
         # Boundary was cleared at IDLE -> ACTIVE so future reevaluation isn't
         # locked out.
@@ -711,14 +722,7 @@ class TestBackToBackEndToEnd:
         _drive_tick_idle_to_generation(
             engine, fake_origin, cfg, wal=synthetic_wal,
             mtime=base_mtime + 65, size=20_100,
-            entries=[
-                _make_entry("b1", "marc talking",
-                            meeting_id="marc_meeting_id_BB",
-                            speaker="Marc", timestamp="11:32:08"),
-                _make_entry("b2", "nick replying",
-                            meeting_id="marc_meeting_id_BB",
-                            speaker="Nick", timestamp="11:33:00"),
-            ],
+            entries=marc_entries,
             detected_meeting_id="marc_meeting_id_BB",
         )
 

@@ -93,10 +93,6 @@ class ZoomNotesConfig:
     # Raw YAML string appended after structured properties (advanced).
     extra_frontmatter_yaml: str = ""
 
-    def __post_init__(self):
-        if self.custom_frontmatter_properties is None:
-            self.custom_frontmatter_properties = []
-
     # Polling / idle detection
     poll_interval_secs: int = 5
     idle_threshold_secs: int = 90
@@ -109,6 +105,18 @@ class ZoomNotesConfig:
     # accumulator persistence, etc. Useful for post-mortem debugging
     # without recompiling. Off by default.
     diagnostics: bool = False
+
+    # Meeting IDs to permanently ignore. If a detected meeting_id is in
+    # this list the engine will not transition to ACTIVE for that meeting.
+    # IDs are base64 strings copied from the `meeting_id:` frontmatter
+    # field in any generated note.
+    blocked_meeting_ids: list = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.custom_frontmatter_properties is None:
+            self.custom_frontmatter_properties = []
+        if self.blocked_meeting_ids is None:
+            self.blocked_meeting_ids = []
 
     # Provider base URLs (override to route through a proxy)
     ollama_base_url: str = "http://localhost:11434"

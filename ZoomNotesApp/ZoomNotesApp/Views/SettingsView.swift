@@ -537,6 +537,29 @@ private struct AdvancedTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
 
+            Section("Blocked Meeting IDs") {
+                VStack(alignment: .leading, spacing: 6) {
+                    TextEditor(text: Binding(
+                        get: { vm.config.blockedMeetingIds.joined(separator: "\n") },
+                        set: { raw in
+                            vm.config.blockedMeetingIds = raw
+                                .components(separatedBy: "\n")
+                                .map { $0.trimmingCharacters(in: .whitespaces) }
+                                .filter { !$0.isEmpty }
+                        }
+                    ))
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 80)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                    )
+                    Text("One meeting ID per line. Copy IDs from the `meeting_id:` field in any note.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+
             Section("API Base URLs (optional overrides)") {
                 if vm.config.llmProvider == "ollama" {
                     TextField("Ollama base URL", text: $vm.config.ollamaBaseUrl)

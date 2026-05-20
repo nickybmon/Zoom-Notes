@@ -368,3 +368,75 @@ class TestRecurringMeetingDedupe:
         msm = engine._read_session_mtime()
         assert (mid, msm) == engine._last_generated_session, \
             "checkpoint mutation must keep the same fingerprint as the one we generated for"
+
+
+class TestBlockedMeetingIds:
+    """Regression guard for the blocked_meeting_ids feature.
+
+    When a detected meeting_id is in cfg.blocked_meeting_ids the engine
+    must not transition to ACTIVE — it should stay IDLE.
+    """
+
+    def _make_cfg_with_blocked(self, blocked_id: str):
+        """Return a real config object with blocked_meeting_ids set."""
+        from zoom_config import ZoomNotesConfig
+        cfg = ZoomNotesConfig()
+        cfg.blocked_meeting_ids = [blocked_id]
+        return cfg
+
+    def test_blocked_id_prevents_idle_to_active(self, fake_origin, tmp_path, isolated_cache):
+        """IDLE→ACTIVE must not fire when the detected meeting_id is blocked."""
+        wal = tmp_path / "synthetic.sqlite3-wal"
+        wal.write_bytes(b"x" * 1024)
+        engine = ZoomEngine()
+        blocked_id = "HA1Kj2+mQDqLrOwX2pQIfA=="
+        cfg = self._make_cfg_with_blocked(blocked_id)
+
+        size = wal.stat().st_size
+
+        # Tick 1: anchor.
+        os.utime(wal, (1000.0, 1000.0))
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "detect_active_meeting_id", return_value=blocked_id):
+            engine._poll_once(fake_origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+        assert engine._get_state() == EngineState.IDLE
+
+        # Tick 2: WAL changed, detection returns the blocked id.
+        os.utime(wal, (1005.0, 1005.0))
+        wal.write_bytes(b"x" * (size + 1))
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "detect_active_meeting_id", return_value=blocked_id):
+            engine._poll_once(fake_origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+
+        assert engine._get_state() == EngineState.IDLE, (
+            "engine must stay IDLE when the detected meeting_id is in blocked_meeting_ids"
+        )
+
+    def test_non_blocked_id_still_activates(self, fake_origin, tmp_path, isolated_cache):
+        """An unblocked meeting_id must still trigger IDLE→ACTIVE normally."""
+        wal = tmp_path / "synthetic2.sqlite3-wal"
+        wal.write_bytes(b"x" * 1024)
+        engine = ZoomEngine()
+        blocked_id = "HA1Kj2+mQDqLrOwX2pQIfA=="
+        other_id = "ZZ9Kj2+mQDqLrOwX2pQIfZ=="
+        cfg = self._make_cfg_with_blocked(blocked_id)
+
+        size = wal.stat().st_size
+
+        # Tick 1: anchor.
+        os.utime(wal, (1000.0, 1000.0))
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "detect_active_meeting_id", return_value=other_id):
+            engine._poll_once(fake_origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+        assert engine._get_state() == EngineState.IDLE
+
+        # Tick 2: different (non-blocked) id → should go ACTIVE.
+        wal.write_bytes(b"x" * (size + 1))
+        os.utime(wal, (1005.0, 1005.0))
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "detect_active_meeting_id", return_value=other_id):
+            engine._poll_once(fake_origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+
+        assert engine._get_state() == EngineState.ACTIVE, (
+            "a non-blocked meeting_id must still trigger IDLE→ACTIVE"
+        )

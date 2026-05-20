@@ -40,6 +40,8 @@ struct ZoomNotesConfig: Codable {
 
     var diagnostics: Bool = false
 
+    var blockedMeetingIds: [String] = []
+
     enum CodingKeys: String, CodingKey {
         case llmProvider = "llm_provider"
         case llmModel = "llm_model"
@@ -59,6 +61,7 @@ struct ZoomNotesConfig: Codable {
         case openaiBaseUrl = "openai_base_url"
         case geminiBaseUrl = "gemini_base_url"
         case diagnostics
+        case blockedMeetingIds = "blocked_meeting_ids"
     }
 }
 

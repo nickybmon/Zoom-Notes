@@ -170,6 +170,104 @@ class TestAbandonedLooksReal:
         assert ZoomEngine._abandoned_looks_real(snap) is True
 
 
+# ── Cross-meeting snapshot inflation ─────────────────────────────────────
+
+
+class TestAbandonedGenerationMixedMeetingIds:
+    """Regression: when entries from the NEXT meeting inflate the snapshot
+    count above the _abandoned_looks_real threshold, the abandoned meeting's
+    filtered entries may still be too few to warrant a note.
+
+    Scenario (observed 2026-05-20): meeting A (Michael, 1 entry at 14:55)
+    was being tracked. When meeting B started, the engine accumulated entries
+    from B before Case B fired. The full snapshot had 5+ entries (threshold
+    passes), but after filtering to meeting A's id only 3 entries remained.
+    The abandoned generation ran and produced a near-empty, misleading note.
+
+    The fix: inside _trigger_abandoned_generation the worker re-runs
+    _abandoned_looks_real on the *filtered* entries and bails out if they
+    are below threshold.
+    """
+
+    def _make_snapshot_for_meeting(self, meeting_id: str, count: int, prefix: str) -> dict:
+        """Like _make_realistic_accumulator but with a caller-supplied key prefix
+        to avoid collisions when merging two snapshots in the same dict."""
+        speakers = ["Alice", "Bob", "Carol"]
+        return {
+            f"{prefix}-{i}": _make_entry(
+                f"{prefix}-{i}",
+                f"Utterance {i}.",
+                meeting_id=meeting_id,
+                speaker=speakers[i % len(speakers)],
+                timestamp=f"13:3{i}:00",
+            )
+            for i in range(count)
+        }
+
+    def test_no_generation_when_filtered_count_below_threshold(
+        self, isolated_cache, isolated_vault, monkeypatch
+    ):
+        """If only meeting-A entries are below threshold but total snapshot
+        is above it, the worker must bail out without calling summarize."""
+        import zoom_engine as ze
+
+        seen_summarize = []
+        monkeypatch.setattr(ze, "summarize", lambda *a, **kw: seen_summarize.append(1) or "summary")
+
+        engine = ZoomEngine()
+
+        # 3 entries for the abandoned meeting A (below threshold of 5)
+        snap_a = self._make_snapshot_for_meeting("meeting-A-AA", count=3, prefix="a")
+        # 4 entries for the next meeting B (inflating the total to 7)
+        snap_b = self._make_snapshot_for_meeting("meeting-B-BB", count=4, prefix="b")
+        mixed_snapshot = {**snap_a, **snap_b}
+
+        assert len(mixed_snapshot) == 7
+        assert ZoomEngine._abandoned_looks_real(mixed_snapshot) is True  # total passes
+        # But only 3 entries belong to meeting A
+        assert ZoomEngine._abandoned_looks_real(snap_a) is False  # A-only fails
+
+        engine._trigger_abandoned_generation("meeting-A-AA", mixed_snapshot)
+
+        # Wait for the worker to finish (it holds the lock while running)
+        assert engine._generating_lock.acquire(timeout=5.0), "worker never released lock"
+        engine._generating_lock.release()
+
+        assert seen_summarize == [], (
+            "_trigger_abandoned_generation must not call summarize when "
+            "filtered entries are below threshold"
+        )
+
+    def test_generation_proceeds_when_filtered_count_meets_threshold(
+        self, isolated_cache, isolated_vault, monkeypatch
+    ):
+        """If the abandoned meeting's own filtered entries meet threshold,
+        generation still runs even if the total snapshot is mixed."""
+        import zoom_engine as ze
+
+        seen_summarize = []
+        monkeypatch.setattr(ze, "summarize", lambda *a, **kw: seen_summarize.append(1) or "## Overview\n\nOK")
+        monkeypatch.setattr(ze, "find_origin_dir", lambda: None)
+
+        engine = ZoomEngine()
+
+        # 6 entries for meeting A (above threshold on its own)
+        snap_a = self._make_snapshot_for_meeting("meeting-A-BB", count=6, prefix="a")
+        # 4 entries for meeting B (extra noise in snapshot)
+        snap_b = self._make_snapshot_for_meeting("meeting-B-BB", count=4, prefix="b")
+        mixed_snapshot = {**snap_a, **snap_b}
+
+        engine._trigger_abandoned_generation("meeting-A-BB", mixed_snapshot)
+
+        assert engine._generating_lock.acquire(timeout=5.0), "worker never released lock"
+        engine._generating_lock.release()
+
+        assert seen_summarize == [1], (
+            "_trigger_abandoned_generation must call summarize when "
+            "filtered entries are above threshold"
+        )
+
+
 # ── Case B dispatch ───────────────────────────────────────────────────────
 
 

@@ -374,7 +374,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     private func recoverableSubtitleDetail(for rec: RecoverableMeeting) -> String {
         switch rec.location {
         case .failed:
-            return rec.lastError ?? rec.slugHint
+            let reason = rec.lastError ?? rec.slugHint
+            return reason.isEmpty ? rec.slugHint : "Previous error: \(reason)"
         case .root:
             return rec.slugHint
         }

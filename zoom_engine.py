@@ -678,6 +678,19 @@ class ZoomEngine:
             except Exception:
                 meeting_id = None
 
+            # Blocked-meeting guard: if the detected meeting_id is in the
+            # user's block list, refuse the transition entirely and stay IDLE.
+            # Normalize by stripping whitespace so copy-pasted IDs with a
+            # trailing space or newline still match.
+            if meeting_id:
+                blocked = [b.strip() for b in getattr(cfg, "blocked_meeting_ids", [])]
+                if meeting_id.strip() in blocked:
+                    self._emit_diag(
+                        "meeting_blocked",
+                        meeting_id=meeting_id,
+                    )
+                    return
+
             if state == EngineState.IDLE:
                 # Stamp the session fingerprint as we enter ACTIVE. `mtime`
                 # is the current WAL mtime; combined with meeting_id it lets
@@ -779,54 +792,65 @@ class ZoomEngine:
                         accumulator_size=acc_size,
                     )
                 elif meeting_id != current_tracking_id:
-                    # Case B: real meeting change. Two sub-scenarios:
-                    #
-                    #   1) BACK-TO-BACK MEETINGS: the previous meeting really
-                    #      happened, has a real accumulator with real
-                    #      conversation. Auto-generate its note now (the
-                    #      2026-05-04 AEO GA fix) before clearing local
-                    #      state. Runs in a background thread so the new
-                    #      meeting's tracking proceeds without delay.
-                    #
-                    #   2) MISIDENTIFICATION: scoring just corrected itself
-                    #      after briefly tracking the wrong meeting (the
-                    #      original 2026-04-30 reason this branch existed).
-                    #      Accumulator is small / has no real speakers.
-                    #      Discard as before — generating a note from
-                    #      misidentified noise wastes an LLM call and
-                    #      produces a confusing artifact.
-                    #
-                    # `_abandoned_looks_real` is the gate between the two.
-                    with self._accumulated_lock:
-                        abandoned_snapshot = dict(self._accumulated)
-                    if self._abandoned_looks_real(abandoned_snapshot):
-                        self._trigger_abandoned_generation(
-                            current_tracking_id, abandoned_snapshot,
+                    # If the newly detected meeting_id is blocked, don't
+                    # perform the Case B transition — stay on the current
+                    # tracked meeting (or let idle detection handle it).
+                    _blocked_ids = [b.strip() for b in getattr(cfg, "blocked_meeting_ids", [])]
+                    if meeting_id.strip() in _blocked_ids:
+                        self._emit_diag(
+                            "meeting_blocked",
+                            meeting_id=meeting_id,
+                            context="case_b",
                         )
-                        # Note: do NOT delete_persisted_accumulator here —
-                        # _trigger_abandoned_generation persists a fresh
-                        # snapshot synchronously and cleans up after itself
-                        # on success.
                     else:
-                        try:
-                            delete_persisted_accumulator(current_tracking_id)
-                        except Exception:
-                            pass
-                    self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
-                    with self._accumulated_lock:
-                        self._accumulated = {}
-                    self._emit_diag(
-                        "meeting_id_changed",
-                        from_id=current_tracking_id, to_id=meeting_id,
-                        reason="active_reevaluation",
-                        abandoned_snapshot_size=len(abandoned_snapshot),
-                        abandoned_auto_generated=self._abandoned_looks_real(abandoned_snapshot),
-                    )
-                    self._set_state(
-                        EngineState.ACTIVE,
-                        meeting_id=meeting_id,
-                        accumulator_size=0,
-                    )
+                        # Case B: real meeting change. Two sub-scenarios:
+                        #
+                        #   1) BACK-TO-BACK MEETINGS: the previous meeting really
+                        #      happened, has a real accumulator with real
+                        #      conversation. Auto-generate its note now (the
+                        #      2026-05-04 AEO GA fix) before clearing local
+                        #      state. Runs in a background thread so the new
+                        #      meeting's tracking proceeds without delay.
+                        #
+                        #   2) MISIDENTIFICATION: scoring just corrected itself
+                        #      after briefly tracking the wrong meeting (the
+                        #      original 2026-04-30 reason this branch existed).
+                        #      Accumulator is small / has no real speakers.
+                        #      Discard as before — generating a note from
+                        #      misidentified noise wastes an LLM call and
+                        #      produces a confusing artifact.
+                        #
+                        # `_abandoned_looks_real` is the gate between the two.
+                        with self._accumulated_lock:
+                            abandoned_snapshot = dict(self._accumulated)
+                        if self._abandoned_looks_real(abandoned_snapshot):
+                            self._trigger_abandoned_generation(
+                                current_tracking_id, abandoned_snapshot,
+                            )
+                            # Note: do NOT delete_persisted_accumulator here —
+                            # _trigger_abandoned_generation persists a fresh
+                            # snapshot synchronously and cleans up after itself
+                            # on success.
+                        else:
+                            try:
+                                delete_persisted_accumulator(current_tracking_id)
+                            except Exception:
+                                pass
+                        self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
+                        with self._accumulated_lock:
+                            self._accumulated = {}
+                        self._emit_diag(
+                            "meeting_id_changed",
+                            from_id=current_tracking_id, to_id=meeting_id,
+                            reason="active_reevaluation",
+                            abandoned_snapshot_size=len(abandoned_snapshot),
+                            abandoned_auto_generated=self._abandoned_looks_real(abandoned_snapshot),
+                        )
+                        self._set_state(
+                            EngineState.ACTIVE,
+                            meeting_id=meeting_id,
+                            accumulator_size=0,
+                        )
 
             # Snapshot new entries into the accumulator on every change tick.
             # No meeting_id_filter here — we accumulate everything and filter
@@ -1128,6 +1152,22 @@ class ZoomEngine:
         if not entries:
             raise RuntimeError("No transcript entries found.")
 
+        # Refuse to generate a note from a near-empty transcript — this
+        # catches recurring meetings (static meeting_id) whose Notetaker
+        # only captured a brief opening monologue before the WAL went
+        # quiet. Threshold matches _abandoned_looks_real for consistency.
+        entries_by_id = {e.get("msg_id", str(i)): e for i, e in enumerate(entries)}
+        if not self._abandoned_looks_real(entries_by_id):
+            emit({
+                "event": "error",
+                "message": (
+                    f"Skipped note generation — only {len(entries)} transcript "
+                    f"entr{'y' if len(entries) == 1 else 'ies'} found "
+                    f"(minimum 5 with at least one identified speaker required)."
+                ),
+            })
+            return
+
         meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
         date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
@@ -1178,20 +1218,37 @@ class ZoomEngine:
             # A cancelled run leaves the transcript on disk (Stage 1 already
             # ran) and the persisted accumulator intact for retry. We do NOT
             # write a placeholder — a cancellation note in the user's vault
-            # would be confusing noise; the menu bar already surfaces the
-            # timeout via the `error` event.
+            # would be confusing noise.
+            #
+            # We DO emit note_failed so the menu bar shows an in-session retry
+            # item immediately (not just at the next launch). Guard against a
+            # new meeting having started while the LLM was timing out — if the
+            # engine is no longer IDLE, skip the emit to avoid flipping the
+            # active meeting's displayed state to idle.
             self._last_run_note_failed = True
-            self._last_failed_meeting = {
+            _title_slug = slugify_title(meeting_title, fallback_date=date_str)
+            failed_meta = {
                 "meeting_id": active_meeting_id or "",
-                "title": slugify_title(meeting_title, fallback_date=date_str),
+                "title": _title_slug,
                 "note_path": "",
                 "transcript_path": str(transcript_path),
-                "message": "Note generation cancelled (timed out)",
+                "message": "API call timed out — the LLM took too long to respond",
                 "date_str": date_str,
                 "attendees": attendees,
             }
+            self._last_failed_meeting = failed_meta
             if active_meeting_id:
-                mark_meeting_failed(active_meeting_id, metadata=self._last_failed_meeting)
+                mark_meeting_failed(active_meeting_id, metadata=failed_meta)
+            if self._get_state() == EngineState.IDLE:
+                emit({
+                    "event": "note_failed",
+                    "title": _title_slug,
+                    "meeting_id": active_meeting_id or "",
+                    "note_path": "",
+                    "transcript_path": str(transcript_path),
+                    "message": failed_meta["message"],
+                    "attendees": attendees,
+                })
             return
         except Exception as exc:
             error_msg = _friendly_error(exc)
@@ -1612,6 +1669,21 @@ class ZoomEngine:
                 ]
                 entries = sorted(raw_entries, key=lambda e: e.get("timestamp") or "")
                 if not entries:
+                    return
+
+                # Re-apply the _abandoned_looks_real gate on the *filtered*
+                # entries. The pre-flight check in _poll_once operates on the
+                # full snapshot (all meeting_ids mixed together). If entries
+                # from the *next* meeting inflated the count above threshold,
+                # the abandoned meeting's own filtered entries may be too few
+                # to deserve a note. Bail out and clean up rather than
+                # generating a near-empty, misleading transcript.
+                filtered_snapshot = {e["msg_id"]: e for e in raw_entries if "msg_id" in e}
+                if not self._abandoned_looks_real(filtered_snapshot):
+                    try:
+                        delete_persisted_accumulator(meeting_id)
+                    except Exception:
+                        pass
                     return
 
                 origin = find_origin_dir()
