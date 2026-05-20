@@ -1352,10 +1352,35 @@ class ZoomEngine:
                 # cleanly than to summarize yesterday's Anna fragment.
                 return [], None
 
+            # Compute the session-start floor for anonymous entries.
+            # Entries with no meeting_id are early WAL pages whose meetingId
+            # field hadn't been written yet. We keep them — but only if their
+            # transcript timestamp falls at or after the session start (with a
+            # 5-minute look-back for clock skew / late ACTIVE detection). This
+            # evicts stale anonymous entries from a prior meeting that are still
+            # resident in the WAL after an accumulator reset, without dropping
+            # real opening utterances from the current session.
+            session_mtime = self._read_session_mtime()
+            if session_mtime is not None:
+                session_floor_secs = self._wallclock_secs_from_mtime(session_mtime) - 5 * 60
+
+                def _anon_entry_is_fresh(e: dict) -> bool:
+                    ts = e.get("timestamp")
+                    if not ts:
+                        return True  # no timestamp → keep (can't reject safely)
+                    try:
+                        parts = [int(x) for x in ts.split(":")]
+                        return len(parts) == 3 and (parts[0] * 3600 + parts[1] * 60 + parts[2]) >= session_floor_secs
+                    except ValueError:
+                        return True
+            else:
+                def _anon_entry_is_fresh(e: dict) -> bool:  # type: ignore[misc]
+                    return True
+
             acc_entries = [
                 e for e in acc_snapshot.values()
                 if e.get("meeting_id") == active_meeting_id
-                or not e.get("meeting_id")
+                or (not e.get("meeting_id") and _anon_entry_is_fresh(e))
             ]
             if not acc_entries:
                 # Self-heal path #2: tracking has the wrong meeting_id
@@ -1369,7 +1394,7 @@ class ZoomEngine:
                     recovered_entries = [
                         e for e in acc_snapshot.values()
                         if e.get("meeting_id") == recovered
-                        or not e.get("meeting_id")
+                        or (not e.get("meeting_id") and _anon_entry_is_fresh(e))
                     ]
                     recovered_entries.sort(key=lambda e: e.get("timestamp") or "")
                     return recovered_entries, recovered

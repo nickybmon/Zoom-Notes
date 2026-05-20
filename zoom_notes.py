@@ -1134,6 +1134,13 @@ _TITLE_JUNK = {
     "editorsVisible", "lastUpdatedVisible", "readTimeVisible",
     "visitsVisible", "updatedAt", "createdAt", "lastUsed", "pageId",
     "Zoom Meeting",
+    # Zoom UI / calendar-sync status strings that appear in the blocks WAL
+    # when calendar integration is misconfigured or disabled.
+    "Google Calendar not synced",
+    "Calendar is not synced",
+    "No calendar connected",
+    "Connect your calendar",
+    "Calendar not connected",
 }
 
 # Matches a space-separated token that looks like a base64/hex meeting-ID fragment
