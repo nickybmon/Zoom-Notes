@@ -112,7 +112,7 @@ username
 Zoom streams word-by-word, so the same `messageId` appears many times with progressively longer text. The parser deduplicates by `messageId` (keeping the longest text), then sorts by timestamp, then merges consecutive same-speaker sub-string entries.
 
 ### Idle detection
-`zoom_engine.py` compares `st_mtime` and `st_size` on each 5-second tick. If both are unchanged for `idle_threshold_secs` (default 90s) after a period of activity, it triggers note generation.
+`zoom_engine.py` compares `st_mtime` and `st_size` on each 5-second tick. If both are unchanged for `idle_threshold_secs` (default 120s) after a period of activity, it triggers note generation.
 
 ### Thread safety
 Note generation runs in a background `threading.Thread`. A `threading.Lock` prevents double-triggering. After generation completes (success or error), the lock is released and state resets to idle.
@@ -155,7 +155,7 @@ Settings are stored in two places (shared between Swift and Python):
 | `transcript_filename_pattern` | `{title} — transcript` | Transcript filename template |
 | `system_prompt` | `null` (use default) | Custom LLM instruction |
 | `poll_interval_secs` | `5` | WAL poll frequency (clamped 1..300) |
-| `idle_threshold_secs` | `90` | Seconds idle before triggering (clamped 10..600) |
+| `idle_threshold_secs` | `120` | Seconds idle before triggering (clamped 10..600) |
 | `transcript_db_prefix` | `1CB477F679D6` | IndexedDB folder prefix |
 | `blocks_db_prefix` | `DDEC8414E29A` | Title/blocks DB prefix |
 | `diagnostics` | `false` | Emit structured `diag` events for post-mortem debugging |

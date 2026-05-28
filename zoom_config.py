@@ -95,7 +95,7 @@ class ZoomNotesConfig:
 
     # Polling / idle detection
     poll_interval_secs: int = 5
-    idle_threshold_secs: int = 90
+    idle_threshold_secs: int = 120
 
     # WAL prefixes (override if Zoom changes their IndexedDB hash)
     transcript_db_prefix: str = "1CB477F679D6"

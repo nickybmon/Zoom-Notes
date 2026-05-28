@@ -77,6 +77,8 @@ from zoom_notes import (
     detect_active_meeting_id,
     persist_accumulator,
     load_persisted_accumulator,
+    load_failed_sidecar,
+    _persisted_paths,
     delete_persisted_accumulator,
     purge_stale_accumulators,
     list_recoverable_meetings,
@@ -210,6 +212,14 @@ class ZoomEngine:
         # in logs without re-creating the issue.
         self._empty_parse_streak: int = 0
 
+        # Monotonic timestamp of the last tick that added new entries to
+        # the accumulator. Used by the secondary idle trigger to detect
+        # meetings where Zoom's post-meeting WAL checkpoint writes keep
+        # the WAL "alive" (resetting the normal idle clock) even after
+        # the last speech was captured — causing the meeting to never
+        # trigger generation until the app is restarted.
+        self._last_acc_changed_wall_time: float | None = None
+
         # Purge stale in-progress cache files left over from prior crashes.
         # Order matters: purge first so the recovery scan that follows only
         # surfaces snapshots inside the live retention window.
@@ -251,10 +261,26 @@ class ZoomEngine:
         self._setup_error_emitted = False
 
         signal.signal(signal.SIGHUP, self._on_sighup)
+        signal.signal(signal.SIGTERM, self._on_sigterm)
 
     def _on_sighup(self, signum, frame):
         """SIGHUP triggers a config reload on the next poll tick."""
         self._reload_requested = True
+
+    def _on_sigterm(self, signum, frame):
+        """SIGTERM: finish any in-flight generation before exiting.
+
+        Without this, app termination mid-generation kills the background
+        thread before it can call delete_persisted_accumulator(), leaving
+        an orphaned snapshot that surfaces as a spurious "recover unfinished
+        meeting" item on the next launch. Cancelling the LLM call and waiting
+        up to 10 seconds gives the worker a clean exit path.
+        """
+        self._cancel_event.set()
+        acquired = self._generating_lock.acquire(timeout=10)
+        if acquired:
+            self._generating_lock.release()
+        sys.exit(0)
 
     # ── Tracking helpers (always held under _tracking_lock) ─────────────────
 
@@ -320,9 +346,10 @@ class ZoomEngine:
         # Reset the periodic-persist counter alongside tracking — its meaning
         # is "ticks since last persist while ACTIVE", and a tracking reset
         # always implies we're leaving ACTIVE. Same reasoning for the
-        # empty-parse streak.
+        # empty-parse streak and accumulator-change timestamp.
         self._ticks_since_persist = 0
         self._empty_parse_streak = 0
+        self._last_acc_changed_wall_time = None
 
     # ── State helpers ───────────────────────────────────────────────────────
 
@@ -823,7 +850,18 @@ class ZoomEngine:
                         # `_abandoned_looks_real` is the gate between the two.
                         with self._accumulated_lock:
                             abandoned_snapshot = dict(self._accumulated)
-                        if self._abandoned_looks_real(abandoned_snapshot):
+                        # Gate on entries that *explicitly* belong to the
+                        # abandoned meeting_id. The full snapshot may contain
+                        # early utterances from the new meeting whose WAL pages
+                        # haven't established a meeting_id context yet
+                        # (meeting_id=None). Including them inflates the count
+                        # and causes false-positives where a stale meeting +
+                        # 3 new-meeting utterances triggers abandoned generation.
+                        strict_snapshot = {
+                            k: v for k, v in abandoned_snapshot.items()
+                            if v.get("meeting_id") == current_tracking_id
+                        }
+                        if self._abandoned_looks_real(strict_snapshot):
                             self._trigger_abandoned_generation(
                                 current_tracking_id, abandoned_snapshot,
                             )
@@ -844,7 +882,8 @@ class ZoomEngine:
                             from_id=current_tracking_id, to_id=meeting_id,
                             reason="active_reevaluation",
                             abandoned_snapshot_size=len(abandoned_snapshot),
-                            abandoned_auto_generated=self._abandoned_looks_real(abandoned_snapshot),
+                            strict_snapshot_size=len(strict_snapshot),
+                            abandoned_auto_generated=self._abandoned_looks_real(strict_snapshot),
                         )
                         self._set_state(
                             EngineState.ACTIVE,
@@ -862,9 +901,11 @@ class ZoomEngine:
                 fresh = parse_transcript(wal)
                 changed_in_acc = False
                 with self._accumulated_lock:
+                    _today_str = datetime.now().strftime("%Y-%m-%d")
                     for entry in fresh:
                         mid_key = entry["msg_id"]
                         if mid_key not in self._accumulated:
+                            entry["_session_date"] = _today_str
                             self._accumulated[mid_key] = entry
                             changed_in_acc = True
                         else:
@@ -906,6 +947,8 @@ class ZoomEngine:
                 # matter for retry just as much as new utterances.
                 if changed_in_acc and current_meeting_id:
                     self._persist_accumulator_now(current_meeting_id, reason="changed")
+                if changed_in_acc:
+                    self._last_acc_changed_wall_time = time.monotonic()
 
                 # Empty-parse streak: WAL moved (mtime/size) but the parser
                 # found nothing new. Reset on real changes; emit a diag at
@@ -929,6 +972,44 @@ class ZoomEngine:
                     error=str(exc)[:200],
                     meeting_id=(self._read_tracking()[3] or ""),
                 )
+
+            # Secondary idle trigger: fire generation when the accumulator
+            # has been frozen for a long time even though the WAL file is
+            # still being updated by Zoom checkpoint writes. This is the
+            # "Jose Ocando" failure mode — meeting ends, Zoom keeps the WAL
+            # alive overnight with periodic checkpoint writes, the normal
+            # idle clock never elapses because `changed` stays True.
+            # Threshold is max(3× idle_threshold, 5 min) so a brief
+            # mid-meeting Notetaker pause doesn't trigger prematurely.
+            if (
+                state == EngineState.ACTIVE
+                and self._last_acc_changed_wall_time is not None
+            ):
+                acc_stale_secs = time.monotonic() - self._last_acc_changed_wall_time
+                acc_stale_threshold = max(idle_threshold * 3, 5 * 60)
+                if acc_stale_secs >= acc_stale_threshold:
+                    _, _, _, _stale_mid = self._read_tracking()
+                    if _stale_mid:
+                        with self._accumulated_lock:
+                            _has_content = any(
+                                e.get("meeting_id") == _stale_mid
+                                for e in self._accumulated.values()
+                            )
+                        if _has_content:
+                            _provider = cfg.llm_provider
+                            if _provider != "ollama":
+                                from zoom_config import get_api_key as _ak
+                                if not _ak(_provider):
+                                    return
+                            self._emit_diag(
+                                "acc_stale_trigger",
+                                meeting_id=_stale_mid,
+                                acc_stale_secs=int(acc_stale_secs),
+                                threshold=acc_stale_threshold,
+                            )
+                            self._trigger_generate(origin, cfg)
+                            return
+
         else:
             if state == EngineState.ACTIVE and last_active_ts is not None:
                 idle_secs = now - last_active_ts
@@ -1420,14 +1501,29 @@ class ZoomEngine:
             session_mtime = self._read_session_mtime()
             if session_mtime is not None:
                 session_floor_secs = self._wallclock_secs_from_mtime(session_mtime) - 5 * 60
+                _now_local = datetime.now()
+                _now_secs = _now_local.hour * 3600 + _now_local.minute * 60 + _now_local.second
+                _today_date = _now_local.strftime("%Y-%m-%d")
+                _ANON_FUTURE_BUF = 5 * 60  # 5-minute buffer for clock skew / batch writes
 
                 def _anon_entry_is_fresh(e: dict) -> bool:
+                    # Reject entries from a prior calendar day.
+                    sd = e.get("_session_date")
+                    if sd and sd != _today_date:
+                        return False
                     ts = e.get("timestamp")
                     if not ts:
                         return True  # no timestamp → keep (can't reject safely)
                     try:
                         parts = [int(x) for x in ts.split(":")]
-                        return len(parts) == 3 and (parts[0] * 3600 + parts[1] * 60 + parts[2]) >= session_floor_secs
+                        if len(parts) != 3:
+                            return True
+                        secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                        # Must be at or after session start (with look-back buffer)
+                        # AND must not be suspiciously ahead of current wall time.
+                        # Stale WAL entries from an earlier meeting (e.g. 14:55 in
+                        # a session that started at 12:16) fail the upper bound.
+                        return secs >= session_floor_secs and secs <= _now_secs + _ANON_FUTURE_BUF
                     except ValueError:
                         return True
             else:
@@ -1488,12 +1584,21 @@ class ZoomEngine:
         session_floor_secs = self._wallclock_secs_from_mtime(session_mtime)
 
         # Group entries by meeting_id, tracking max-ts per group.
+        # Skip entries from prior calendar days (defence-in-depth alongside
+        # the is_today check on persisted snapshot files at IDLE→ACTIVE seed).
         from collections import Counter
+        _now_r = datetime.now()
+        _today_r = _now_r.strftime("%Y-%m-%d")
+        _now_secs_r = _now_r.hour * 3600 + _now_r.minute * 60 + _now_r.second
         counts: Counter[str] = Counter()
         max_ts: dict[str, int] = {}
         for e in acc_snapshot.values():
             mid = e.get("meeting_id")
             if not mid:
+                continue
+            # Entries tagged from a prior calendar day are stale WAL residue.
+            sd = e.get("_session_date")
+            if sd and sd != _today_r:
                 continue
             counts[mid] += 1
             ts = e.get("timestamp")
@@ -1507,8 +1612,31 @@ class ZoomEngine:
                 except ValueError:
                     pass
 
-        eligible = [mid for mid, c in counts.items()
-                    if max_ts.get(mid, -1) >= session_floor_secs]
+        # Eligibility: entry must be at or after session start AND must not
+        # be suspiciously far ahead of the current wall clock. The upper-bound
+        # check is the core fix for the HH:MM:SS-without-date problem: stale
+        # WAL entries from an earlier meeting today (e.g. Michael Huard [14:55]
+        # parsed during a 12:16 session) have timestamps numerically > session
+        # start but also numerically > now-by-hours. A real in-progress entry
+        # can never be more than a few seconds ahead of the current time.
+        # The boundary check mirrors detect_active_meeting_id: don't re-select
+        # a meeting we just finished generating notes for.
+        _FUTURE_BUF_R = 5 * 60
+        boundary = self._last_completed_boundary  # (exc_id, freshness_floor) or None
+
+        eligible = []
+        for mid in counts:
+            ts_secs = max_ts.get(mid, -1)
+            if ts_secs < session_floor_secs:
+                continue
+            if ts_secs > _now_secs_r + _FUTURE_BUF_R:
+                continue  # timestamp is impossibly far in the future → stale
+            if boundary is not None:
+                exc_id, exc_floor = boundary
+                if mid == exc_id and ts_secs <= exc_floor:
+                    continue  # stale WAL data from the session we just finished
+            eligible.append(mid)
+
         if not eligible:
             return None
         # Of the eligible, pick the one with the most entries.
@@ -1671,14 +1799,14 @@ class ZoomEngine:
                 if not entries:
                     return
 
-                # Re-apply the _abandoned_looks_real gate on the *filtered*
-                # entries. The pre-flight check in _poll_once operates on the
-                # full snapshot (all meeting_ids mixed together). If entries
-                # from the *next* meeting inflated the count above threshold,
-                # the abandoned meeting's own filtered entries may be too few
-                # to deserve a note. Bail out and clean up rather than
-                # generating a near-empty, misleading transcript.
-                filtered_snapshot = {e["msg_id"]: e for e in raw_entries if "msg_id" in e}
+                # Re-apply the _abandoned_looks_real gate using only entries
+                # that *explicitly* carry this meeting_id. The broad
+                # raw_entries filter (above) also admits meeting_id=None
+                # entries for transcript completeness, but using those here
+                # would re-introduce the same false-positive the strict
+                # pre-flight check was meant to prevent.
+                strict_entries = [e for e in raw_entries if e.get("meeting_id") == meeting_id]
+                filtered_snapshot = {e["msg_id"]: e for e in strict_entries if "msg_id" in e}
                 if not self._abandoned_looks_real(filtered_snapshot):
                     try:
                         delete_persisted_accumulator(meeting_id)
@@ -1871,6 +1999,19 @@ class ZoomEngine:
             emit({"event": "error", "message": "No failed meeting to retry."})
             return
 
+        # For cross-session recovery (the "recover" cmd sent from a prior engine
+        # session), _last_failed_meeting is None because it lives only in memory.
+        # Load the on-disk sidecar so the retry has the correct title, note_path,
+        # transcript_path, date_str, and attendees from the original failure.
+        # Only use the sidecar when it carries real generation metadata (title +
+        # date_str). Demoted snapshots have only `demoted_at` / `message` —
+        # for those, fall through to the re-derive path below so the worker
+        # doesn't use today's date for a meeting from a prior day.
+        if failed is None and meeting_id:
+            sidecar = load_failed_sidecar(meeting_id)
+            if sidecar and sidecar.get("title") and sidecar.get("date_str"):
+                failed = sidecar
+
         cfg = self._get_cfg()
         # Reset cancellation for this retry — a prior cancelled run must
         # not cause the retry to abort instantly.
@@ -1905,7 +2046,19 @@ class ZoomEngine:
                     transcript_wal = self._resolve_wal(origin, cfg, "transcript") if origin else None
                     meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
                     m = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
-                    date_str = m.group(1) if m else datetime.now().strftime("%Y-%m-%d")
+                    if m:
+                        date_str = m.group(1)
+                    else:
+                        # Use the snapshot file's mtime as the date — avoids stamping
+                        # old recovered meetings with today's date when the blocks
+                        # WAL no longer holds a title for them.
+                        snap_path, _ = _persisted_paths(meeting_id)
+                        try:
+                            date_str = datetime.fromtimestamp(
+                                snap_path.stat().st_mtime
+                            ).strftime("%Y-%m-%d") if snap_path else datetime.now().strftime("%Y-%m-%d")
+                        except OSError:
+                            date_str = datetime.now().strftime("%Y-%m-%d")
                     seen: dict[str, None] = {}
                     for e in entries:
                         s = e.get("speaker")

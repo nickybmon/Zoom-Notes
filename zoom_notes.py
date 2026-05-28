@@ -634,6 +634,26 @@ def load_persisted_accumulator(meeting_id: str) -> dict | None:
         return None
 
 
+def load_failed_sidecar(meeting_id: str) -> dict | None:
+    """Load the metadata sidecar for a meeting that landed in `failed/`.
+
+    Returns the sidecar dict (title, note_path, transcript_path, date_str,
+    attendees, message, failed_at) or None if no sidecar exists. Used by
+    the retry/recover flow to restore correct title and paths from the
+    original failure session when _last_failed_meeting is not available
+    (i.e. recovery from a prior engine session).
+    """
+    slug = _safe_meeting_id_slug(meeting_id)
+    sidecar_path = _failed_dir() / f"{slug}.{_FAILED_SIDECAR_NAME}"
+    if not sidecar_path.exists():
+        return None
+    try:
+        data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def delete_persisted_accumulator(meeting_id: str) -> None:
     """Remove the in-progress snapshot after successful note generation.
 
