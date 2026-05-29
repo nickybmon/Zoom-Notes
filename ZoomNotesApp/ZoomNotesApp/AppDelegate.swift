@@ -36,6 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         log("Log file: \(ConsoleLogger.shared.getCurrentLogPath())", level: .info)
 
         requestNotificationPermission()
+        CalendarService.shared.start()
         setupMenuBar()
         observeAppState()
         showOnboardingIfNeeded()

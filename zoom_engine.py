@@ -65,6 +65,7 @@ from zoom_notes import (
     find_wal,
     parse_transcript,
     parse_meeting_title,
+    read_calendar_title,
     format_transcript,
     summarize,
     build_note_content,
@@ -1664,6 +1665,16 @@ class ZoomEngine:
                 # event. Fall back to all entries only when none have an id.
                 anchor_entries = [e for e in entries if e.get("meeting_id")]
                 meeting_title = parse_meeting_title(blocks_wal, anchor_entries or entries)
+            except Exception:
+                pass
+        # If the WAL couldn't identify a title (returned None), try Apple
+        # Calendar. CalendarService.swift writes today's events to a JSON
+        # sidecar every 5 minutes; read_calendar_title finds the event whose
+        # time window contains the transcript's earliest entry.
+        if not meeting_title:
+            try:
+                anchor_entries = [e for e in entries if e.get("meeting_id")] or entries
+                meeting_title = read_calendar_title(anchor_entries)
             except Exception:
                 pass
         if not meeting_title:

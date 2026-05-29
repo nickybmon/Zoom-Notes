@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		3DF7BCFF7AEC473082CEDE8B /* EngineManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 774355B5E45A4EC5A111B5E9 /* EngineManager.swift */; };
+		AA001A2B3F4E5D6A7B8C9D0E /* CalendarService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA001A1B3F4E5D6A7B8C9D0E /* CalendarService.swift */; };
 		42144784ED474F2B8F213543 /* ZoomNotesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28AB7D26DA0649FEAB26F5C1 /* ZoomNotesApp.swift */; };
 		4C473AB599AD4A0BACCE47CC /* EngineEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */; };
 		613CDE9688CC4E24999EA3A5 /* ZoomNotesConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EDE7D98D20B4C51A1065FB4 /* ZoomNotesConfig.swift */; };
@@ -78,6 +79,7 @@
 		65808EC146A24232ABD83746 /* ZoomNotesApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ZoomNotesApp.entitlements; sourceTree = "<group>"; };
 		666DDC72BA4A4BCD93768505 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		774355B5E45A4EC5A111B5E9 /* EngineManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineManager.swift; sourceTree = "<group>"; };
+		AA001A1B3F4E5D6A7B8C9D0E /* CalendarService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarService.swift; sourceTree = "<group>"; };
 		8795DFDC08FB47268DF78CC0 /* ZoomNotesApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = ZoomNotesApp.app; path = "Zoom Notes.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		9898EF6F1C4E4B4EBA7DDA86 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
 		C6130797C4374F2C976E6C4F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -134,6 +136,7 @@
 			isa = PBXGroup;
 			children = (
 				774355B5E45A4EC5A111B5E9 /* EngineManager.swift */,
+				AA001A1B3F4E5D6A7B8C9D0E /* CalendarService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -256,6 +259,7 @@
 				4C473AB599AD4A0BACCE47CC /* EngineEvent.swift in Sources */,
 				613CDE9688CC4E24999EA3A5 /* ZoomNotesConfig.swift in Sources */,
 				3DF7BCFF7AEC473082CEDE8B /* EngineManager.swift in Sources */,
+				AA001A2B3F4E5D6A7B8C9D0E /* CalendarService.swift in Sources */,
 				E30EC9958F804EEA80C7451E /* AppState.swift in Sources */,
 				7E0809FC065443D89EB7B56D /* SettingsViewModel.swift in Sources */,
 				B615248E7BF448B6BC9B2B71 /* SettingsView.swift in Sources */,

@@ -634,6 +634,16 @@ def load_persisted_accumulator(meeting_id: str) -> dict | None:
         return None
 
 
+def load_failed_sidecar(meeting_id: str) -> dict | None:
+    """Return the sidecar metadata dict for a failed meeting, or None if absent."""
+    slug = _safe_meeting_id_slug(meeting_id)
+    sidecar_path = _failed_dir() / f"{slug}.{_FAILED_SIDECAR_NAME}"
+    try:
+        return json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def delete_persisted_accumulator(meeting_id: str) -> None:
     """Remove the in-progress snapshot after successful note generation.
 
@@ -1184,6 +1194,55 @@ def _title_has_hash_token(text: str) -> bool:
     """
     fragments = re.split(r'[^A-Za-z0-9+/=]+', text)
     return any(_HASH_TOKEN_RE.fullmatch(f) for f in fragments if f)
+
+
+_CALENDAR_EVENTS_PATH = Path.home() / ".local" / "share" / "zoom-notes" / "calendar_events.json"
+
+
+def read_calendar_title(transcript_entries: list[dict]) -> str | None:
+    """Return the Apple Calendar event title whose window covers this transcript.
+
+    Reads the sidecar written by CalendarService.swift every 5 minutes.
+    The sidecar contains today's multi-attendee events with HH:MM start/end
+    times. Finds the event whose start <= earliest_transcript_time <= end.
+    When multiple events overlap, prefers the one closest to starting.
+    Returns None if the file is absent or no event matches.
+    """
+    try:
+        raw = json.loads(_CALENDAR_EVENTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    ts_strings = sorted(e.get("timestamp") for e in transcript_entries if e.get("timestamp"))
+    if not ts_strings:
+        return None
+
+    # Earliest transcript entry as HH:MM for comparison against sidecar HH:MM times
+    ref_hhmm = ts_strings[0][:5]  # "HH:MM"
+
+    best_title: str | None = None
+    best_delta: int | None = None  # in minutes, smaller = closer to start of event
+
+    for event in raw:
+        title = event.get("title", "").strip()
+        start = event.get("startDate", "")
+        end = event.get("endDate", "")
+        if not title or len(start) != 5 or len(end) != 5:
+            continue
+        if not (start <= ref_hhmm <= end):
+            continue
+        # delta in minutes from event start to first transcript entry
+        try:
+            sh, sm = int(start[:2]), int(start[3:])
+            rh, rm = int(ref_hhmm[:2]), int(ref_hhmm[3:])
+            delta = (rh * 60 + rm) - (sh * 60 + sm)
+        except ValueError:
+            continue
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best_title = title
+
+    return best_title
 
 
 def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None = None) -> str | None:
