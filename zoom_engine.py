@@ -1654,29 +1654,27 @@ class ZoomEngine:
         return d.hour * 3600 + d.minute * 60 + d.second
 
     def _derive_meeting_title(self, blocks_wal, transcript_wal, entries) -> str:
+        anchor_entries = [e for e in entries if e.get("meeting_id")] or entries
+
+        # Apple Calendar is the most authoritative source — it has the actual
+        # invite name. Try it first. Falls back to None if the sidecar is
+        # absent, stale, or no event window overlaps the transcript.
         meeting_title = None
-        if blocks_wal:
+        try:
+            meeting_title = read_calendar_title(anchor_entries)
+        except Exception:
+            pass
+
+        # WAL title as fallback — Zoom's own title detection. Can produce
+        # speaker names or "Google Calendar Meeting (not synced)" for meetings
+        # where Zoom couldn't read the calendar, but is better than nothing
+        # when no calendar event matched.
+        if not meeting_title and blocks_wal:
             try:
-                # Use only entries with a confirmed meeting_id for the
-                # timestamp anchor passed to parse_meeting_title. No-meeting-id
-                # entries are early WAL pages that may belong to a prior
-                # meeting; including them shifts the reference time backward
-                # and causes the title matcher to snap to the wrong calendar
-                # event. Fall back to all entries only when none have an id.
-                anchor_entries = [e for e in entries if e.get("meeting_id")]
-                meeting_title = parse_meeting_title(blocks_wal, anchor_entries or entries)
+                meeting_title = parse_meeting_title(blocks_wal, anchor_entries)
             except Exception:
                 pass
-        # If the WAL couldn't identify a title (returned None), try Apple
-        # Calendar. CalendarService.swift writes today's events to a JSON
-        # sidecar every 5 minutes; read_calendar_title finds the event whose
-        # time window contains the transcript's earliest entry.
-        if not meeting_title:
-            try:
-                anchor_entries = [e for e in entries if e.get("meeting_id")] or entries
-                meeting_title = read_calendar_title(anchor_entries)
-            except Exception:
-                pass
+
         if not meeting_title:
             mtime = transcript_wal.stat().st_mtime if transcript_wal else time.time()
             meeting_title = f"Zoom Meeting {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}"

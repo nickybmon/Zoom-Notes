@@ -161,11 +161,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     func updateMenuBar() {
         let menu = NSMenu()
         let state = appState.engineState
+        let upcoming = CalendarService.shared.upcomingEvents(withinHours: 4)
+        let nextMeeting = upcoming.first
 
-        // Status header
+        // ── Status header ────────────────────────────────────────────────────
         let statusTitle: String
         switch state {
-        case .idle:       statusTitle = "Idle — waiting for meeting"
+        case .idle:
+            if let next = nextMeeting {
+                statusTitle = next.isNow
+                    ? "\(next.title) — Now"
+                    : "\(next.title) — \(next.startTimeString) (\(next.timeLabel))"
+            } else {
+                statusTitle = "Idle — waiting for meeting"
+            }
         case .active:     statusTitle = "Meeting in progress…"
         case .generating: statusTitle = "Generating notes…"
         case .unknown:    statusTitle = "Engine starting…"
@@ -173,6 +182,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
         statusItem.isEnabled = false
         menu.addItem(statusItem)
+
+        // ── Upcoming meetings ────────────────────────────────────────────────
+        if !upcoming.isEmpty && state == .idle {
+            menu.addItem(.separator())
+
+            // Show up to 4 events; bold/highlight the one happening now
+            for event in upcoming.prefix(4) {
+                let label = event.isNow
+                    ? "\(event.title) — Now"
+                    : "\(event.title) — \(event.startTimeString) (\(event.timeLabel))"
+                let item = NSMenuItem(title: label, action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                if event.isNow {
+                    item.attributedTitle = NSAttributedString(
+                        string: label,
+                        attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)]
+                    )
+                }
+                menu.addItem(item)
+            }
+
+            // Join shortcut — first upcoming event with a Zoom URL
+            if let joinable = upcoming.first(where: { $0.zoomUrl != nil }),
+               let urlStr = joinable.zoomUrl {
+                menu.addItem(.separator())
+                let joinItem = NSMenuItem(
+                    title: "Join: \(joinable.title)",
+                    action: #selector(joinMeeting(_:)),
+                    keyEquivalent: ""
+                )
+                joinItem.representedObject = urlStr
+                joinItem.target = self
+                menu.addItem(joinItem)
+            }
+
+            let refreshItem = NSMenuItem(
+                title: "Refresh Calendar",
+                action: #selector(refreshCalendar),
+                keyEquivalent: ""
+            )
+            refreshItem.target = self
+            menu.addItem(refreshItem)
+        }
 
         menu.addItem(.separator())
 
@@ -301,17 +353,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         menu.items.forEach { $0.target = self }
         statusBarItem?.menu = menu
 
-        // Update icon — image is always doc.text (outlined), tint signals state
+        // Update status bar button — show next meeting name + countdown when idle
         if let button = statusBarItem?.button {
             button.image = menuBarIcon()
             switch state {
             case .idle, .unknown:
                 button.contentTintColor = nil
-                button.toolTip = appState.isEngineRunning ? "Zoom Notes — Idle" : "Zoom Notes — Engine starting…"
+                if let next = nextMeeting, state == .idle {
+                    let label = next.isNow ? "\(next.title) — Now" : "\(next.title) · \(next.timeLabel)"
+                    button.title = "  \(label)"
+                    button.imagePosition = .imageLeft
+                    button.toolTip = next.isNow ? "Zoom Notes — \(next.title)" : "Zoom Notes — Next: \(next.title)"
+                } else {
+                    button.title = ""
+                    button.imagePosition = .imageOnly
+                    button.toolTip = appState.isEngineRunning ? "Zoom Notes — Idle" : "Zoom Notes — Engine starting…"
+                }
             case .active:
+                button.title = ""
+                button.imagePosition = .imageOnly
                 button.contentTintColor = .controlAccentColor
                 button.toolTip = "Zoom Notes — Meeting in progress"
             case .generating:
+                button.title = ""
+                button.imagePosition = .imageOnly
                 button.contentTintColor = .systemOrange
                 button.toolTip = "Zoom Notes — Generating notes…"
             }
@@ -438,6 +503,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
     @objc func openLogs() {
         ConsoleLogger.shared.openTodayLogDirectory()
+    }
+
+    @objc func joinMeeting(_ sender: NSMenuItem) {
+        guard let urlStr = sender.representedObject as? String,
+              let url = URL(string: urlStr) else { return }
+        ConsoleLogger.shared.logUserAction("Join meeting from calendar")
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc func refreshCalendar() {
+        ConsoleLogger.shared.logUserAction("Refresh Calendar")
+        CalendarService.shared.refresh()
+        // Trigger a menu rebuild after a short delay to show updated events
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.updateMenuBar()
+        }
     }
 
     @objc func quitApp() {
