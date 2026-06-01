@@ -184,7 +184,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         menu.addItem(statusItem)
 
         // ── Upcoming meetings ────────────────────────────────────────────────
-        if !upcoming.isEmpty && state == .idle {
+        if !upcoming.isEmpty {
             menu.addItem(.separator())
 
             // Show up to 4 events; bold/highlight the one happening now
