@@ -1209,7 +1209,14 @@ def read_calendar_title(transcript_entries: list[dict]) -> str | None:
     Returns None if the file is absent or no event matches.
     """
     try:
-        raw = json.loads(_CALENDAR_EVENTS_PATH.read_text(encoding="utf-8"))
+        p = _CALENDAR_EVENTS_PATH
+        # Reject a sidecar written on a previous day — its HH:MM times carry
+        # no date, so a stale file would match today's meetings by time overlap
+        # and return a wrong title from a prior day.
+        mtime = datetime.fromtimestamp(p.stat().st_mtime).date()
+        if mtime < datetime.now().date():
+            return None
+        raw = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
 
