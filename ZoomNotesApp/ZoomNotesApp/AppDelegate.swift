@@ -266,23 +266,55 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                     detail.isEnabled = false
                     menu.addItem(detail)
                 }
+
+                let discardItem = NSMenuItem(
+                    title: "Discard",
+                    action: #selector(dismissFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                discardItem.representedObject = rec.meetingId
+                discardItem.target = self
+                menu.addItem(discardItem)
             } else {
                 let parent = NSMenuItem(
-                    title: "Recover unfinished meetings (\(appState.recoverableMeetings.count))",
+                    title: "Unfinished meetings (\(appState.recoverableMeetings.count))",
                     action: nil,
                     keyEquivalent: ""
                 )
                 let submenu = NSMenu()
                 for rec in appState.recoverableMeetings {
-                    let item = NSMenuItem(
+                    let itemParent = NSMenuItem(title: rec.displayLabel, action: nil, keyEquivalent: "")
+                    let itemSubmenu = NSMenu()
+
+                    let recoverAction = NSMenuItem(
                         title: recoverableMenuTitle(for: rec),
                         action: #selector(recoverFromMenu(_:)),
                         keyEquivalent: ""
                     )
-                    item.representedObject = rec.meetingId
-                    item.target = self
-                    submenu.addItem(item)
+                    recoverAction.representedObject = rec.meetingId
+                    recoverAction.target = self
+                    itemSubmenu.addItem(recoverAction)
+
+                    let discardAction = NSMenuItem(
+                        title: "Discard",
+                        action: #selector(dismissFromMenu(_:)),
+                        keyEquivalent: ""
+                    )
+                    discardAction.representedObject = rec.meetingId
+                    discardAction.target = self
+                    itemSubmenu.addItem(discardAction)
+
+                    itemParent.submenu = itemSubmenu
+                    submenu.addItem(itemParent)
                 }
+                submenu.addItem(.separator())
+                let discardAll = NSMenuItem(
+                    title: "Discard All",
+                    action: #selector(dismissAllFromMenu),
+                    keyEquivalent: ""
+                )
+                discardAll.target = self
+                submenu.addItem(discardAll)
                 parent.submenu = submenu
                 menu.addItem(parent)
             }
@@ -347,6 +379,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Open Logs…", action: #selector(openLogs), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Clear Meeting Cache", action: #selector(clearCache), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Zoom Notes", action: #selector(quitApp), keyEquivalent: "q"))
 
@@ -415,6 +448,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         }
         ConsoleLogger.shared.logUserAction("Recover unfinished meeting (\(rec.entryCount) entries, \(rec.location.rawValue))")
         appState.recoverMeeting(rec)
+    }
+
+    @objc func dismissFromMenu(_ sender: NSMenuItem) {
+        guard let mid = sender.representedObject as? String,
+              let rec = appState.recoverableMeetings.first(where: { $0.meetingId == mid }) else {
+            return
+        }
+        ConsoleLogger.shared.logUserAction("Discard unfinished meeting (\(rec.location.rawValue))")
+        appState.dismissMeeting(rec)
+    }
+
+    @objc func dismissAllFromMenu() {
+        ConsoleLogger.shared.logUserAction("Discard all unfinished meetings (\(appState.recoverableMeetings.count))")
+        appState.dismissAllRecoverableMeetings()
+    }
+
+    @objc func clearCache() {
+        ConsoleLogger.shared.logUserAction("Clear meeting cache")
+        appState.clearMeetingCache()
     }
 
     /// The primary clickable label for a recoverable meeting in the menu.

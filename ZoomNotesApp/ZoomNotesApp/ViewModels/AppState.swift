@@ -188,6 +188,12 @@ class AppState: ObservableObject {
             if let mid = event.meetingId, !mid.isEmpty {
                 recoverableMeetings.removeAll { $0.meetingId == mid }
             }
+        case "dismissed":
+            if let mid = event.meetingId, !mid.isEmpty {
+                recoverableMeetings.removeAll { $0.meetingId == mid }
+            }
+        case "cache_cleared":
+            recoverableMeetings.removeAll { $0.location == .root }
         case "note_failed":
             engineState = .idle
             let failure = FailedMeeting(
@@ -230,6 +236,18 @@ class AppState: ObservableObject {
     /// recovery-only telemetry without entangling it with retry.
     func recoverMeeting(_ meeting: RecoverableMeeting) {
         engineManager.sendCommand(["cmd": "recover", "meeting_id": meeting.meetingId])
+    }
+
+    func dismissMeeting(_ meeting: RecoverableMeeting) {
+        engineManager.sendCommand(["cmd": "dismiss", "meeting_id": meeting.meetingId])
+    }
+
+    func dismissAllRecoverableMeetings() {
+        engineManager.sendCommand(["cmd": "dismiss_all"])
+    }
+
+    func clearMeetingCache() {
+        engineManager.sendCommand(["cmd": "clear_cache"])
     }
 
     // MARK: - Notifications

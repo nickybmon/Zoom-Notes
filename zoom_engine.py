@@ -754,17 +754,22 @@ class ZoomEngine:
                             slug = _safe_meeting_id_slug(meeting_id)
                             snap_path = _CACHE_DIR / f"in-progress-{slug}.json"
                             try:
-                                snap_date = datetime.fromtimestamp(
-                                    snap_path.stat().st_mtime
-                                ).date()
-                                is_today = (snap_date == datetime.now().date())
+                                snap_mtime = datetime.fromtimestamp(snap_path.stat().st_mtime)
+                                age_hours = (datetime.now() - snap_mtime).total_seconds() / 3600
+                                is_recent = age_hours < 4
                             except OSError:
-                                is_today = True  # no stat → treat as safe to load
-                            if is_today:
+                                is_recent = True  # no stat → treat as safe to load
+                            if is_recent:
                                 self._accumulated = {
                                     k: v for k, v in persisted.items()
                                     if not v.get("meeting_id") or v.get("meeting_id") == meeting_id
                                 }
+                            else:
+                                # Snapshot is stale (>4 h old) — a prior-day or
+                                # earlier same-day occurrence of a recurring meeting.
+                                # Delete it so the failed/ recovery item (if any) is
+                                # also cleaned up, and start with an empty accumulator.
+                                delete_persisted_accumulator(meeting_id)
                     acc_size = len(self._accumulated)
                 self._emit_diag(
                     "meeting_id_changed",
@@ -1720,6 +1725,31 @@ class ZoomEngine:
                 emit({"event": "error", "message": "recover command requires meeting_id."})
                 return
             self._trigger_retry(meeting_id)
+        elif action == "dismiss":
+            meeting_id = cmd.get("meeting_id") or ""
+            if not meeting_id:
+                emit({"event": "error", "message": "dismiss command requires meeting_id."})
+                return
+            delete_persisted_accumulator(meeting_id)
+            emit({"event": "dismissed", "meeting_id": meeting_id})
+        elif action == "dismiss_all":
+            ids = [r["meeting_id"] for r in self._recoverable_at_startup]
+            for mid in ids:
+                delete_persisted_accumulator(mid)
+                emit({"event": "dismissed", "meeting_id": mid})
+        elif action == "clear_cache":
+            # Delete every in-progress snapshot from the root cache dir.
+            # Leaves failed/ intact — those are deliberate LLM-failure survivors
+            # that the user must explicitly discard via the recovery menu.
+            count = 0
+            if _CACHE_DIR.exists():
+                for p in list(_CACHE_DIR.glob("in-progress-*.json")) + list(_CACHE_DIR.glob("in-progress-*.md")):
+                    try:
+                        p.unlink(missing_ok=True)
+                        count += 1
+                    except OSError:
+                        pass
+            emit({"event": "cache_cleared", "count": count})
 
     # ── Abandoned-meeting auto-generation ───────────────────────────────────
 
