@@ -103,6 +103,7 @@ if [ "$CONFIGURATION" = "Release" ]; then
         -scheme "$SCHEME" \
         -configuration Release \
         -archivePath "$ARCHIVE" \
+        -derivedDataPath "$BUILD_DIR/derived" \
         -destination "generic/platform=macOS" \
         CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
         CODE_SIGN_STYLE=Manual \
