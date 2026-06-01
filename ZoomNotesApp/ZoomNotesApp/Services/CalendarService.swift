@@ -144,9 +144,18 @@ end tell
         else { return [] }
 
         let now = Date()
-        let cutoff = now.addingTimeInterval(Double(hours) * 3600)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
+
+        // Reject a sidecar written on a previous day — its HH:MM times would
+        // be reconstructed relative to today, surfacing old events as upcoming.
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: sidecarURL.path),
+           let mtime = attrs[.modificationDate] as? Date,
+           calendar.startOfDay(for: mtime) < today {
+            return []
+        }
+
+        let cutoff = now.addingTimeInterval(Double(hours) * 3600)
 
         return events.compactMap { e -> UpcomingEvent? in
             guard let start = timeToDate(e.startDate, relativeTo: today),
