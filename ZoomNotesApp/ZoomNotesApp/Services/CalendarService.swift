@@ -70,9 +70,8 @@ class CalendarService: ObservableObject {
 
     func start() {
         let status = EKEventStore.authorizationStatus(for: .event)
+        log("[CalendarService] start() — authorization status: \(status.rawValue)", level: .info)
         if status == .notDetermined {
-            // First launch — request immediately so the system prompt fires
-            // without requiring the user to find Settings → Calendar.
             requestAccess()
         } else {
             updateAuthorizationStatus()
@@ -98,13 +97,17 @@ class CalendarService: ObservableObject {
     /// to the Calendars privacy pane so the user can re-enable it manually.
     func requestAccess(completion: @escaping (Bool) -> Void = { _ in }) {
         let status = EKEventStore.authorizationStatus(for: .event)
+        log("[CalendarService] requestAccess() — status: \(status.rawValue)", level: .info)
         if status == .denied || status == .restricted {
+            log("[CalendarService] Access denied/restricted — opening System Settings", level: .warning)
             openSystemSettings()
             completion(false)
             return
         }
         if #available(macOS 14.0, *) {
-            store.requestFullAccessToEvents { [weak self] granted, _ in
+            log("[CalendarService] Calling requestFullAccessToEvents (macOS 14+)", level: .info)
+            store.requestFullAccessToEvents { [weak self] granted, error in
+                log("[CalendarService] requestFullAccessToEvents result: granted=\(granted), error=\(String(describing: error))", level: .info)
                 DispatchQueue.main.async {
                     self?.updateAuthorizationStatus()
                     if granted { self?.fetchAndWrite() }
@@ -112,7 +115,9 @@ class CalendarService: ObservableObject {
                 }
             }
         } else {
-            store.requestAccess(to: .event) { [weak self] granted, _ in
+            log("[CalendarService] Calling requestAccess (macOS 13)", level: .info)
+            store.requestAccess(to: .event) { [weak self] granted, error in
+                log("[CalendarService] requestAccess result: granted=\(granted), error=\(String(describing: error))", level: .info)
                 DispatchQueue.main.async {
                     self?.updateAuthorizationStatus()
                     if granted { self?.fetchAndWrite() }
