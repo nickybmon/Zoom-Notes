@@ -8,6 +8,7 @@
 
 import SwiftUI
 import AppKit
+import EventKit
 
 // MARK: - Navigation model
 
@@ -21,6 +22,7 @@ private let navItems: [NavItem] = [
     NavItem(id: "llm",      label: "API / LLM",  icon: "brain"),
     NavItem(id: "output",   label: "Output",      icon: "square.and.arrow.up"),
     NavItem(id: "prompt",   label: "Prompt",      icon: "text.quote"),
+    NavItem(id: "calendar", label: "Calendar",    icon: "calendar"),
     NavItem(id: "advanced", label: "Advanced",    icon: "gearshape.2"),
 ]
 
@@ -71,6 +73,7 @@ struct SettingsView: View {
                         case "llm":      LLMTab(vm: vm)
                         case "output":   OutputTab(vm: vm)
                         case "prompt":   PromptTab(vm: vm)
+                        case "calendar": CalendarTab()
                         default:         AdvancedTab(vm: vm)
                         }
                     }
@@ -575,6 +578,82 @@ private struct AdvancedTab: View {
                 }
                 Text("Leave blank to use the provider's default endpoint.")
                     .font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - Calendar Tab
+
+private struct CalendarTab: View {
+    @ObservedObject private var calendarService = CalendarService.shared
+
+    private var statusLabel: String {
+        switch calendarService.authorizationStatus {
+        case .authorized:      return "Access granted"
+        case .denied:          return "Access denied"
+        case .restricted:      return "Restricted by system policy"
+        case .notDetermined:   return "Not requested yet"
+        @unknown default:
+            if #available(macOS 14.0, *), calendarService.authorizationStatus == .fullAccess {
+                return "Access granted"
+            }
+            return "Unknown"
+        }
+    }
+
+    private var statusColor: Color {
+        calendarService.isAuthorized ? .green : .orange
+    }
+
+    private var buttonLabel: String {
+        switch calendarService.authorizationStatus {
+        case .denied, .restricted: return "Open System Settings"
+        case .notDetermined:       return "Grant Calendar Access"
+        default:                   return "Refresh Calendar"
+        }
+    }
+
+    var body: some View {
+        Form {
+            Section("Calendar Access") {
+                HStack {
+                    Image(systemName: calendarService.isAuthorized ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .foregroundColor(statusColor)
+                    Text(statusLabel)
+                    Spacer()
+                    Button(buttonLabel) {
+                        if calendarService.isAuthorized {
+                            calendarService.refresh()
+                        } else {
+                            calendarService.requestAccess()
+                        }
+                    }
+                }
+                Text("Zoom Notes reads Apple Calendar to show upcoming meetings in the menu bar and to name notes correctly when Zoom can't identify the meeting title.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if calendarService.isAuthorized {
+                Section("Upcoming Meetings Preview") {
+                    let events = calendarService.upcomingEvents(withinHours: 8)
+                    if events.isEmpty {
+                        Text("No meetings in the next 8 hours.")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(events, id: \.title) { event in
+                            HStack {
+                                Text(event.title)
+                                Spacer()
+                                Text("\(event.startTimeString) (\(event.timeLabel))")
+                                    .foregroundColor(.secondary)
+                                    .font(.caption)
+                            }
+                        }
+                    }
+                }
             }
         }
         .formStyle(.grouped)

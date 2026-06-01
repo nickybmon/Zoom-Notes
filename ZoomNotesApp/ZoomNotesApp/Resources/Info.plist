@@ -34,9 +34,7 @@
     <string>NSApplication</string>
     <key>NSCalendarsUsageDescription</key>
     <string>Zoom Notes reads your calendar to name meeting notes correctly when Zoom can't identify the meeting title.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Zoom Notes uses Calendar to show upcoming meetings and name notes after the correct meeting title.</string>
-    <key>NSUserNotificationAlertStyle</key>
+<key>NSUserNotificationAlertStyle</key>
     <string>alert</string>
 </dict>
 </plist>
