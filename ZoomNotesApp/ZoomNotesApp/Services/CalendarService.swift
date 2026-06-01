@@ -69,8 +69,15 @@ class CalendarService: ObservableObject {
     // MARK: - Public interface
 
     func start() {
-        updateAuthorizationStatus()
-        if isAuthorized { fetchAndWrite() }
+        let status = EKEventStore.authorizationStatus(for: .event)
+        if status == .notDetermined {
+            // First launch — request immediately so the system prompt fires
+            // without requiring the user to find Settings → Calendar.
+            requestAccess()
+        } else {
+            updateAuthorizationStatus()
+            if isAuthorized { fetchAndWrite() }
+        }
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.updateAuthorizationStatus()
             if self?.isAuthorized == true { self?.fetchAndWrite() }
