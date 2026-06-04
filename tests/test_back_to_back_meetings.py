@@ -621,6 +621,10 @@ class TestBackToBackEndToEnd:
             zoom_engine, "summarize",
             lambda text, title, cfg, cancel_event=None: f"### Summary\n{title}",
         )
+        # generate_title uses zoom_notes.get_api_key (bound at import time, not
+        # affected by the zoom_config patch below). Mock it at the zoom_engine
+        # level so tests with a live Keychain entry don't make real HTTP calls.
+        monkeypatch.setattr(zoom_engine, "generate_title", lambda *a, **kw: None)
         # Skip API key check so the engine doesn't refuse to generate.
         monkeypatch.setattr(
             "zoom_config.get_api_key", lambda provider: "fake-key",

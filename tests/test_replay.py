@@ -99,6 +99,7 @@ class TestReplay:
         # in zoom_engine's namespace because zoom_engine does
         # `from zoom_notes import summarize` at import time.
         with patch.object(zoom_engine, "summarize", return_value="(summary)"), \
+             patch.object(zoom_engine, "generate_title", return_value=None), \
              patch.object(zoom_engine, "find_wal", return_value=fixture_wal_path):
             engine._generate_notes(fake_origin, cfg)
 
@@ -136,6 +137,7 @@ class TestReplay:
             raise RuntimeError("LLM API error 503: server unavailable")
 
         with patch.object(zoom_engine, "summarize", side_effect=boom), \
+             patch.object(zoom_engine, "generate_title", return_value=None), \
              patch.object(zoom_engine, "find_wal", return_value=fixture_wal_path):
             engine._generate_notes(fake_origin, cfg)
 

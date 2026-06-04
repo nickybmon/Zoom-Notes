@@ -1682,6 +1682,132 @@ def summarize(
     raise RuntimeError(f"Unknown LLM provider: {provider!r}")
 
 
+_GENERATE_TITLE_PROMPT = (
+    "Give this meeting a short, descriptive title (5 words or fewer). "
+    "Reply with ONLY the title — no punctuation at the end, no quotes, no explanation."
+)
+
+_TITLE_CLEANUP_RE = re.compile(r"^(?:title|meeting|topic)[\s:–\-]+", re.IGNORECASE)
+
+
+def generate_title(transcript: str, cfg: "ZoomNotesConfig | None" = None) -> str | None:
+    """Ask the LLM for a short meeting title derived from the transcript.
+
+    Called when neither Apple Calendar nor the blocks WAL could supply a
+    title (i.e. the engine would otherwise fall back to "Zoom Meeting …").
+    Returns None on any error so callers degrade gracefully.
+    """
+    if cfg is None:
+        cfg = get_config()
+
+    excerpt = transcript[:3000].strip()
+    if not excerpt:
+        return None
+
+    provider = cfg.llm_provider
+    model = cfg.llm_model
+
+    try:
+        if provider == "claude":
+            api_key = get_api_key("claude")
+            if not api_key:
+                return None
+            api_url = os.environ.get("ZOOM_NOTES_API_URL", "https://api.anthropic.com/v1/messages")
+            payload = {
+                "model": model,
+                "max_tokens": 50,
+                "system": _GENERATE_TITLE_PROMPT,
+                "messages": [{"role": "user", "content": excerpt}],
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                api_url, data=data,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            raw = _http_retry(req, lambda b: b["content"][0]["text"], retries=1)
+
+        elif provider == "openai":
+            api_key = get_api_key("openai")
+            if not api_key:
+                return None
+            payload = {
+                "model": model,
+                "max_tokens": 50,
+                "messages": [
+                    {"role": "system", "content": _GENERATE_TITLE_PROMPT},
+                    {"role": "user", "content": excerpt},
+                ],
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                cfg.openai_base_url, data=data,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            raw = _http_retry(req, lambda b: b["choices"][0]["message"]["content"], retries=1)
+
+        elif provider == "gemini":
+            api_key = get_api_key("gemini")
+            if not api_key:
+                return None
+            url = f"{cfg.gemini_base_url}/{model}:generateContent?key={api_key}"
+            payload = {
+                "system_instruction": {"parts": [{"text": _GENERATE_TITLE_PROMPT}]},
+                "contents": [{"parts": [{"text": excerpt}]}],
+                "generationConfig": {"maxOutputTokens": 50},
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            raw = _http_retry(
+                req,
+                lambda b: b["candidates"][0]["content"]["parts"][0]["text"],
+                retries=1,
+            )
+
+        elif provider == "ollama":
+            url = f"{cfg.ollama_base_url.rstrip('/')}/api/chat"
+            payload = {
+                "model": model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": _GENERATE_TITLE_PROMPT},
+                    {"role": "user", "content": excerpt},
+                ],
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            raw = _http_retry(req, lambda b: b["message"]["content"], retries=1)
+
+        else:
+            return None
+
+    except Exception:
+        return None
+
+    title = raw.strip().strip('"').strip("'").rstrip(".,;:!?")
+    title = _TITLE_CLEANUP_RE.sub("", title).strip()
+    # Reject multi-line responses (model went rogue) or empty results.
+    if not title or "\n" in title or len(title) > 120:
+        return None
+    return title
+
+
 # ── Note Writing ───────────────────────────────────────────────────────────────
 
 def slugify_title(title: str, fallback_date: str | None = None) -> str:

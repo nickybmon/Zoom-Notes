@@ -68,6 +68,7 @@ from zoom_notes import (
     read_calendar_title,
     format_transcript,
     summarize,
+    generate_title,
     build_note_content,
     build_placeholder_note,
     build_transcript_content,
@@ -1255,6 +1256,8 @@ class ZoomEngine:
             })
             return
 
+        cfg = self._get_cfg()
+
         meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
         date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
@@ -1269,7 +1272,16 @@ class ZoomEngine:
         created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         transcript_text = format_transcript(entries)
 
-        cfg = self._get_cfg()
+        # When neither Apple Calendar nor the blocks WAL could supply a title,
+        # _derive_meeting_title falls back to "Zoom Meeting YYYY-MM-DD HH:MM".
+        # Ask the LLM for a short descriptive title instead.
+        if meeting_title.startswith("Zoom Meeting "):
+            ai_title = generate_title(transcript_text, cfg)
+            if ai_title:
+                meeting_title = ai_title
+                date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
+                if not date_match:
+                    date_str = datetime.now().strftime("%Y-%m-%d")
 
         # ── Stage 1: save transcript (durability boundary) ─────────────────
         # Thread `active_meeting_id` through so a same-day same-title
@@ -1869,6 +1881,15 @@ class ZoomEngine:
 
                 created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                 transcript_text = format_transcript(entries)
+
+                if meeting_title.startswith("Zoom Meeting "):
+                    ai_title = generate_title(transcript_text, cfg)
+                    if ai_title:
+                        meeting_title = ai_title
+                        m2 = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
+                        if not m2:
+                            date_str = datetime.now().strftime("%Y-%m-%d")
+
                 slug = slugify_title(meeting_title, fallback_date=date_str)
 
                 self._emit_diag(

@@ -247,6 +247,7 @@ class TestAbandonedGenerationMixedMeetingIds:
 
         seen_summarize = []
         monkeypatch.setattr(ze, "summarize", lambda *a, **kw: seen_summarize.append(1) or "## Overview\n\nOK")
+        monkeypatch.setattr(ze, "generate_title", lambda *a, **kw: None)
         monkeypatch.setattr(ze, "find_origin_dir", lambda: None)
 
         engine = ZoomEngine()
@@ -395,6 +396,7 @@ class TestAbandonedGenerationWorker:
         # _resolve_wal which is fine — _derive_meeting_title falls back
         # to a "Zoom Meeting <date> <time>" label).
         with patch.object(zoom_engine, "summarize", side_effect=fake_summarize), \
+             patch.object(zoom_engine, "generate_title", return_value=None), \
              patch.object(zoom_engine, "find_origin_dir", return_value=fake_origin), \
              patch.object(engine, "_resolve_wal", return_value=None):
             engine._trigger_abandoned_generation("ABANDONED==", snapshot)
@@ -439,6 +441,7 @@ class TestAbandonedGenerationWorker:
             return "## Overview\n\nDone."
 
         with patch.object(zoom_engine, "summarize", side_effect=slow_summarize), \
+             patch.object(zoom_engine, "generate_title", return_value=None), \
              patch.object(zoom_engine, "find_origin_dir", return_value=fake_origin), \
              patch.object(engine, "_resolve_wal", return_value=None):
             engine._trigger_abandoned_generation("ABANDONED==", snapshot)
@@ -494,6 +497,7 @@ class TestAbandonedGenerationWorker:
         snap_b = tagged_snapshot("ABANDONED-B")
 
         with patch.object(zoom_engine, "summarize", side_effect=tracking_summarize), \
+             patch.object(zoom_engine, "generate_title", return_value=None), \
              patch.object(zoom_engine, "find_origin_dir", return_value=fake_origin), \
              patch.object(engine, "_resolve_wal", return_value=None):
             engine._trigger_abandoned_generation("ABANDONED-A==", snap_a)
