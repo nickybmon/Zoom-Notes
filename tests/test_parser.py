@@ -286,6 +286,64 @@ class TestActiveMeetingDetection:
             f"when latest_ts_secs ({13*3600+12*60+31}) > freshness_floor ({FLOOR_SECS})."
         )
 
+    def test_newer_meeting_wins_over_larger_incumbent(self, monkeypatch, tmp_path):
+        """Regression guard for the 2026-06-18 back-to-back mix-up bug.
+
+        When a second meeting starts before the engine goes idle, BOTH the
+        just-ended meeting and the new one are recent AND both have the user as
+        a speaker — so the recency and user bonuses cancel out. Before the fix,
+        raw entry count decided the tie, so the long-running incumbent always
+        won and detection stayed trapped on the just-ended meeting; the new
+        meeting's transcript was filtered out at generation and the old meeting's
+        notes were regenerated.
+
+        With the fix, the meeting with the newest transcript entry (the one
+        actively producing words right now) wins even with far fewer entries.
+        """
+        monkeypatch.setenv("ZOOM_NOTES_USER_NAME", "Nick Blackmon")
+
+        from datetime import datetime
+        now = datetime.now()
+        now_secs = now.hour * 3600 + now.minute * 60 + now.second
+
+        def hms(secs: int) -> str:
+            secs = max(secs, 0)
+            return f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+
+        def entry(text: str, ts_secs: int, mid: str, msg_id: str) -> list[str]:
+            return [
+                "messageId", msg_id,
+                "message", text,
+                "timeStampContent", hms(ts_secs),
+                "timeStampSeconds", "i",
+                "uniqueUserId", "1-0",
+                "username", "Nick Blackmon",
+                "meetingId", mid,
+            ]
+
+        INCUMBENT = "IncumbentStandup+AAAA=="
+        NEW = "NewMeeting+BBBB=="
+
+        lines: list[str] = []
+        # Incumbent: many entries, but its newest entry is ~3 min old.
+        for n in range(20):
+            lines += entry(f"standup line {n}", now_secs - 180, INCUMBENT, f"1:0:{n}:0:0")
+        # New meeting: only a few entries, but its newest entry is ~15 s old.
+        for n in range(3):
+            lines += entry(f"new meeting line {n}", now_secs - 15, NEW, f"2:0:{n}:0:0")
+
+        monkeypatch.setattr(zoom_notes, "read_wal_strings", lambda _path: lines)
+
+        fake_wal = tmp_path / "fake.wal"
+        fake_wal.write_bytes(b"x" * 64)
+
+        result = detect_active_meeting_id(fake_wal)
+        assert result == NEW, (
+            f"Expected the freshly-active meeting {NEW!r} to win despite having "
+            f"fewer entries than the incumbent {INCUMBENT!r}; got {result!r}. "
+            f"The newest-entry tiebreaker must rank above raw entry count."
+        )
+
     def test_old_content_still_excluded_after_generation(self, monkeypatch, tmp_path):
         """The freshness exception must not re-admit checkpoint replays.
 

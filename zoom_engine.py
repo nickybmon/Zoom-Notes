@@ -883,7 +883,32 @@ class ZoomEngine:
                                 pass
                         self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
                         with self._accumulated_lock:
-                            self._accumulated = {}
+                            # Carry forward entries already tagged to the NEW
+                            # meeting — its opening utterances, captured during
+                            # the overlap window while we were still tracking
+                            # the old meeting. Wiping to empty here used to be
+                            # safe only because the next WAL re-parse re-adds
+                            # them; but if a Zoom WAL checkpoint flushes those
+                            # pages between this clear and the next parse, the
+                            # new meeting's opening lines are lost for good
+                            # (they were never persisted — persist_accumulator
+                            # filtered them out under the OLD meeting's slug).
+                            # Keeping only new-id-tagged entries can't reintroduce
+                            # cross-meeting contamination: every carried entry
+                            # explicitly belongs to the meeting we're switching to.
+                            carried = {
+                                k: v for k, v in self._accumulated.items()
+                                if v.get("meeting_id") == meeting_id
+                            }
+                            self._accumulated = carried
+                            acc_carry_size = len(carried)
+                        # Persist the carried opening lines under the NEW slug
+                        # immediately, so they're durable on disk before the
+                        # next change tick rather than living only in memory.
+                        if acc_carry_size:
+                            self._persist_accumulator_now(
+                                meeting_id, reason="case_b_carry_new_meeting",
+                            )
                         self._emit_diag(
                             "meeting_id_changed",
                             from_id=current_tracking_id, to_id=meeting_id,
@@ -891,11 +916,12 @@ class ZoomEngine:
                             abandoned_snapshot_size=len(abandoned_snapshot),
                             strict_snapshot_size=len(strict_snapshot),
                             abandoned_auto_generated=self._abandoned_looks_real(strict_snapshot),
+                            carried_new_meeting_entries=acc_carry_size,
                         )
                         self._set_state(
                             EngineState.ACTIVE,
                             meeting_id=meeting_id,
-                            accumulator_size=0,
+                            accumulator_size=acc_carry_size,
                         )
 
             # Snapshot new entries into the accumulator on every change tick.

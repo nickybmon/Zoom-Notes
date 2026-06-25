@@ -375,16 +375,37 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
 
     scores: dict[str, float] = {}
     for mid, data in meeting_data.items():
-        score = float(data["count"])
-        # Recency bonus must dominate raw entry count — a freshly-started
-        # meeting may only have a handful of entries while a stale one in
-        # the WAL has thousands. Without a large bonus, the stale one wins.
-        if data["has_recent"]:
-            score += 100_000
-        if data["has_user"]:
-            score += 1_000_000
-        scores[mid] = score
+        scores[mid] = _composite_score(data)
     return scores
+
+
+# Lexicographic ranking, highest priority first:
+#   1. has_user        — you are a speaker (strongest signal you attended)
+#   2. has_recent      — any entry within the 30-min recency window
+#   3. latest_ts_secs  — newest entry's wall-clock time (the meeting actively
+#                        producing transcript RIGHT NOW is the live one)
+#   4. count           — raw entry count, last-resort tiebreaker
+#
+# The weights are spaced so each tier strictly dominates every tier below it.
+# This is the 2026-06-18 back-to-back fix: previously two meetings that were
+# both recent AND both had the user (the normal back-to-back case) tied on the
+# top two bonuses, leaving raw `count` to decide — which always favored the
+# long-running incumbent and trapped detection on the just-ended meeting.
+# Ranking by `latest_ts_secs` ahead of `count` lets a freshly-started meeting
+# overtake the incumbent as soon as its newest entry is more recent.
+_SECONDS_IN_DAY = 86_400
+
+
+def _composite_score(data: dict) -> float:
+    score = float(min(data["count"], _SECONDS_IN_DAY - 1))
+    latest = data.get("latest_ts_secs", -1)
+    if latest > 0:
+        score += latest * 1_000_000  # tier above count (count capped < 1e6 effect)
+    if data["has_recent"]:
+        score += 1_000_000_000_000  # 1e12 — above any latest_ts contribution
+    if data["has_user"]:
+        score += 1_000_000_000_000_000  # 1e15 — above everything below
+    return score
 
 
 def score_meeting_ids_detailed(wal_path: Path) -> dict[str, dict]:
@@ -435,12 +456,7 @@ def score_meeting_ids_detailed(wal_path: Path) -> dict[str, dict]:
         i += 1
 
     for mid, data in meeting_data.items():
-        score = float(data["count"])
-        if data["has_recent"]:
-            score += 100_000
-        if data["has_user"]:
-            score += 1_000_000
-        data["score"] = score
+        data["score"] = _composite_score(data)
     return meeting_data
 
 

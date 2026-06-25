@@ -437,12 +437,18 @@ class TestDetectExcludesJustCompletedMeeting:
     _ONLY = "only_one_meeting_id"
 
     def test_exclude_drops_specific_meeting_id(self, tmp_path):
+        # Checkpoint-replay scenario: the just-ended meeting's entries get
+        # re-written to the WAL with their original (recent) timestamps, so its
+        # newest entry (11:32:30) is even fresher than the just-started
+        # meeting's (11:32:08). Under the newest-entry tiebreaker the ended
+        # meeting therefore wins WITHOUT exclusion — which is exactly why the
+        # `exclude_meeting_id` guard still exists: it drops the meeting the
+        # engine already finished generating notes for.
         twal = tmp_path / "transcript.sqlite3-wal"
         self._write_transcript_wal(twal, [
-            (self._ENDED, ["11:01:00", "11:10:00", "11:20:00"]),
+            (self._ENDED, ["11:01:00", "11:10:00", "11:20:00", "11:32:30"]),
             (self._STARTED, ["11:32:08"]),
         ])
-        # Without exclusion the just-ended meeting wins on entry count.
         with patch.object(zoom_notes, "datetime", _ClockAt("2026-04-30 11:33:00")):
             unfiltered = zoom_notes.detect_active_meeting_id(twal)
             assert unfiltered == self._ENDED
