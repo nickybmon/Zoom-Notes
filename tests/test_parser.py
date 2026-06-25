@@ -427,13 +427,24 @@ class TestTitleHashFilter:
 
 
 class TestFindOriginDir:
-    """Phase 1 #5 regression guard.
+    """Phase 1 #5 regression guard, plus the 2026-06-25 bucket-switch fix.
 
     `find_origin_dir` used to return the FIRST matching origin hash, which
     on multi-account / multi-profile Zoom setups could lock onto a stale
     origin whose WAL hasn't been touched in weeks. The fix scores
     candidates by the freshness of their transcript WAL.
+
+    It also used to scan only the hardcoded `UnSigned` WebKit bucket. When
+    Zoom migrates notes storage to a signed-in account bucket (e.g.
+    "oit2v1HSQSi5kic4VLE7kQ"), the engine sat IDLE forever watching the
+    dead `UnSigned` dir. The fix globs every bucket under `WEBKIT_ROOT`.
     """
+
+    def _make_bucket(self, webkit_root, bucket: str):
+        """Create <webkit_root>/<bucket>/Default/MyNotes/Origins and return it."""
+        origins = webkit_root / bucket / "Default" / "MyNotes" / "Origins"
+        origins.mkdir(parents=True, exist_ok=True)
+        return origins
 
     def _make_origin(self, root, name: str, *, wal_mtime: float | None,
                      prefix: str = "1CB477F679D6"):
@@ -456,9 +467,8 @@ class TestFindOriginDir:
         from zoom_notes import find_origin_dir
         import zoom_notes
 
-        origins_root = tmp_path / "Origins"
-        origins_root.mkdir()
-        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", origins_root)
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path)
+        origins_root = self._make_bucket(tmp_path, "UnSigned")
 
         stale = self._make_origin(origins_root, "aaaaa_stale", wal_mtime=1000.0)
         fresh = self._make_origin(origins_root, "bbbbb_fresh", wal_mtime=999_000.0)
@@ -467,15 +477,33 @@ class TestFindOriginDir:
         assert chosen == fresh, \
             f"expected freshest origin {fresh}, got {chosen} (would have been wrong with first-match)"
 
+    def test_picks_fresh_origin_in_signed_in_bucket_over_stale_unsigned(self, tmp_path, monkeypatch):
+        """The 2026-06-25 bug: a stale meeting in the `UnSigned` bucket and a
+        live meeting in a signed-in account bucket. Discovery must cross
+        bucket boundaries and pick the live one."""
+        from zoom_notes import find_origin_dir
+        import zoom_notes
+
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path)
+
+        unsigned = self._make_bucket(tmp_path, "UnSigned")
+        signed_in = self._make_bucket(tmp_path, "oit2v1HSQSi5kic4VLE7kQ")
+
+        self._make_origin(unsigned, "old_account", wal_mtime=1000.0)
+        live = self._make_origin(signed_in, "new_account", wal_mtime=999_000.0)
+
+        chosen = find_origin_dir()
+        assert chosen == live, \
+            f"expected live signed-in origin {live}, got {chosen} (UnSigned-only scan would miss it)"
+
     def test_falls_back_to_first_match_when_no_wal_yet(self, tmp_path, monkeypatch):
         """Fresh install / cold-start: no transcript WAL exists yet. We
         should still return SOMETHING rather than None."""
         from zoom_notes import find_origin_dir
         import zoom_notes
 
-        origins_root = tmp_path / "Origins"
-        origins_root.mkdir()
-        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", origins_root)
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path)
+        origins_root = self._make_bucket(tmp_path, "UnSigned")
 
         # IndexedDB exists but no matching WAL — find_wal returns None
         # for both candidates.
@@ -491,6 +519,5 @@ class TestFindOriginDir:
         from zoom_notes import find_origin_dir
         import zoom_notes
 
-        empty = tmp_path / "DoesNotExist"
-        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", empty)
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path / "DoesNotExist")
         assert find_origin_dir() is None

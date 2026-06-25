@@ -41,33 +41,56 @@ from zoom_config import (
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 ZOOM_BASE = Path.home() / "Library/Application Support/zoom.us/data"
-MY_NOTES_ORIGINS = (
-    ZOOM_BASE
-    / "UnifyWebView_Cache/WebKit/UnSigned/Default/MyNotes/Origins"
-)
+WEBKIT_ROOT = ZOOM_BASE / "UnifyWebView_Cache/WebKit"
+_MY_NOTES_SUFFIX = "Default/MyNotes/Origins"
+
+# Zoom stores AI Notetaker data under a per-profile WebKit *bucket*. When
+# signed out it uses the literal "UnSigned" bucket; once you sign into a Zoom
+# account it migrates to a per-account hashed bucket (e.g.
+# "oit2v1HSQSi5kic4VLE7kQ"). We therefore can't hardcode a single bucket —
+# `find_origin_dir` globs every bucket's MyNotes Origins dir and picks the one
+# Zoom is actively writing. Kept as a constant for the user-facing "not found"
+# error message; it points at the signed-out (default) bucket.
+MY_NOTES_ORIGINS = WEBKIT_ROOT / "UnSigned" / _MY_NOTES_SUFFIX
 
 
 # ── WAL Discovery ──────────────────────────────────────────────────────────────
 
+def _my_notes_origin_roots() -> list[Path]:
+    """Every existing `WebKit/<bucket>/Default/MyNotes/Origins` directory.
+
+    Zoom switches buckets on sign-in / sign-out (and across app upgrades),
+    so we scan every bucket rather than assume `UnSigned`. Returns an empty
+    list when the WebKit root doesn't exist yet.
+    """
+    if not WEBKIT_ROOT.exists():
+        return []
+    roots: list[Path] = []
+    for bucket in WEBKIT_ROOT.iterdir():
+        origins = bucket / _MY_NOTES_SUFFIX
+        if origins.is_dir():
+            roots.append(origins)
+    return roots
+
+
 def find_origin_dir() -> Path | None:
     """Find the docs.zoom.us origin directory (hash-named folder).
 
-    Most users have a single origin hash, but multi-account / multi-profile
-    Zoom setups can leave several behind in `MY_NOTES_ORIGINS`. Prefer the
-    one whose transcript WAL has been modified most recently — the origin
-    whose Zoom is actively writing to it. Fall back to "first match" when
-    no candidate has a transcript WAL yet (cold-start, or after a fresh
-    re-install where Zoom hasn't begun writing).
+    Origins live under one or more WebKit buckets (see
+    `_my_notes_origin_roots`). Most users have a single live origin, but
+    multi-account / multi-profile setups — and the sign-in bucket switch —
+    leave several behind across buckets. Prefer the one whose transcript WAL
+    has been modified most recently — the origin Zoom is actively writing.
+    Fall back to "first match" when no candidate has a transcript WAL yet
+    (cold-start, or after a fresh re-install where Zoom hasn't begun writing).
     """
-    if not MY_NOTES_ORIGINS.exists():
-        return None
-
     candidates: list[Path] = []
-    for top in MY_NOTES_ORIGINS.iterdir():
-        if top.is_dir():
-            nested = top / top.name
-            if (nested / "IndexedDB").exists():
-                candidates.append(nested)
+    for origins_root in _my_notes_origin_roots():
+        for top in origins_root.iterdir():
+            if top.is_dir():
+                nested = top / top.name
+                if (nested / "IndexedDB").exists():
+                    candidates.append(nested)
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -2445,7 +2468,7 @@ def main() -> None:
     if not origin:
         print(
             "Error: Zoom MyNotes directory not found.\n"
-            f"Expected: {MY_NOTES_ORIGINS}",
+            f"Searched every bucket under: {WEBKIT_ROOT}",
             file=sys.stderr,
         )
         sys.exit(1)
