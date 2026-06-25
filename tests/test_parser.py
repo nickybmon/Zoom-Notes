@@ -286,6 +286,64 @@ class TestActiveMeetingDetection:
             f"when latest_ts_secs ({13*3600+12*60+31}) > freshness_floor ({FLOOR_SECS})."
         )
 
+    def test_newer_meeting_wins_over_larger_incumbent(self, monkeypatch, tmp_path):
+        """Regression guard for the 2026-06-18 back-to-back mix-up bug.
+
+        When a second meeting starts before the engine goes idle, BOTH the
+        just-ended meeting and the new one are recent AND both have the user as
+        a speaker — so the recency and user bonuses cancel out. Before the fix,
+        raw entry count decided the tie, so the long-running incumbent always
+        won and detection stayed trapped on the just-ended meeting; the new
+        meeting's transcript was filtered out at generation and the old meeting's
+        notes were regenerated.
+
+        With the fix, the meeting with the newest transcript entry (the one
+        actively producing words right now) wins even with far fewer entries.
+        """
+        monkeypatch.setenv("ZOOM_NOTES_USER_NAME", "Nick Blackmon")
+
+        from datetime import datetime
+        now = datetime.now()
+        now_secs = now.hour * 3600 + now.minute * 60 + now.second
+
+        def hms(secs: int) -> str:
+            secs = max(secs, 0)
+            return f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+
+        def entry(text: str, ts_secs: int, mid: str, msg_id: str) -> list[str]:
+            return [
+                "messageId", msg_id,
+                "message", text,
+                "timeStampContent", hms(ts_secs),
+                "timeStampSeconds", "i",
+                "uniqueUserId", "1-0",
+                "username", "Nick Blackmon",
+                "meetingId", mid,
+            ]
+
+        INCUMBENT = "IncumbentStandup+AAAA=="
+        NEW = "NewMeeting+BBBB=="
+
+        lines: list[str] = []
+        # Incumbent: many entries, but its newest entry is ~3 min old.
+        for n in range(20):
+            lines += entry(f"standup line {n}", now_secs - 180, INCUMBENT, f"1:0:{n}:0:0")
+        # New meeting: only a few entries, but its newest entry is ~15 s old.
+        for n in range(3):
+            lines += entry(f"new meeting line {n}", now_secs - 15, NEW, f"2:0:{n}:0:0")
+
+        monkeypatch.setattr(zoom_notes, "read_wal_strings", lambda _path: lines)
+
+        fake_wal = tmp_path / "fake.wal"
+        fake_wal.write_bytes(b"x" * 64)
+
+        result = detect_active_meeting_id(fake_wal)
+        assert result == NEW, (
+            f"Expected the freshly-active meeting {NEW!r} to win despite having "
+            f"fewer entries than the incumbent {INCUMBENT!r}; got {result!r}. "
+            f"The newest-entry tiebreaker must rank above raw entry count."
+        )
+
     def test_old_content_still_excluded_after_generation(self, monkeypatch, tmp_path):
         """The freshness exception must not re-admit checkpoint replays.
 
@@ -369,13 +427,24 @@ class TestTitleHashFilter:
 
 
 class TestFindOriginDir:
-    """Phase 1 #5 regression guard.
+    """Phase 1 #5 regression guard, plus the 2026-06-25 bucket-switch fix.
 
     `find_origin_dir` used to return the FIRST matching origin hash, which
     on multi-account / multi-profile Zoom setups could lock onto a stale
     origin whose WAL hasn't been touched in weeks. The fix scores
     candidates by the freshness of their transcript WAL.
+
+    It also used to scan only the hardcoded `UnSigned` WebKit bucket. When
+    Zoom migrates notes storage to a signed-in account bucket (e.g.
+    "oit2v1HSQSi5kic4VLE7kQ"), the engine sat IDLE forever watching the
+    dead `UnSigned` dir. The fix globs every bucket under `WEBKIT_ROOT`.
     """
+
+    def _make_bucket(self, webkit_root, bucket: str):
+        """Create <webkit_root>/<bucket>/Default/MyNotes/Origins and return it."""
+        origins = webkit_root / bucket / "Default" / "MyNotes" / "Origins"
+        origins.mkdir(parents=True, exist_ok=True)
+        return origins
 
     def _make_origin(self, root, name: str, *, wal_mtime: float | None,
                      prefix: str = "1CB477F679D6"):
@@ -398,9 +467,8 @@ class TestFindOriginDir:
         from zoom_notes import find_origin_dir
         import zoom_notes
 
-        origins_root = tmp_path / "Origins"
-        origins_root.mkdir()
-        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", origins_root)
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path)
+        origins_root = self._make_bucket(tmp_path, "UnSigned")
 
         stale = self._make_origin(origins_root, "aaaaa_stale", wal_mtime=1000.0)
         fresh = self._make_origin(origins_root, "bbbbb_fresh", wal_mtime=999_000.0)
@@ -409,15 +477,33 @@ class TestFindOriginDir:
         assert chosen == fresh, \
             f"expected freshest origin {fresh}, got {chosen} (would have been wrong with first-match)"
 
+    def test_picks_fresh_origin_in_signed_in_bucket_over_stale_unsigned(self, tmp_path, monkeypatch):
+        """The 2026-06-25 bug: a stale meeting in the `UnSigned` bucket and a
+        live meeting in a signed-in account bucket. Discovery must cross
+        bucket boundaries and pick the live one."""
+        from zoom_notes import find_origin_dir
+        import zoom_notes
+
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path)
+
+        unsigned = self._make_bucket(tmp_path, "UnSigned")
+        signed_in = self._make_bucket(tmp_path, "oit2v1HSQSi5kic4VLE7kQ")
+
+        self._make_origin(unsigned, "old_account", wal_mtime=1000.0)
+        live = self._make_origin(signed_in, "new_account", wal_mtime=999_000.0)
+
+        chosen = find_origin_dir()
+        assert chosen == live, \
+            f"expected live signed-in origin {live}, got {chosen} (UnSigned-only scan would miss it)"
+
     def test_falls_back_to_first_match_when_no_wal_yet(self, tmp_path, monkeypatch):
         """Fresh install / cold-start: no transcript WAL exists yet. We
         should still return SOMETHING rather than None."""
         from zoom_notes import find_origin_dir
         import zoom_notes
 
-        origins_root = tmp_path / "Origins"
-        origins_root.mkdir()
-        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", origins_root)
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path)
+        origins_root = self._make_bucket(tmp_path, "UnSigned")
 
         # IndexedDB exists but no matching WAL — find_wal returns None
         # for both candidates.
@@ -433,6 +519,5 @@ class TestFindOriginDir:
         from zoom_notes import find_origin_dir
         import zoom_notes
 
-        empty = tmp_path / "DoesNotExist"
-        monkeypatch.setattr(zoom_notes, "MY_NOTES_ORIGINS", empty)
+        monkeypatch.setattr(zoom_notes, "WEBKIT_ROOT", tmp_path / "DoesNotExist")
         assert find_origin_dir() is None

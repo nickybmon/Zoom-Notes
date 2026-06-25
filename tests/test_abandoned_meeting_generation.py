@@ -325,6 +325,79 @@ class TestCaseBDispatch:
             f"new meeting's accumulator polluted with abandoned data: {ids_after}"
         )
 
+    def test_case_b_carries_forward_new_meetings_opening_lines(
+        self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
+    ):
+        """The 2026-06-18 data-loss fix: when Case B switches to meeting B, the
+        opening lines of B already captured during the overlap window (while
+        tracking was still on A) must be carried forward and persisted to disk
+        — NOT wiped to empty. Wiping was only safe because the next WAL parse
+        re-adds them; if a Zoom checkpoint flushes the WAL in that window
+        (simulated here by an empty parse on the switch tick), the old behavior
+        lost B's opening utterances permanently.
+        """
+        engine = ZoomEngine()
+        cfg = engine._get_cfg()
+
+        # Anchor + populate meeting A.
+        _drive_tick(
+            engine, fake_origin, cfg, wal=synthetic_wal,
+            mtime=1000.0, size=4096, entries=[],
+            detected_meeting_id="MEETING-A==",
+        )
+        a_entries = list(_make_realistic_accumulator("MEETING-A==", count=6).values())
+        _drive_tick(
+            engine, fake_origin, cfg, wal=synthetic_wal,
+            mtime=1005.0, size=8192, entries=a_entries,
+            detected_meeting_id="MEETING-A==",
+        )
+
+        # Overlap tick: B's opening lines appear in the WAL while detection
+        # still scores A as active. They accumulate tagged to B.
+        b_entries = [
+            _make_entry(f"b-{i}", f"new meeting opening line {i}",
+                        meeting_id="MEETING-B==", speaker="Dave",
+                        timestamp=f"14:0{i}:00")
+            for i in range(3)
+        ]
+        _drive_tick(
+            engine, fake_origin, cfg, wal=synthetic_wal,
+            mtime=1010.0, size=12288, entries=a_entries + b_entries,
+            detected_meeting_id="MEETING-A==",
+        )
+        with engine._accumulated_lock:
+            b_in_acc = [e for e in engine._accumulated.values()
+                        if e.get("meeting_id") == "MEETING-B=="]
+        assert len(b_in_acc) == 3, "fixture sanity: B's opening lines must be present pre-switch"
+
+        # Switch tick: detection flips to B, AND the WAL has been checkpointed
+        # (empty parse) so B's opening lines are NO LONGER recoverable from the
+        # WAL. Patch abandoned-generation so we don't hit the network.
+        with patch.object(ZoomEngine, "_trigger_abandoned_generation"):
+            _drive_tick(
+                engine, fake_origin, cfg, wal=synthetic_wal,
+                mtime=1015.0, size=16384, entries=[],
+                detected_meeting_id="MEETING-B==",
+            )
+
+        # B's opening lines survived in memory (carried, not wiped).
+        with engine._accumulated_lock:
+            ids_after = {e.get("meeting_id") for e in engine._accumulated.values()}
+            carried = [e for e in engine._accumulated.values()
+                       if e.get("meeting_id") == "MEETING-B=="]
+        assert ids_after == {"MEETING-B=="}, f"unexpected accumulator ids: {ids_after}"
+        assert len(carried) == 3, (
+            "B's opening lines were lost on the Case B switch — they should "
+            "have been carried forward when the WAL parse came back empty."
+        )
+
+        # And they were persisted to disk under B's slug (durable before the
+        # next change tick).
+        persisted = zoom_notes.load_persisted_accumulator("MEETING-B==")
+        assert persisted is not None and len(persisted) == 3, (
+            f"B's opening lines not persisted under its own slug: {persisted!r}"
+        )
+
     def test_case_b_skips_generation_when_below_threshold(
         self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
     ):

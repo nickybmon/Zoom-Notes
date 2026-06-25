@@ -41,33 +41,56 @@ from zoom_config import (
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 ZOOM_BASE = Path.home() / "Library/Application Support/zoom.us/data"
-MY_NOTES_ORIGINS = (
-    ZOOM_BASE
-    / "UnifyWebView_Cache/WebKit/UnSigned/Default/MyNotes/Origins"
-)
+WEBKIT_ROOT = ZOOM_BASE / "UnifyWebView_Cache/WebKit"
+_MY_NOTES_SUFFIX = "Default/MyNotes/Origins"
+
+# Zoom stores AI Notetaker data under a per-profile WebKit *bucket*. When
+# signed out it uses the literal "UnSigned" bucket; once you sign into a Zoom
+# account it migrates to a per-account hashed bucket (e.g.
+# "oit2v1HSQSi5kic4VLE7kQ"). We therefore can't hardcode a single bucket —
+# `find_origin_dir` globs every bucket's MyNotes Origins dir and picks the one
+# Zoom is actively writing. Kept as a constant for the user-facing "not found"
+# error message; it points at the signed-out (default) bucket.
+MY_NOTES_ORIGINS = WEBKIT_ROOT / "UnSigned" / _MY_NOTES_SUFFIX
 
 
 # ── WAL Discovery ──────────────────────────────────────────────────────────────
 
+def _my_notes_origin_roots() -> list[Path]:
+    """Every existing `WebKit/<bucket>/Default/MyNotes/Origins` directory.
+
+    Zoom switches buckets on sign-in / sign-out (and across app upgrades),
+    so we scan every bucket rather than assume `UnSigned`. Returns an empty
+    list when the WebKit root doesn't exist yet.
+    """
+    if not WEBKIT_ROOT.exists():
+        return []
+    roots: list[Path] = []
+    for bucket in WEBKIT_ROOT.iterdir():
+        origins = bucket / _MY_NOTES_SUFFIX
+        if origins.is_dir():
+            roots.append(origins)
+    return roots
+
+
 def find_origin_dir() -> Path | None:
     """Find the docs.zoom.us origin directory (hash-named folder).
 
-    Most users have a single origin hash, but multi-account / multi-profile
-    Zoom setups can leave several behind in `MY_NOTES_ORIGINS`. Prefer the
-    one whose transcript WAL has been modified most recently — the origin
-    whose Zoom is actively writing to it. Fall back to "first match" when
-    no candidate has a transcript WAL yet (cold-start, or after a fresh
-    re-install where Zoom hasn't begun writing).
+    Origins live under one or more WebKit buckets (see
+    `_my_notes_origin_roots`). Most users have a single live origin, but
+    multi-account / multi-profile setups — and the sign-in bucket switch —
+    leave several behind across buckets. Prefer the one whose transcript WAL
+    has been modified most recently — the origin Zoom is actively writing.
+    Fall back to "first match" when no candidate has a transcript WAL yet
+    (cold-start, or after a fresh re-install where Zoom hasn't begun writing).
     """
-    if not MY_NOTES_ORIGINS.exists():
-        return None
-
     candidates: list[Path] = []
-    for top in MY_NOTES_ORIGINS.iterdir():
-        if top.is_dir():
-            nested = top / top.name
-            if (nested / "IndexedDB").exists():
-                candidates.append(nested)
+    for origins_root in _my_notes_origin_roots():
+        for top in origins_root.iterdir():
+            if top.is_dir():
+                nested = top / top.name
+                if (nested / "IndexedDB").exists():
+                    candidates.append(nested)
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -375,16 +398,37 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
 
     scores: dict[str, float] = {}
     for mid, data in meeting_data.items():
-        score = float(data["count"])
-        # Recency bonus must dominate raw entry count — a freshly-started
-        # meeting may only have a handful of entries while a stale one in
-        # the WAL has thousands. Without a large bonus, the stale one wins.
-        if data["has_recent"]:
-            score += 100_000
-        if data["has_user"]:
-            score += 1_000_000
-        scores[mid] = score
+        scores[mid] = _composite_score(data)
     return scores
+
+
+# Lexicographic ranking, highest priority first:
+#   1. has_user        — you are a speaker (strongest signal you attended)
+#   2. has_recent      — any entry within the 30-min recency window
+#   3. latest_ts_secs  — newest entry's wall-clock time (the meeting actively
+#                        producing transcript RIGHT NOW is the live one)
+#   4. count           — raw entry count, last-resort tiebreaker
+#
+# The weights are spaced so each tier strictly dominates every tier below it.
+# This is the 2026-06-18 back-to-back fix: previously two meetings that were
+# both recent AND both had the user (the normal back-to-back case) tied on the
+# top two bonuses, leaving raw `count` to decide — which always favored the
+# long-running incumbent and trapped detection on the just-ended meeting.
+# Ranking by `latest_ts_secs` ahead of `count` lets a freshly-started meeting
+# overtake the incumbent as soon as its newest entry is more recent.
+_SECONDS_IN_DAY = 86_400
+
+
+def _composite_score(data: dict) -> float:
+    score = float(min(data["count"], _SECONDS_IN_DAY - 1))
+    latest = data.get("latest_ts_secs", -1)
+    if latest > 0:
+        score += latest * 1_000_000  # tier above count (count capped < 1e6 effect)
+    if data["has_recent"]:
+        score += 1_000_000_000_000  # 1e12 — above any latest_ts contribution
+    if data["has_user"]:
+        score += 1_000_000_000_000_000  # 1e15 — above everything below
+    return score
 
 
 def score_meeting_ids_detailed(wal_path: Path) -> dict[str, dict]:
@@ -435,12 +479,7 @@ def score_meeting_ids_detailed(wal_path: Path) -> dict[str, dict]:
         i += 1
 
     for mid, data in meeting_data.items():
-        score = float(data["count"])
-        if data["has_recent"]:
-            score += 100_000
-        if data["has_user"]:
-            score += 1_000_000
-        data["score"] = score
+        data["score"] = _composite_score(data)
     return meeting_data
 
 
@@ -2429,7 +2468,7 @@ def main() -> None:
     if not origin:
         print(
             "Error: Zoom MyNotes directory not found.\n"
-            f"Expected: {MY_NOTES_ORIGINS}",
+            f"Searched every bucket under: {WEBKIT_ROOT}",
             file=sys.stderr,
         )
         sys.exit(1)

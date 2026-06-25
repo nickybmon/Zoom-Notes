@@ -274,7 +274,17 @@ class EngineManager: ObservableObject {
             }
             return
         }
-        log("[Engine] event=\(event.event) value=\(event.value ?? "-")", level: .debug)
+        if event.event == "diag" {
+            // diag detail lives in fields beyond `value` (kind, from_id,
+            // to_id, reason, scores, …). Log the full raw payload so
+            // post-mortem investigation of meeting-switch decisions actually
+            // has the data — `event=diag value=-` was useless on its own.
+            let raw = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            log("[Engine] \(raw)", level: .debug)
+        } else {
+            log("[Engine] event=\(event.event) value=\(event.value ?? "-")", level: .debug)
+        }
         DispatchQueue.main.async {
             self.eventPublisher.send(event)
         }
