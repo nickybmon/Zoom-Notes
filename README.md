@@ -207,7 +207,7 @@ These commands read the same `settings.json` and Keychain entries the menu bar a
 
 - **Zoom updates may break this.** The WAL path and DB structure are internal implementation details — no stability guarantee. If detection stops working, update the WAL prefixes in Settings → Advanced.
 - After a meeting ends, Zoom checkpoints the WAL (deleting or shrinking it). The engine handles this by persisting accumulated transcript entries to `~/.cache/zoom-notes/` on every tick — notes are not lost even if the WAL disappears before the idle threshold fires.
-- The `<hash>` folder name appears stable per Zoom account but could change on re-login or app update. Run `python3 zoom_notes.py --list` to verify the path.
+- Zoom stores notes under a per-profile WebView *bucket* (`UnSigned` when signed out, a per-account hash like `oit2v1HSQSi5kic4VLE7kQ` once you sign in) plus per-account `<hash>` folders inside it. Both change on sign-in/sign-out and app updates. The engine scans **every** bucket and picks the one Zoom is actively writing, so this is handled automatically — but if detection ever stops, run `python3 zoom_notes.py --list` to verify the resolved path.
 - Transcription accuracy depends on Zoom's server-side ASR, not local processing.
 
 ---
