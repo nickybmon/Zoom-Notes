@@ -101,6 +101,28 @@ def _make_entry(msg_id: str, text: str, *, meeting_id: str, speaker: str = "Test
     }
 
 
+def _freeze_engine_now(hour: int, minute: int = 0, second: int = 0):
+    """Patch `zoom_engine.datetime` so its `.now()` returns real-today at the
+    given wall-clock time.
+
+    `_recover_active_meeting_id` rejects accumulator entries whose HH:MM:SS is
+    more than 5 minutes ahead of `datetime.now()` (the guard against stale WAL
+    timestamps that are hours ahead of the current session). Tests that hardcode
+    entry timestamps must pin "now" to a time just after those entries, or they
+    pass only when the suite happens to run late enough in the day. Subclassing
+    datetime keeps fromtimestamp/replace/strftime intact for the rest of the
+    engine's clock math. Returns a `patch.object` context manager.
+    """
+    fixed = datetime.now().replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+    class _FrozenNow(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    return patch.object(zoom_engine, "datetime", _FrozenNow)
+
+
 def _set_wal_size(wal: Path, size: int) -> None:
     with open(wal, "r+b") as f:
         f.truncate(size)
@@ -533,10 +555,14 @@ class TestCollectEntriesSelfHealing:
                                      meeting_id="anna_old_yesterday",
                                      speaker="Anna", timestamp="13:07:23"),
             }
-        entries, recovered_id = engine._collect_entries_for_generation(
-            transcript_wal=None,
-            active_meeting_id="just_ended_standup",  # WRONG id
-        )
+        # Pin "now" to 11:34 — just after Marc's entries — so they read as
+        # recent in-session rather than tripping the future guard when the
+        # suite runs early in the day.
+        with _freeze_engine_now(11, 34):
+            entries, recovered_id = engine._collect_entries_for_generation(
+                transcript_wal=None,
+                active_meeting_id="just_ended_standup",  # WRONG id
+            )
         assert recovered_id == "marc_meeting", (
             "self-heal must recover the correct id when tracking is wrong"
         )
@@ -581,20 +607,19 @@ class TestCollectEntriesSelfHealing:
                                       meeting_id="bob_old",
                                       timestamp="08:00:00"),  # also pre-session
             }
-        entries, recovered_id = engine._collect_entries_for_generation(
-            transcript_wal=None, active_meeting_id="something_we_thought",
-        )
-        # Anna is "future" relative to wall-clock 11:30 and so passes the
-        # session_floor check, BUT her id wasn't excluded — the recovery
-        # picks the most-common id whose latest_ts >= session_floor. 13:07
-        # is >= 11:30, so anna_old qualifies.
-        # This is fine: in a real session the engine would also have set
-        # an exclude id for `something_we_thought`, but the recovery
-        # function itself doesn't enforce that — it just answers
-        # "given the accumulator, what id is most plausibly the active
-        # meeting?". Test fixes this contract.
+        # Pin "now" to 13:10 — just after Anna's 13:07 entry — so her
+        # timestamp reads as a recent in-session entry rather than being
+        # rejected by the >now+5min "stale future" guard.
+        with _freeze_engine_now(13, 10):
+            entries, recovered_id = engine._collect_entries_for_generation(
+                transcript_wal=None, active_meeting_id="something_we_thought",
+            )
+        # Recovery picks the most-common id whose latest_ts is in the session
+        # window [11:30, now+5min]. Anna's 13:07 qualifies; the recovery
+        # function answers "given the accumulator, what id is most plausibly
+        # the active meeting?" without enforcing an exclude id of its own.
         assert recovered_id == "anna_old"
-        # Bob is filtered (08:00:00 < 11:30:00).
+        # Bob is filtered (08:00:00 < 11:30:00 session floor).
         assert all(e["meeting_id"] == "anna_old" for e in entries)
 
 
@@ -1072,10 +1097,12 @@ class TestCollectEntriesSelfHealWhenEmpty:
                                      timestamp="14:33:03"),
             }
         # Simulate the actual failure mode: active_meeting_id is '' (the
-        # empty string), not the right id.
-        entries, recovered_id = engine._collect_entries_for_generation(
-            transcript_wal=None, active_meeting_id="",
-        )
+        # empty string), not the right id. Pin "now" to 14:35 — just after the
+        # Brand Team entries — so they aren't rejected by the future guard.
+        with _freeze_engine_now(14, 35):
+            entries, recovered_id = engine._collect_entries_for_generation(
+                transcript_wal=None, active_meeting_id="",
+            )
         assert recovered_id == "brand_team_id_AA", (
             "self-heal must recover the right id when active_meeting_id "
             "was empty and the accumulator has cross-meeting content"
