@@ -131,6 +131,21 @@ _PERIODIC_PERSIST_TICKS = 6
 # without truncating the log. Treat <50% of last_size as a truncate signal.
 _TRUNCATE_RATIO = 0.5
 
+# How long a `_last_completed_boundary` stays in force. The boundary exists
+# only to stop the JUST-ended meeting (whose WAL data lingers for a few
+# minutes after it ends) from being re-detected as the next active meeting.
+# That is a minutes-long concern. But the freshness_floor it carries is a
+# date-less seconds-since-midnight value, and this app runs 24/7 as a menu
+# bar process — so a boundary set by yesterday afternoon's meeting (floor
+# ~5pm) survives into this morning and wrongly filters out today's 9am
+# meeting (whose timestamps are numerically < the stale floor). Detection
+# then returns None on every tick, the empty tracked id never upgrades, the
+# boundary never clears, and back-to-back meetings pile into one bucket until
+# the user manually generates. Expiring the boundary breaks that deadlock:
+# 1h is generous for the legitimate purpose yet guarantees no overnight bleed.
+# See the 2026-07-02 Brand Studio Crit incident.
+_BOUNDARY_EXPIRY_SECS = 60 * 60
+
 
 class ZoomEngine:
     def __init__(self):
@@ -171,7 +186,11 @@ class ZoomEngine:
         # `_last_generated_session`: the fingerprint there guards against
         # re-summarizing the same checkpoint, this guards against picking
         # up the wrong meeting when a NEW one starts immediately after.
-        self._last_completed_boundary: tuple[str, int] | None = None
+        # Shape: (meeting_id, freshness_floor_secs, set_at_epoch). The third
+        # element stamps when the boundary was recorded so `_active_boundary`
+        # can expire it (see _BOUNDARY_EXPIRY_SECS) — a stale boundary would
+        # otherwise permanently suppress detection of a later/next-day meeting.
+        self._last_completed_boundary: tuple[str, int, float] | None = None
 
         # Set by _generate_notes when it writes a placeholder note instead of
         # a final note. Read by the worker so it knows to keep the persisted
@@ -324,6 +343,33 @@ class ZoomEngine:
                 if secs > latest:
                     latest = secs
         return latest if latest >= 0 else None
+
+    def _active_boundary(self) -> tuple[str, int, float] | None:
+        """Return `_last_completed_boundary` if still in force, else clear it.
+
+        The boundary carries a date-less seconds-since-midnight freshness
+        floor whose only legitimate job is to keep the just-ended meeting from
+        being re-detected in the minutes after it ends. Because this app runs
+        for days as a menu-bar process, a boundary can otherwise outlive its
+        purpose and — once its clock time is no longer comparable to a later
+        or next-day meeting's timestamps — permanently suppress detection.
+        Expiring it after `_BOUNDARY_EXPIRY_SECS` breaks that deadlock
+        (2026-07-02 Brand Studio Crit incident).
+        """
+        boundary = self._last_completed_boundary
+        if boundary is None:
+            return None
+        set_at = boundary[2]
+        if time.time() - set_at > _BOUNDARY_EXPIRY_SECS:
+            self._last_completed_boundary = None
+            self._emit_diag(
+                "boundary_expired",
+                meeting_id=boundary[0],
+                freshness_floor=boundary[1],
+                age_secs=int(time.time() - set_at),
+            )
+            return None
+        return boundary
 
     def _write_tracking(self, *, mtime=..., size=..., active_ts=..., meeting_id=..., session_mtime=...):
         with self._tracking_lock:
@@ -696,8 +742,10 @@ class ZoomEngine:
             )
             exclude_id = None
             freshness_floor = None
-            if apply_boundary and self._last_completed_boundary is not None:
-                exclude_id, freshness_floor = self._last_completed_boundary
+            if apply_boundary:
+                boundary = self._active_boundary()
+                if boundary is not None:
+                    exclude_id, freshness_floor, _ = boundary
             try:
                 meeting_id = detect_active_meeting_id(
                     wal,
@@ -706,6 +754,16 @@ class ZoomEngine:
                 )
             except Exception:
                 meeting_id = None
+
+            # Observability for the empty-tracking deadlock: if we're ACTIVE
+            # with no tracked id and detection still can't name a meeting,
+            # surface it — this is the state where back-to-back meetings merge.
+            if state == EngineState.ACTIVE and tracking_is_empty and not meeting_id:
+                self._emit_diag(
+                    "active_empty_no_detection",
+                    exclude_id=exclude_id or "",
+                    freshness_floor=freshness_floor if freshness_floor is not None else -1,
+                )
 
             # Blocked-meeting guard: if the detected meeting_id is in the
             # user's block list, refuse the transition entirely and stay IDLE.
@@ -1168,7 +1226,9 @@ class ZoomEngine:
                 if processing_meeting_id:
                     latest = self._latest_acc_ts_secs_for(processing_meeting_id)
                     if latest is not None:
-                        self._last_completed_boundary = (processing_meeting_id, latest)
+                        self._last_completed_boundary = (
+                            processing_meeting_id, latest, time.time(),
+                        )
                 # Clean up the in-memory accumulator. Keep the persisted
                 # disk snapshot if note generation failed — it's the source
                 # of truth for the retry flow.
@@ -1666,7 +1726,7 @@ class ZoomEngine:
         # The boundary check mirrors detect_active_meeting_id: don't re-select
         # a meeting we just finished generating notes for.
         _FUTURE_BUF_R = 5 * 60
-        boundary = self._last_completed_boundary  # (exc_id, freshness_floor) or None
+        boundary = self._active_boundary()  # (exc_id, floor, set_at) or None
 
         eligible = []
         for mid in counts:
@@ -1676,7 +1736,7 @@ class ZoomEngine:
             if ts_secs > _now_secs_r + _FUTURE_BUF_R:
                 continue  # timestamp is impossibly far in the future → stale
             if boundary is not None:
-                exc_id, exc_floor = boundary
+                exc_id, exc_floor, _ = boundary
                 if mid == exc_id and ts_secs <= exc_floor:
                     continue  # stale WAL data from the session we just finished
             eligible.append(mid)
@@ -2032,7 +2092,9 @@ class ZoomEngine:
                     except (ValueError, AttributeError):
                         continue
                 if latest_ts_secs >= 0:
-                    self._last_completed_boundary = (meeting_id, latest_ts_secs)
+                    self._last_completed_boundary = (
+                        meeting_id, latest_ts_secs, time.time(),
+                    )
 
                 # Cleanup persisted snapshot — the note is now safe on disk.
                 delete_persisted_accumulator(meeting_id)

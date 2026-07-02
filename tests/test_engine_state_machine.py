@@ -6,6 +6,7 @@ parser. These tests are the regression guard for that class of bug.
 """
 import os
 import shutil
+import time
 from unittest.mock import patch
 
 import pytest
@@ -439,4 +440,85 @@ class TestBlockedMeetingIds:
 
         assert engine._get_state() == EngineState.ACTIVE, (
             "a non-blocked meeting_id must still trigger IDLE→ACTIVE"
+        )
+
+
+class TestBoundaryExpiry:
+    """Regression guard for the 2026-07-02 back-to-back deadlock.
+
+    `_last_completed_boundary` carries a date-less seconds-since-midnight
+    freshness floor. Because the app runs 24/7 as a menu-bar process, a
+    boundary set by an earlier/previous-day meeting could outlive its purpose
+    and permanently suppress detection of a later meeting whose timestamps are
+    numerically below the stale floor — detection returned None every tick,
+    the empty tracked id never upgraded, and back-to-back meetings merged into
+    one note. The fix expires the boundary after `_BOUNDARY_EXPIRY_SECS`.
+    """
+
+    def test_active_boundary_expires_stale_entry(self):
+        engine = ZoomEngine()
+        # Boundary older than the expiry window → dropped and cleared.
+        engine._last_completed_boundary = (
+            "OLD_MEETING_ID_xxxxxxxx==", 60000,
+            time.time() - (zoom_engine._BOUNDARY_EXPIRY_SECS + 60),
+        )
+        assert engine._active_boundary() is None
+        assert engine._last_completed_boundary is None
+
+    def test_active_boundary_keeps_fresh_entry(self):
+        engine = ZoomEngine()
+        fresh = ("RECENT_MEETING_xxxxxxxx==", 34200, time.time())
+        engine._last_completed_boundary = fresh
+        assert engine._active_boundary() == fresh
+        assert engine._last_completed_boundary == fresh
+
+    def _make_cfg(self):
+        engine = ZoomEngine()
+        return engine._get_cfg()
+
+    def test_stale_boundary_not_passed_to_detection(self, fake_origin, tmp_path, isolated_cache):
+        """A stale boundary must NOT be handed to detect_active_meeting_id —
+        otherwise its floor filters out the genuinely-new meeting and tracking
+        stays empty forever."""
+        wal = tmp_path / "stale-boundary.sqlite3-wal"
+        wal.write_bytes(b"x" * 1024)
+        engine = ZoomEngine()
+        cfg = self._make_cfg()
+        new_id = "NEW9amMeeting_xxxxxxxxxx=="
+
+        # A boundary left over from a meeting hours ago, with a floor (16:40 =
+        # 60000s) numerically ABOVE this morning meeting's timestamps.
+        engine._last_completed_boundary = (
+            "PRIOR_MEETING_xxxxxxxxxx==", 60000,
+            time.time() - (zoom_engine._BOUNDARY_EXPIRY_SECS + 60),
+        )
+
+        seen = []
+
+        def rec_detect(wal_path, *, exclude_meeting_id=None, freshness_floor_secs=None):
+            seen.append((exclude_meeting_id, freshness_floor_secs))
+            return new_id
+
+        size = wal.stat().st_size
+        # Tick 1: anchor (IDLE).
+        os.utime(wal, (1000.0, 1000.0))
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "detect_active_meeting_id", side_effect=rec_detect):
+            engine._poll_once(fake_origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+
+        # Tick 2: size changed → detect runs, boundary should already be expired.
+        wal.write_bytes(b"x" * (size + 1))
+        os.utime(wal, (1005.0, 1005.0))
+        with patch.object(zoom_engine, "find_wal", return_value=wal), \
+             patch.object(zoom_engine, "detect_active_meeting_id", side_effect=rec_detect):
+            engine._poll_once(fake_origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+
+        assert seen, "detect_active_meeting_id was never called"
+        # The last detection call must have been made with NO stale floor.
+        assert seen[-1] == (None, None), (
+            f"stale boundary leaked into detection: {seen[-1]}"
+        )
+        assert engine._get_state() == EngineState.ACTIVE
+        assert engine._read_tracking()[3] == new_id, (
+            "engine failed to upgrade to the concrete meeting id"
         )

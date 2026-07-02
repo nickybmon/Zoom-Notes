@@ -1029,8 +1029,12 @@ class TestUpgradeTrackingFromEmpty:
         import time as _time
         base_mtime = _time.time()
 
-        # Pre-stamp a boundary as if a previous meeting just finished.
-        engine._last_completed_boundary = ("just_ended_id_AA", 12 * 3600)
+        # Pre-stamp a boundary as if a previous meeting just finished — a
+        # FRESH set_at, since the just-ended meeting whose data still lingers
+        # is the exact case the boundary protects against. (A stale boundary
+        # is expired by `_active_boundary`; see TestBoundaryExpiry.)
+        boundary_set_at = _time.time()
+        engine._last_completed_boundary = ("just_ended_id_AA", 12 * 3600, boundary_set_at)
 
         # Tick 1: anchor.
         _drive_tick(engine, fake_origin, cfg, wal=synthetic_wal,
@@ -1048,7 +1052,7 @@ class TestUpgradeTrackingFromEmpty:
             "the next tick has no protection against detecting the "
             "just-ended meeting"
         )
-        assert engine._last_completed_boundary == ("just_ended_id_AA", 12 * 3600)
+        assert engine._last_completed_boundary == ("just_ended_id_AA", 12 * 3600, boundary_set_at)
 
 
 # ── Engine: collect-entries self-heal when active_meeting_id is empty ────
