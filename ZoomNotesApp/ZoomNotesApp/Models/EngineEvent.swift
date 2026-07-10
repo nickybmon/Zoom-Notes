@@ -27,6 +27,13 @@ struct EngineEvent: Decodable {
     // Present on "note_failed" events
     let notePath: String?
 
+    // Present on "done" and "note_failed" events emitted by the abandoned-
+    // meeting (back-to-back) generation path. The main engine loop stays
+    // ACTIVE while this runs in the background, so these events must NOT
+    // reset the UI to idle — the state events already reflect the real
+    // (new) meeting being tracked.
+    let background: Bool?
+
     // Present on "ready" events (one-shot at engine startup)
     let zoomInstalled: Bool?
     let walPath: String?
@@ -68,6 +75,7 @@ struct EngineEvent: Decodable {
         case location
         case failedAt = "failed_at"
         case lastError = "last_error"
+        case background
     }
 }
 

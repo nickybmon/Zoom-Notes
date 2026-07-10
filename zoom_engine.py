@@ -13,6 +13,8 @@ JSON events emitted to stdout:
   {"event": "state", "value": "active", "meeting_id": "<id>"}
   {"event": "state", "value": "generating"}
   {"event": "done", "title": "...", "path": "...", "transcript_path": "...", "attendees": [...], "meeting_id": "..."}
+  {"event": "done", ..., "background": true}   — abandoned-meeting generation; main loop is still ACTIVE, don't reset UI state
+  {"event": "note_failed", ..., "background": true}  — same, but the LLM call failed
   {"event": "recovery_available", "meeting_id": "...", "entry_count": N, "last_updated": "...", "slug_hint": "...", "location": "root|failed", "title": "...?", "failed_at": "...?", "last_error": "...?"}
   {"event": "error", "message": "..."}
 
@@ -2194,6 +2196,7 @@ class ZoomEngine:
                         "meeting_id": meeting_id,
                         "attendees": attendees,
                         "message": error_msg,
+                        "background": True,
                     })
                     return
 
@@ -2243,6 +2246,7 @@ class ZoomEngine:
                     "transcript_path": str(transcript_path),
                     "attendees": attendees,
                     "meeting_id": meeting_id,
+                    "background": True,
                 })
                 self._emit_diag(
                     "abandoned_generation_completed",

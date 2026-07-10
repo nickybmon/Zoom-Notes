@@ -172,7 +172,13 @@ class AppState: ObservableObject {
                 lastError: event.lastError
             ))
         case "done":
-            engineState = .idle
+            // Abandoned-meeting (back-to-back) generation runs in the
+            // background while the main loop stays ACTIVE for the new
+            // meeting — a state event already reflects that. Resetting to
+            // idle here would make it look like tracking stopped.
+            if event.background != true {
+                engineState = .idle
+            }
             if let title = event.title {
                 lastSavedTitle = title
                 lastSavedPath = event.path
@@ -195,7 +201,9 @@ class AppState: ObservableObject {
         case "cache_cleared":
             recoverableMeetings.removeAll { $0.location == .root }
         case "note_failed":
-            engineState = .idle
+            if event.background != true {
+                engineState = .idle
+            }
             let failure = FailedMeeting(
                 meetingId: event.meetingId ?? "",
                 title: event.title ?? "Untitled meeting",
