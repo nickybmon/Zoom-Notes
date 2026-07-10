@@ -13,6 +13,8 @@ JSON events emitted to stdout:
   {"event": "state", "value": "active", "meeting_id": "<id>"}
   {"event": "state", "value": "generating"}
   {"event": "done", "title": "...", "path": "...", "transcript_path": "...", "attendees": [...], "meeting_id": "..."}
+  {"event": "done", ..., "background": true}   — abandoned-meeting generation; main loop is still ACTIVE, don't reset UI state
+  {"event": "note_failed", ..., "background": true}  — same, but the LLM call failed
   {"event": "recovery_available", "meeting_id": "...", "entry_count": N, "last_updated": "...", "slug_hint": "...", "location": "root|failed", "title": "...?", "failed_at": "...?", "last_error": "...?"}
   {"event": "error", "message": "..."}
 
@@ -131,6 +133,21 @@ _PERIODIC_PERSIST_TICKS = 6
 # without truncating the log. Treat <50% of last_size as a truncate signal.
 _TRUNCATE_RATIO = 0.5
 
+# How long a `_last_completed_boundary` stays in force. The boundary exists
+# only to stop the JUST-ended meeting (whose WAL data lingers for a few
+# minutes after it ends) from being re-detected as the next active meeting.
+# That is a minutes-long concern. But the freshness_floor it carries is a
+# date-less seconds-since-midnight value, and this app runs 24/7 as a menu
+# bar process — so a boundary set by yesterday afternoon's meeting (floor
+# ~5pm) survives into this morning and wrongly filters out today's 9am
+# meeting (whose timestamps are numerically < the stale floor). Detection
+# then returns None on every tick, the empty tracked id never upgrades, the
+# boundary never clears, and back-to-back meetings pile into one bucket until
+# the user manually generates. Expiring the boundary breaks that deadlock:
+# 1h is generous for the legitimate purpose yet guarantees no overnight bleed.
+# See the 2026-07-02 Brand Studio Crit incident.
+_BOUNDARY_EXPIRY_SECS = 60 * 60
+
 
 class ZoomEngine:
     def __init__(self):
@@ -171,7 +188,22 @@ class ZoomEngine:
         # `_last_generated_session`: the fingerprint there guards against
         # re-summarizing the same checkpoint, this guards against picking
         # up the wrong meeting when a NEW one starts immediately after.
-        self._last_completed_boundary: tuple[str, int] | None = None
+        # Shape: (meeting_id, freshness_floor_secs, set_at_epoch). The third
+        # element stamps when the boundary was recorded so `_active_boundary`
+        # can expire it (see _BOUNDARY_EXPIRY_SECS) — a stale boundary would
+        # otherwise permanently suppress detection of a later/next-day meeting.
+        self._last_completed_boundary: tuple[str, int, float] | None = None
+
+        # Deferred abandoned-meeting note (the 2026-06-30 single-meeting-flap
+        # fix). When a mid-ACTIVE meeting_id change abandons a real-looking
+        # accumulator, we no longer generate its note immediately — a single
+        # meeting whose ID oscillates between two values would otherwise fire
+        # a premature note on every score flip. Instead we hold the abandoned
+        # snapshot here and only generate once the meeting we switched TO
+        # proves real (accumulates its own content). A flap swings the score
+        # back to this id before that happens, and the flap-back guard in
+        # Case B restores it instead. Shape: {"meeting_id": str, "snapshot": dict}.
+        self._pending_abandoned: dict | None = None
 
         # Set by _generate_notes when it writes a placeholder note instead of
         # a final note. Read by the worker so it knows to keep the persisted
@@ -324,6 +356,33 @@ class ZoomEngine:
                 if secs > latest:
                     latest = secs
         return latest if latest >= 0 else None
+
+    def _active_boundary(self) -> tuple[str, int, float] | None:
+        """Return `_last_completed_boundary` if still in force, else clear it.
+
+        The boundary carries a date-less seconds-since-midnight freshness
+        floor whose only legitimate job is to keep the just-ended meeting from
+        being re-detected in the minutes after it ends. Because this app runs
+        for days as a menu-bar process, a boundary can otherwise outlive its
+        purpose and — once its clock time is no longer comparable to a later
+        or next-day meeting's timestamps — permanently suppress detection.
+        Expiring it after `_BOUNDARY_EXPIRY_SECS` breaks that deadlock
+        (2026-07-02 Brand Studio Crit incident).
+        """
+        boundary = self._last_completed_boundary
+        if boundary is None:
+            return None
+        set_at = boundary[2]
+        if time.time() - set_at > _BOUNDARY_EXPIRY_SECS:
+            self._last_completed_boundary = None
+            self._emit_diag(
+                "boundary_expired",
+                meeting_id=boundary[0],
+                freshness_floor=boundary[1],
+                age_secs=int(time.time() - set_at),
+            )
+            return None
+        return boundary
 
     def _write_tracking(self, *, mtime=..., size=..., active_ts=..., meeting_id=..., session_mtime=...):
         with self._tracking_lock:
@@ -696,8 +755,10 @@ class ZoomEngine:
             )
             exclude_id = None
             freshness_floor = None
-            if apply_boundary and self._last_completed_boundary is not None:
-                exclude_id, freshness_floor = self._last_completed_boundary
+            if apply_boundary:
+                boundary = self._active_boundary()
+                if boundary is not None:
+                    exclude_id, freshness_floor, _ = boundary
             try:
                 meeting_id = detect_active_meeting_id(
                     wal,
@@ -706,6 +767,16 @@ class ZoomEngine:
                 )
             except Exception:
                 meeting_id = None
+
+            # Observability for the empty-tracking deadlock: if we're ACTIVE
+            # with no tracked id and detection still can't name a meeting,
+            # surface it — this is the state where back-to-back meetings merge.
+            if state == EngineState.ACTIVE and tracking_is_empty and not meeting_id:
+                self._emit_diag(
+                    "active_empty_no_detection",
+                    exclude_id=exclude_id or "",
+                    freshness_floor=freshness_floor if freshness_floor is not None else -1,
+                )
 
             # Blocked-meeting guard: if the detected meeting_id is in the
             # user's block list, refuse the transition entirely and stay IDLE.
@@ -836,15 +907,49 @@ class ZoomEngine:
                             meeting_id=meeting_id,
                             context="case_b",
                         )
+                    elif (
+                        self._pending_abandoned is not None
+                        and meeting_id == self._pending_abandoned["meeting_id"]
+                    ):
+                        # FLAP-BACK: we recently deferred abandoning this very
+                        # meeting (held its snapshot, waiting for the meeting we
+                        # switched to to prove real). The score has now swung
+                        # back to it — proof that this is a SINGLE meeting whose
+                        # ID oscillates between two values, not a back-to-back
+                        # boundary. Restore it and discard the phantom we briefly
+                        # tracked. No note is generated; the meeting continues.
+                        restored = self._pending_abandoned["snapshot"]
+                        self._pending_abandoned = None
+                        self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
+                        with self._accumulated_lock:
+                            # Re-seed from the deferred snapshot. The WAL re-parse
+                            # later this same tick re-adds anything written since.
+                            self._accumulated = dict(restored)
+                            acc_size = len(self._accumulated)
+                        self._emit_diag(
+                            "meeting_id_changed",
+                            from_id=current_tracking_id, to_id=meeting_id,
+                            reason="flap_back_restore",
+                            restored_entries=acc_size,
+                        )
+                        self._set_state(
+                            EngineState.ACTIVE,
+                            meeting_id=meeting_id,
+                            accumulator_size=acc_size,
+                        )
                     else:
                         # Case B: real meeting change. Two sub-scenarios:
                         #
                         #   1) BACK-TO-BACK MEETINGS: the previous meeting really
                         #      happened, has a real accumulator with real
-                        #      conversation. Auto-generate its note now (the
-                        #      2026-05-04 AEO GA fix) before clearing local
-                        #      state. Runs in a background thread so the new
-                        #      meeting's tracking proceeds without delay.
+                        #      conversation. Its note should be generated (the
+                        #      2026-05-04 AEO GA fix). We now DEFER that decision
+                        #      rather than firing immediately (the 2026-06-30
+                        #      single-meeting-flap fix): the note fires once the
+                        #      meeting we switched TO accumulates its own real
+                        #      content — see _maybe_fire_pending_abandoned. A
+                        #      genuine new meeting reaches that bar within a tick
+                        #      or two; a phantom flap-target never does.
                         #
                         #   2) MISIDENTIFICATION: scoring just corrected itself
                         #      after briefly tracking the wrong meeting (the
@@ -869,13 +974,27 @@ class ZoomEngine:
                             if v.get("meeting_id") == current_tracking_id
                         }
                         if self._abandoned_looks_real(strict_snapshot):
-                            self._trigger_abandoned_generation(
-                                current_tracking_id, abandoned_snapshot,
-                            )
+                            # DEFER generation. If a DIFFERENT meeting is already
+                            # pending, this switch supersedes it — flush the old
+                            # pending now so its note isn't lost when we overwrite.
+                            if (
+                                self._pending_abandoned is not None
+                                and self._pending_abandoned["meeting_id"]
+                                != current_tracking_id
+                            ):
+                                self._trigger_abandoned_generation(
+                                    self._pending_abandoned["meeting_id"],
+                                    self._pending_abandoned["snapshot"],
+                                )
+                            self._pending_abandoned = {
+                                "meeting_id": current_tracking_id,
+                                "snapshot": abandoned_snapshot,
+                            }
                             # Note: do NOT delete_persisted_accumulator here —
-                            # _trigger_abandoned_generation persists a fresh
-                            # snapshot synchronously and cleans up after itself
-                            # on success.
+                            # the persisted snapshot is the durability boundary
+                            # until the deferred decision resolves (fired by
+                            # _maybe_fire_pending_abandoned or restored by the
+                            # flap-back guard above).
                         else:
                             try:
                                 delete_persisted_accumulator(current_tracking_id)
@@ -915,7 +1034,7 @@ class ZoomEngine:
                             reason="active_reevaluation",
                             abandoned_snapshot_size=len(abandoned_snapshot),
                             strict_snapshot_size=len(strict_snapshot),
-                            abandoned_auto_generated=self._abandoned_looks_real(strict_snapshot),
+                            abandoned_deferred=self._abandoned_looks_real(strict_snapshot),
                             carried_new_meeting_entries=acc_carry_size,
                         )
                         self._set_state(
@@ -1006,6 +1125,12 @@ class ZoomEngine:
                     meeting_id=(self._read_tracking()[3] or ""),
                 )
 
+            # Resolve any deferred abandoned-meeting note now that the
+            # accumulator reflects this tick's content: if the meeting we
+            # switched to has accumulated real content of its own, the switch
+            # was a genuine back-to-back boundary and the abandoned note fires.
+            self._maybe_fire_pending_abandoned()
+
             # Secondary idle trigger: fire generation when the accumulator
             # has been frozen for a long time even though the WAL file is
             # still being updated by Zoom checkpoint writes. This is the
@@ -1040,6 +1165,7 @@ class ZoomEngine:
                                 acc_stale_secs=int(acc_stale_secs),
                                 threshold=acc_stale_threshold,
                             )
+                            self._flush_pending_abandoned(reason="acc_stale")
                             self._trigger_generate(origin, cfg)
                             return
 
@@ -1047,6 +1173,12 @@ class ZoomEngine:
             if state == EngineState.ACTIVE and last_active_ts is not None:
                 idle_secs = now - last_active_ts
                 if idle_secs >= idle_threshold:
+                    # The tracked meeting has fallen idle. If a different
+                    # meeting is still parked pending the flap/back-to-back
+                    # decision, it was real — finalize it now before we
+                    # generate or disarm the tracked one, so it isn't stranded.
+                    self._flush_pending_abandoned(reason="idle")
+
                     # Belt-and-suspenders: don't re-summarize a meeting we
                     # already finished. Zoom checkpoints the WAL after the
                     # meeting ends, which mutates mtime/size and would
@@ -1168,7 +1300,9 @@ class ZoomEngine:
                 if processing_meeting_id:
                     latest = self._latest_acc_ts_secs_for(processing_meeting_id)
                     if latest is not None:
-                        self._last_completed_boundary = (processing_meeting_id, latest)
+                        self._last_completed_boundary = (
+                            processing_meeting_id, latest, time.time(),
+                        )
                 # Clean up the in-memory accumulator. Keep the persisted
                 # disk snapshot if note generation failed — it's the source
                 # of truth for the retry flow.
@@ -1666,7 +1800,7 @@ class ZoomEngine:
         # The boundary check mirrors detect_active_meeting_id: don't re-select
         # a meeting we just finished generating notes for.
         _FUTURE_BUF_R = 5 * 60
-        boundary = self._last_completed_boundary  # (exc_id, freshness_floor) or None
+        boundary = self._active_boundary()  # (exc_id, floor, set_at) or None
 
         eligible = []
         for mid in counts:
@@ -1676,7 +1810,7 @@ class ZoomEngine:
             if ts_secs > _now_secs_r + _FUTURE_BUF_R:
                 continue  # timestamp is impossibly far in the future → stale
             if boundary is not None:
-                exc_id, exc_floor = boundary
+                exc_id, exc_floor, _ = boundary
                 if mid == exc_id and ts_secs <= exc_floor:
                     continue  # stale WAL data from the session we just finished
             eligible.append(mid)
@@ -1820,6 +1954,71 @@ class ZoomEngine:
             if speaker and speaker != "Unknown":
                 return True
         return False
+
+    def _maybe_fire_pending_abandoned(self) -> None:
+        """Generate a deferred abandoned-meeting note once the switch is proven.
+
+        The 2026-06-30 single-meeting-flap fix: Case B no longer generates an
+        abandoned meeting's note the instant the tracked meeting_id changes,
+        because a single meeting whose ID oscillates between two values would
+        fire a premature note on every flip. Instead it parks the abandoned
+        snapshot in `self._pending_abandoned`. This method, called every poll
+        tick after the accumulator is refreshed, resolves the deferral:
+
+          - If the meeting we switched TO has now accumulated real content of
+            its own (`_abandoned_looks_real` over its strict entries), the
+            switch was a genuine back-to-back boundary — fire the abandoned
+            note and clear the pending state.
+          - Otherwise leave it pending. A flap swings the score back to the
+            abandoned id first, and the flap-back guard in Case B restores it
+            without ever generating. A genuine new meeting clears this bar
+            within a tick or two of real speech.
+
+        Idle/secondary-idle generation flushes any leftover pending note via
+        the same `_trigger_abandoned_generation` path (see `_flush_pending_abandoned`).
+        """
+        pending = self._pending_abandoned
+        if not pending:
+            return
+        _, _, _, tracked_id = self._read_tracking()
+        if not tracked_id or tracked_id == pending["meeting_id"]:
+            return
+        with self._accumulated_lock:
+            new_strict = {
+                k: v for k, v in self._accumulated.items()
+                if v.get("meeting_id") == tracked_id
+            }
+        if self._abandoned_looks_real(new_strict):
+            self._emit_diag(
+                "abandoned_generation_promoted",
+                abandoned_id=pending["meeting_id"],
+                new_meeting_id=tracked_id,
+                new_entry_count=len(new_strict),
+            )
+            self._trigger_abandoned_generation(
+                pending["meeting_id"], pending["snapshot"],
+            )
+            self._pending_abandoned = None
+
+    def _flush_pending_abandoned(self, reason: str) -> None:
+        """Generate any still-pending abandoned note before going idle.
+
+        Reached when the engine decides to generate / disarm the currently
+        tracked meeting while a different meeting is still parked in
+        `_pending_abandoned` (the meeting we switched to ended or fell silent
+        before accumulating enough to promote the deferral on its own). The
+        parked meeting was real — finalize it rather than stranding it.
+        """
+        pending = self._pending_abandoned
+        if not pending:
+            return
+        self._emit_diag(
+            "abandoned_generation_flushed",
+            abandoned_id=pending["meeting_id"],
+            reason=reason,
+        )
+        self._trigger_abandoned_generation(pending["meeting_id"], pending["snapshot"])
+        self._pending_abandoned = None
 
     def _trigger_abandoned_generation(self, meeting_id: str, snapshot: dict) -> None:
         """Finalize an accumulator that Case B is about to abandon.
@@ -1997,6 +2196,7 @@ class ZoomEngine:
                         "meeting_id": meeting_id,
                         "attendees": attendees,
                         "message": error_msg,
+                        "background": True,
                     })
                     return
 
@@ -2032,7 +2232,9 @@ class ZoomEngine:
                     except (ValueError, AttributeError):
                         continue
                 if latest_ts_secs >= 0:
-                    self._last_completed_boundary = (meeting_id, latest_ts_secs)
+                    self._last_completed_boundary = (
+                        meeting_id, latest_ts_secs, time.time(),
+                    )
 
                 # Cleanup persisted snapshot — the note is now safe on disk.
                 delete_persisted_accumulator(meeting_id)
@@ -2044,6 +2246,7 @@ class ZoomEngine:
                     "transcript_path": str(transcript_path),
                     "attendees": attendees,
                     "meeting_id": meeting_id,
+                    "background": True,
                 })
                 self._emit_diag(
                     "abandoned_generation_completed",

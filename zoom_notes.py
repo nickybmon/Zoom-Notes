@@ -418,6 +418,12 @@ def score_meeting_ids(wal_path: Path) -> dict[str, float]:
 # overtake the incumbent as soon as its newest entry is more recent.
 _SECONDS_IN_DAY = 86_400
 
+# A live meeting's newest transcript entry is never more than a couple of
+# minutes ahead of the current wall clock. Anything further ahead is stale WAL
+# residue from an earlier/prior-day session whose HH:MM:SS just happens to be a
+# larger clock value. `detect_active_meeting_id` uses this to drop such ids.
+_FUTURE_TS_BUFFER_SECS = 5 * 60
+
 
 def _composite_score(data: dict) -> float:
     score = float(min(data["count"], _SECONDS_IN_DAY - 1))
@@ -517,13 +523,32 @@ def detect_active_meeting_id(
       freshly-starting one's few-entry count, and the engine locks onto the
       wrong id.
     """
-    if exclude_meeting_id is None and freshness_floor_secs is None:
-        scores = score_meeting_ids(wal_path)
-        return max(scores, key=lambda k: scores[k]) if scores else None
-
     detailed = score_meeting_ids_detailed(wal_path)
+    if not detailed:
+        return None
+
+    # Staleness guard — applied on EVERY call, not just when a boundary is
+    # passed. A meeting whose newest transcript timestamp sits well ahead of
+    # the current wall clock is residual data from an earlier (or prior-day)
+    # session still resident in the WAL: its HH:MM:SS simply carries a larger
+    # clock value than the live meeting's, so the recency term in
+    # `_composite_score` ranks it above the meeting actually in progress. A
+    # genuinely in-progress meeting can never be more than a couple of minutes
+    # ahead of now. Without this, a 2:33 PM meeting from yesterday outscores an
+    # 11:41 AM meeting happening right now and detection flaps onto the stale
+    # id mid-call — firing a premature note. Mirrors the `_FUTURE_BUF_R` guard
+    # already used in `_recover_active_meeting_id`.
+    now_hms = datetime.now().strftime("%H:%M:%S")
+    try:
+        now_secs = sum(int(x) * m for x, m in zip(now_hms.split(":"), [3600, 60, 1]))
+    except ValueError:
+        now_secs = _SECONDS_IN_DAY  # can't compute now → don't reject anything
+
     eligible: dict[str, float] = {}
     for mid, data in detailed.items():
+        latest_ts = data["latest_ts_secs"]
+        if latest_ts >= 0 and latest_ts > now_secs + _FUTURE_TS_BUFFER_SECS:
+            continue  # timestamp is implausibly far ahead of now → stale residue
         if exclude_meeting_id and mid == exclude_meeting_id:
             # Block checkpoint replays of the just-processed session, but
             # allow the *same* meeting to be re-detected if it has genuinely

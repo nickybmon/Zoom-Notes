@@ -250,6 +250,19 @@ class TestActiveMeetingDetection:
         MID = "FigJam+SessionABC=="
         FLOOR_SECS = 13 * 3600 + 6 * 60 + 27  # 13:06:27 — last entry before silence
 
+        # Pin "now" to just after the resumed entry (13:12) so the staleness
+        # guard in detect_active_meeting_id — which drops meetings whose newest
+        # timestamp is far ahead of the current wall clock — treats 13:12:31 as
+        # present, not future, regardless of when this test actually runs.
+        import datetime as _dt
+
+        class _FixedNow(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime(2026, 5, 8, 13, 15, 0)
+
+        monkeypatch.setattr(zoom_notes, "datetime", _FixedNow)
+
         # Synthetic WAL: entries from the SAME meeting but with timestamps
         # clearly beyond the freshness floor (speech resumed at 13:12).
         resumed_lines = [
@@ -284,6 +297,88 @@ class TestActiveMeetingDetection:
             f"Expected resumed meeting {MID!r} to be re-detected after silent period, "
             f"got {result!r}. The exclude_meeting_id guard must allow re-detection "
             f"when latest_ts_secs ({13*3600+12*60+31}) > freshness_floor ({FLOOR_SECS})."
+        )
+
+    def test_stale_future_timestamped_meeting_is_never_selected(self, monkeypatch, tmp_path):
+        """Regression guard for the 2026-07-07 stale-WAL-residue premature-fire bug.
+
+        Zoom leaves prior meetings' data resident in the WAL. A meeting from
+        earlier in the day (or a prior day) has HH:MM:SS timestamps whose raw
+        clock value is LARGER than the meeting happening right now — e.g. a
+        2:33 PM meeting from yesterday vs. an 11:41 AM meeting in progress. The
+        recency term in `_composite_score` therefore ranks the stale meeting
+        above the live one, and detection flaps onto the stale id mid-call,
+        firing a premature note (observed: a meeting auto-concluded while the
+        user was still on the call).
+
+        The fix: any meeting whose newest timestamp sits more than a few minutes
+        ahead of the current wall clock is treated as stale residue and dropped
+        on EVERY detection call — no boundary/exclude arguments required.
+
+        Here the stale meeting is given the user-is-speaker bonus (the strongest
+        signal) so that, absent the guard, it would be the top scorer. The guard
+        must still exclude it and return the live meeting.
+        """
+        monkeypatch.setenv("ZOOM_NOTES_USER_NAME", "Nick Blackmon")
+
+        # Pin "now" to 11:44:00 so the test is deterministic regardless of when
+        # it runs. score_meeting_ids_detailed and detect_active_meeting_id both
+        # read zoom_notes.datetime.now().
+        import datetime as _dt
+
+        class _FixedNow(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime(2026, 7, 7, 11, 44, 0)
+
+        monkeypatch.setattr(zoom_notes, "datetime", _FixedNow)
+
+        STALE = "StaleYesterdayPM=="   # newest entry 14:33 — hours "ahead" of now
+        LIVE = "LiveMeetingNow=="       # in progress, but currently in a silent lull
+
+        def _entry(msg_id, text, ts, username, mid):
+            return [
+                "messageId", msg_id,
+                "message", text,
+                "timeStampContent", ts,
+                "timeStampSeconds", "i",
+                "uniqueUserId", "1-0",
+                "username", username,
+                "meetingId", mid,
+            ]
+
+        # The live meeting is mid-lull: its newest entry is 11:10, > 30 min
+        # before now (11:44), so it loses the recency bonus — exactly the
+        # window in which flapping onto stale data occurred. Both meetings have
+        # the user as a speaker (bonus cancels), so ranking falls to the newest
+        # timestamp, where the stale 14:33 residue beats the live 11:10.
+        # LIVE block first, STALE last: the scorer associates a timestamp with a
+        # meetingId by scanning up to 60 lines BACKWARD, so keeping the stale
+        # 14:33 entry after the live block prevents it from bleeding its future
+        # timestamp onto the live meeting in this compact synthetic WAL.
+        lines = (
+            _entry("2:0:2:0:2", "Earlier in this call.", "11:10:00", "Nick Blackmon", LIVE)
+            + _entry("3:0:3:0:3", "Still the same call.", "11:10:20", "Megan Chovanec", LIVE)
+            + _entry("1:0:1:0:1", "Leftover from yesterday afternoon.", "14:33:35", "Nick Blackmon", STALE)
+        )
+        monkeypatch.setattr(zoom_notes, "read_wal_strings", lambda _path: lines)
+
+        fake_wal = tmp_path / "fake.wal"
+        fake_wal.write_bytes(b"x" * 64)
+
+        # Sanity: absent the guard the stale meeting genuinely outscores the live
+        # one (this is what made the bug bite), so the guard is load-bearing.
+        detailed = zoom_notes.score_meeting_ids_detailed(fake_wal)
+        assert detailed[STALE]["score"] > detailed[LIVE]["score"], (
+            "test setup invalid: stale meeting must out-score the live one for "
+            "this to prove the guard matters"
+        )
+
+        result = detect_active_meeting_id(fake_wal)
+        assert result == LIVE, (
+            f"Expected the in-progress meeting {LIVE!r}, got {result!r}. A meeting "
+            f"whose newest timestamp (14:33) is hours ahead of now (11:44) is stale "
+            f"WAL residue and must never be selected as active."
         )
 
     def test_newer_meeting_wins_over_larger_incumbent(self, monkeypatch, tmp_path):

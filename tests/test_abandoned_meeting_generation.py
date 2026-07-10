@@ -276,9 +276,15 @@ class TestCaseBDispatch:
     """Case B in `_poll_once` must snapshot + dispatch when the abandoned
     accumulator looks real, and fall back to delete-only when it doesn't."""
 
-    def test_case_b_kicks_off_abandoned_generation_when_threshold_met(
+    def test_case_b_defers_then_fires_when_new_meeting_proves_real(
         self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
     ):
+        """The 2026-06-30 single-meeting-flap fix changed Case B from
+        generate-immediately to defer-until-proven. When meeting B is detected,
+        meeting A's note must NOT fire yet — it's parked in `_pending_abandoned`.
+        Only once meeting B accumulates real content of its own (proving a
+        genuine back-to-back boundary, not an ID flap) does A's note fire.
+        """
         engine = ZoomEngine()
         cfg = engine._get_cfg()
 
@@ -299,13 +305,30 @@ class TestCaseBDispatch:
             pre_count = len(engine._accumulated)
         assert pre_count >= 5, "fixture sanity: accumulator must have meeting A's entries"
 
-        # Tick 3: Case B — meeting B detected. Patch the abandoned-generation
-        # entry point so we can assert it was called with meeting A's data.
-        b_entries = list(_make_realistic_accumulator("MEETING-B==", count=2).values())
+        # Tick 3: Case B — meeting B detected with only a couple of entries.
+        # Generation must NOT fire (could be a flap); A is parked pending.
+        b_entries_small = list(_make_realistic_accumulator("MEETING-B==", count=2).values())
         with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
             _drive_tick(
                 engine, fake_origin, cfg, wal=synthetic_wal,
-                mtime=1010.0, size=12288, entries=b_entries,
+                mtime=1010.0, size=12288, entries=b_entries_small,
+                detected_meeting_id="MEETING-B==",
+            )
+            mock_dispatch.assert_not_called()
+
+        assert engine._pending_abandoned is not None, "meeting A must be parked"
+        assert engine._pending_abandoned["meeting_id"] == "MEETING-A=="
+        parked = engine._pending_abandoned["snapshot"]
+        assert len(parked) >= 5
+        assert all(e["meeting_id"] == "MEETING-A==" for e in parked.values())
+
+        # Tick 4: meeting B accumulates real content of its own — a genuine
+        # back-to-back boundary. Now A's deferred note fires, exactly once.
+        b_entries_full = list(_make_realistic_accumulator("MEETING-B==", count=6).values())
+        with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
+            _drive_tick(
+                engine, fake_origin, cfg, wal=synthetic_wal,
+                mtime=1015.0, size=16384, entries=b_entries_full,
                 detected_meeting_id="MEETING-B==",
             )
             mock_dispatch.assert_called_once()
@@ -317,13 +340,63 @@ class TestCaseBDispatch:
             assert len(snapshot) >= 5
             assert all(e["meeting_id"] == "MEETING-A==" for e in snapshot.values())
 
-        # And the new meeting's accumulator should start fresh (the existing
-        # Case B clear-and-switch behavior must not regress).
+        assert engine._pending_abandoned is None, "pending must clear after firing"
+
+        # The new meeting's accumulator holds only meeting B's data.
         with engine._accumulated_lock:
             ids_after = {e.get("meeting_id") for e in engine._accumulated.values()}
         assert ids_after <= {"MEETING-B=="}, (
             f"new meeting's accumulator polluted with abandoned data: {ids_after}"
         )
+
+    def test_case_b_flap_back_restores_without_generating(
+        self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
+    ):
+        """The core 2026-06-30 fix: a single meeting whose ID oscillates
+        between two values must NOT generate a premature note. When the score
+        swings A -> B (B never proves real) -> A, the flap-back guard restores
+        meeting A and discards the phantom B, generating nothing.
+        """
+        engine = ZoomEngine()
+        cfg = engine._get_cfg()
+
+        # Anchor + populate meeting A.
+        _drive_tick(
+            engine, fake_origin, cfg, wal=synthetic_wal,
+            mtime=1000.0, size=4096, entries=[],
+            detected_meeting_id="MEETING-A==",
+        )
+        a_entries = list(_make_realistic_accumulator("MEETING-A==", count=6).values())
+        _drive_tick(
+            engine, fake_origin, cfg, wal=synthetic_wal,
+            mtime=1005.0, size=8192, entries=a_entries,
+            detected_meeting_id="MEETING-A==",
+        )
+
+        with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
+            # Flip to phantom B (1 entry) — A parked, nothing generated.
+            b_entries = list(_make_realistic_accumulator("MEETING-B==", count=1).values())
+            _drive_tick(
+                engine, fake_origin, cfg, wal=synthetic_wal,
+                mtime=1010.0, size=12288, entries=b_entries,
+                detected_meeting_id="MEETING-B==",
+            )
+            assert engine._pending_abandoned is not None
+
+            # Score swings back to A before B ever became real → flap-back.
+            _drive_tick(
+                engine, fake_origin, cfg, wal=synthetic_wal,
+                mtime=1015.0, size=16384, entries=a_entries,
+                detected_meeting_id="MEETING-A==",
+            )
+            mock_dispatch.assert_not_called()
+
+        assert engine._pending_abandoned is None, "flap-back must clear pending"
+        _, _, _, tracked = engine._read_tracking()
+        assert tracked == "MEETING-A==", "flap-back must restore meeting A as tracked"
+        with engine._accumulated_lock:
+            restored_ids = {e.get("meeting_id") for e in engine._accumulated.values()}
+        assert "MEETING-A==" in restored_ids, "meeting A's transcript must be restored"
 
     def test_case_b_carries_forward_new_meetings_opening_lines(
         self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
