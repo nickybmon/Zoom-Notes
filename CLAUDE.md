@@ -147,7 +147,7 @@ Settings are stored in two places (shared between Swift and Python):
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `llm_provider` | `claude` | `claude` \| `openai` \| `gemini` \| `ollama` |
-| `llm_model` | `claude-sonnet-4-6` | Model name |
+| `llm_model` | `claude-sonnet-5` | Model name |
 | `notes_dir` | `~/Desktop/Meeting Notes/Notes` | Notes output directory |
 | `transcripts_dir` | `~/Desktop/Meeting Notes/Transcripts` | Transcripts output directory |
 | `subfolder_pattern` | `day` | `none` \| `day` \| `month` |

@@ -72,7 +72,7 @@ _KEYCHAIN_SERVICE = "zoom-notes-assistant"
 class ZoomNotesConfig:
     # LLM provider and model
     llm_provider: str = "claude"          # "claude" | "openai" | "gemini" | "ollama"
-    llm_model: str = "claude-sonnet-4-6"
+    llm_model: str = "claude-sonnet-5"
 
     # Output paths
     notes_dir: str = str(Path.home() / "Desktop/Meeting Notes/Notes")
