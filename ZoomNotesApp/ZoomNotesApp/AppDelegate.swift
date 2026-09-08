@@ -158,6 +158,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         return img
     }
 
+    /// Truncates a calendar event title so long meeting names don't blow up
+    /// the menu bar width or the dropdown menu's layout. Cuts at a character
+    /// boundary and appends an ellipsis rather than wrapping or clipping.
+    private func truncatedEventTitle(_ title: String, maxLength: Int) -> String {
+        guard title.count > maxLength else { return title }
+        let cutoff = title.index(title.startIndex, offsetBy: maxLength)
+        return title[..<cutoff].trimmingCharacters(in: .whitespaces) + "…"
+    }
+
     func updateMenuBar() {
         let menu = NSMenu()
         let state = appState.engineState
@@ -169,9 +178,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         switch state {
         case .idle:
             if let next = nextMeeting {
+                let title = truncatedEventTitle(next.title, maxLength: 40)
                 statusTitle = next.isNow
-                    ? "\(next.title) — Now"
-                    : "\(next.title) — \(next.startTimeString) (\(next.timeLabel))"
+                    ? "\(title) — Now"
+                    : "\(title) — \(next.startTimeString) (\(next.timeLabel))"
             } else {
                 statusTitle = "Idle — waiting for meeting"
             }
@@ -189,9 +199,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
             // Show up to 4 events; bold/highlight the one happening now
             for event in upcoming.prefix(4) {
+                let title = truncatedEventTitle(event.title, maxLength: 40)
                 let label = event.isNow
-                    ? "\(event.title) — Now"
-                    : "\(event.title) — \(event.startTimeString) (\(event.timeLabel))"
+                    ? "\(title) — Now"
+                    : "\(title) — \(event.startTimeString) (\(event.timeLabel))"
                 let item = NSMenuItem(title: label, action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 if event.isNow {
@@ -208,7 +219,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                let urlStr = joinable.zoomUrl {
                 menu.addItem(.separator())
                 let joinItem = NSMenuItem(
-                    title: "Join: \(joinable.title)",
+                    title: "Join: \(truncatedEventTitle(joinable.title, maxLength: 40))",
                     action: #selector(joinMeeting(_:)),
                     keyEquivalent: ""
                 )
@@ -393,7 +404,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             case .idle, .unknown:
                 button.contentTintColor = nil
                 if let next = nextMeeting, state == .idle {
-                    let label = next.isNow ? "\(next.title) — Now" : "\(next.title) · \(next.timeLabel)"
+                    let title = truncatedEventTitle(next.title, maxLength: 24)
+                    let label = next.isNow ? "\(title) — Now" : "\(title) · \(next.timeLabel)"
                     button.title = "  \(label)"
                     button.imagePosition = .imageLeft
                     button.toolTip = next.isNow ? "Zoom Notes — \(next.title)" : "Zoom Notes — Next: \(next.title)"
