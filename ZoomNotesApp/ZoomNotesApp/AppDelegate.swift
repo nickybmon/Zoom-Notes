@@ -26,6 +26,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     private var cancellables = Set<AnyCancellable>()
     private var menuUpdateTimer: Timer?
 
+    /// True when macOS will not display our alerts — either the app is not
+    /// authorized or alerts are switched off for it. Drives the menu warning.
+    private var notificationsBlocked = false
+    private var menuTickCount = 0
+    private var didCheckNotifications = false
+
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -44,7 +50,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         appState.startEngine()
 
         menuUpdateTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.updateMenuBar() }
+            Task { @MainActor in
+                guard let self else { return }
+                self.updateMenuBar()
+                self.menuTickCount += 1
+                if self.menuTickCount % 15 == 0 {
+                    self.refreshNotificationAuthorization()
+                }
+            }
         }
     }
 
@@ -87,7 +100,78 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         )
 
         UNUserNotificationCenter.current().setNotificationCategories([savedCategory, failedCategory])
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error {
+                log("[Notifications] requestAuthorization failed: \(error.localizedDescription)", level: .error)
+            } else {
+                log("[Notifications] requestAuthorization granted=\(granted)", level: .info)
+            }
+            // requestAuthorization returning true is not sufficient — macOS can
+            // still have the app's alerts turned off (or, when several bundles
+            // claim the same identifier, no record for it at all). Read back
+            // what Notification Center actually has and surface a mismatch.
+            self.refreshNotificationAuthorization()
+        }
+    }
+
+    /// Read the live notification settings and cache them for the menu bar.
+    /// Called at launch and whenever the menu is rebuilt, so a permission the
+    /// user revokes (or that macOS drops on a re-signed build) becomes visible
+    /// instead of silently swallowing every alert.
+    func refreshNotificationAuthorization() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let status = settings.authorizationStatus
+            let alerts = settings.alertSetting
+            Task { @MainActor in
+                let wasBlocked = self.notificationsBlocked
+                let firstCheck = !self.didCheckNotifications
+                self.didCheckNotifications = true
+                self.notificationsBlocked = (status != .authorized && status != .provisional)
+                    || alerts == .disabled
+                // Always log the first readback so a healthy launch is on the
+                // record too — otherwise silence is ambiguous between "fine"
+                // and "never ran".
+                if firstCheck || self.notificationsBlocked != wasBlocked || self.notificationsBlocked {
+                    log(
+                        """
+                        [Notifications] authorizationStatus=\(status.rawValue) \
+                        alertSetting=\(alerts.rawValue) blocked=\(self.notificationsBlocked)
+                        """,
+                        level: self.notificationsBlocked ? .error : .info
+                    )
+                }
+            }
+        }
+    }
+
+    /// Post a throwaway alert so the user can confirm notifications actually
+    /// reach the screen. Silent failures here are the whole reason this exists:
+    /// the app can be authorized and still have nothing appear.
+    @objc func sendTestNotification() {
+        ConsoleLogger.shared.logUserAction("Send test notification")
+        refreshNotificationAuthorization()
+
+        let content = UNMutableNotificationContent()
+        content.title = "Zoom Notes"
+        content.body = "Test notification — alerts are working."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "zoom-notes-test-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                log("[Notifications] test alert failed: \(error.localizedDescription)", level: .error)
+            } else {
+                log("[Notifications] test alert posted", level: .info)
+            }
+        }
+    }
+
+    @objc func openNotificationSettings() {
+        ConsoleLogger.shared.logUserAction("Open notification settings")
+        Permissions.openNotificationSettings()
     }
 
     func userNotificationCenter(
@@ -377,6 +461,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
+        if notificationsBlocked {
+            let warn = NSMenuItem(
+                title: "⚠ Notifications are off — fix in System Settings",
+                action: #selector(openNotificationSettings),
+                keyEquivalent: ""
+            )
+            menu.addItem(warn)
+            menu.addItem(.separator())
+        }
+
         // Error display — show errors that are actionable; suppress transient/auth noise
         if let err = appState.engineError,
            !err.contains("401"),
@@ -390,6 +484,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Open Logs…", action: #selector(openLogs), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(
+            title: "Send Test Notification",
+            action: #selector(sendTestNotification),
+            keyEquivalent: ""
+        ))
         menu.addItem(NSMenuItem(title: "Clear Meeting Cache", action: #selector(clearCache), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Zoom Notes", action: #selector(quitApp), keyEquivalent: "q"))

@@ -155,7 +155,43 @@ say "Installing to ${INSTALLED_PATH}…"
 rm -rf "$INSTALLED_PATH"
 cp -R "$APP_PATH" "$INSTALLED_PATH"
 
-# ── 5. Launch ─────────────────────────────────────────────────────────────────
+# ── 5. Remove build-tree copies of the bundle ────────────────────────────────
+# The archive/export steps leave extra copies of the .app in build/, and Launch
+# Services registers every one of them. Notification Center resolves permission
+# by bundle ID and then validates it against whichever bundle Launch Services
+# says owns that ID — with several candidates it can land on a stale build-tree
+# path and silently drop the app's alerts.
+#
+# Deregistering alone doesn't hold: Launch Services rescans and re-adds any
+# bundle that's still on disk. The copies have to go. We only delete what this
+# script produced ($BUILD_DIR); anything else under build/ belongs to
+# release.sh, so warn instead of deleting someone else's artifacts.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+say "Removing build-tree copies of $APP_NAME.app…"
+while IFS= read -r copy; do
+    [ -x "$LSREGISTER" ] && "$LSREGISTER" -u "$copy" 2>/dev/null || true
+    rm -rf "$copy"
+done < <(find "$BUILD_DIR" -maxdepth 8 -type d -name "$APP_NAME.app" 2>/dev/null)
+
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$INSTALLED_PATH" 2>/dev/null || true
+
+    # No trailing anchor — dump lines end with an LS handle, e.g. "(0x81cc)".
+    others=$("$LSREGISTER" -dump 2>/dev/null \
+        | grep -oE "^[[:space:]]*path:[[:space:]]+.*/$APP_NAME\.app" \
+        | sed -E 's/^[[:space:]]*path:[[:space:]]+//' \
+        | sort -u \
+        | grep -vFx "$INSTALLED_PATH" || true)
+    if [ -n "$others" ]; then
+        warn "Other bundles still claim $APP_NAME.app in Launch Services:"
+        printf '%s\n' "$others" | sed 's/^/    /' >&2
+        warn "These can break notifications. Delete them, or deregister with:"
+        warn "    $LSREGISTER -u <path>"
+    fi
+fi
+
+# ── 6. Launch ─────────────────────────────────────────────────────────────────
 VERSION=$(defaults read "$INSTALLED_PATH/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "?")
 SHA=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "no-git")
 
