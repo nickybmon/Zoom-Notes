@@ -278,6 +278,10 @@ class ZoomEngine:
         # prefixes / a Zoom install relocation on the next tick.
         self._origin_invalidated = False
 
+        # Throttle for the periodic IDLE origin re-check in `_resolve_origin`
+        # — None means "never checked yet, check on the first eligible tick".
+        self._last_origin_recheck_monotonic: float | None = None
+
         # Resolved WAL paths, keyed by (origin_str, kind). Populated lazily on
         # first successful resolution and reused on every subsequent poll —
         # the underlying IndexedDB folder structure is stable for the life of
@@ -472,6 +476,59 @@ class ZoomEngine:
             self._setup_error_emitted = False
         return was
 
+    # Minimum time between periodic IDLE origin re-checks in `_resolve_origin`.
+    # A re-scan is cheap (directory iteration), but polling runs every few
+    # seconds and idle stretches can last hours or days between meetings —
+    # throttling avoids scanning the WebKit bucket tree on every single tick
+    # for no reason.
+    _ORIGIN_RECHECK_INTERVAL_SECS = 60
+
+    def _resolve_origin(self, origin: Path | None) -> Path | None:
+        """Decide which WebKit origin directory the poll loop should use.
+
+        Always re-resolves from scratch when there's no cached origin yet,
+        or the cache was explicitly invalidated (settings reload, Zoom
+        reinstall/relocation) — a re-poll here is cheap and lets us recover
+        immediately.
+
+        Otherwise, while IDLE, periodically re-scans for a fresher origin.
+        Zoom can switch which WebKit bucket it writes to mid-session (e.g. a
+        sign-out/sign-in cycle) without ever invalidating our cache; without
+        this check the engine stays locked onto a now-frozen WAL in the old
+        bucket while real meeting data streams into a different one —
+        forever (the 2026-09-08 "meeting didn't record" bug). Only safe to
+        switch while IDLE: no meeting is being tracked, so changing origin
+        can't drop in-flight data. Throttled via
+        `_ORIGIN_RECHECK_INTERVAL_SECS` — see above.
+        """
+        if origin is None or self._consume_origin_invalidated():
+            self._last_origin_recheck_monotonic = time.monotonic()
+            return find_origin_dir()
+
+        if self._get_state() != EngineState.IDLE:
+            return origin
+
+        now = time.monotonic()
+        last = self._last_origin_recheck_monotonic
+        if last is not None and (now - last) < self._ORIGIN_RECHECK_INTERVAL_SECS:
+            return origin
+        self._last_origin_recheck_monotonic = now
+
+        fresher = find_origin_dir()
+        if fresher is not None and fresher != origin:
+            self._emit_diag(
+                "origin_switched",
+                old_path=str(origin),
+                new_path=str(fresher),
+            )
+            # Old origin's cached WAL paths and setup-error guard no longer
+            # apply — clear them so the new origin gets a fresh resolution
+            # and a fresh chance to surface a real setup diagnostic.
+            self._wal_cache.clear()
+            self._setup_error_emitted = False
+            return fresher
+        return origin
+
     # ── WAL resolution (with cache and setup-error fallback) ────────────────
 
     def _resolve_wal(self, origin, cfg, kind: str) -> Path | None:
@@ -618,11 +675,7 @@ class ZoomEngine:
                 poll_interval = cfg.poll_interval_secs
                 idle_threshold = cfg.idle_threshold_secs
 
-                # Reset cached origin whenever config was reloaded OR we never
-                # found one — a re-poll is cheap (single directory iter) and
-                # lets us recover when Zoom is installed/relocated mid-session.
-                if origin is None or self._consume_origin_invalidated():
-                    origin = find_origin_dir()
+                origin = self._resolve_origin(origin)
 
                 self._poll_once(origin, cfg, idle_threshold)
 

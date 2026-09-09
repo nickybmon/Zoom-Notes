@@ -274,7 +274,12 @@ class AppState: ObservableObject {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request) { _ in }
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                log("[Notifications] failed to post note-saved alert: \(error.localizedDescription)",
+                    level: .error)
+            }
+        }
     }
 
     private func sendNoteFailedNotification(failure: FailedMeeting) {
@@ -293,6 +298,11 @@ class AppState: ObservableObject {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request) { _ in }
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                log("[Notifications] failed to post note-failed alert: \(error.localizedDescription)",
+                    level: .error)
+            }
+        }
     }
 }
