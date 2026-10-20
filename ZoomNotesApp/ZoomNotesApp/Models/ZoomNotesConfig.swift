@@ -14,7 +14,7 @@ import Security
 
 struct ZoomNotesConfig: Codable {
     var llmProvider: String = "claude"
-    var llmModel: String = "claude-sonnet-4-6"
+    var llmModel: String = "claude-sonnet-5-5"
 
     var notesDir: String = "\(NSHomeDirectory())/Desktop/Meeting Notes/Notes"
     var transcriptsDir: String = "\(NSHomeDirectory())/Desktop/Meeting Notes/Transcripts"
