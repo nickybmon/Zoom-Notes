@@ -170,9 +170,9 @@ private struct LLMTab: View {
                     ModelPicker(
                         selection: $vm.config.llmModel,
                         knownModels: [
-                            ("claude-opus-4-8", "Claude Opus 4.8 (most capable)"),
-                            ("claude-sonnet-5", "Claude Sonnet 5 (recommended)"),
-                            ("claude-haiku-4-5", "Claude Haiku 4.5 (fastest)"),
+                            ("claude-opus-5-5", "Claude Opus 5.5 (most capable)"),
+                            ("claude-sonnet-5-5", "Claude Sonnet 5.5 (recommended)"),
+                            ("claude-haiku-5-5", "Claude Haiku 5.5 (fastest)"),
                         ]
                     )
                 case "openai":
@@ -267,7 +267,7 @@ private struct LLMTab: View {
 
     private func defaultModel(for provider: String) -> String {
         switch provider {
-        case "claude":  return "claude-sonnet-5"
+        case "claude":  return "claude-sonnet-5-5"
         case "openai":  return "gpt-4o"
         case "gemini":  return "gemini-2.0-flash"
         case "ollama":  return ""

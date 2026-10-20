@@ -1450,7 +1450,7 @@ def summarize_with_claude(
     transcript: str,
     meeting_title: str,
     api_key: str,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5-5",
     api_url: str = "https://api.anthropic.com/v1/messages",
     system_prompt: str | None = None,
     cancel_event: threading.Event | None = None,
