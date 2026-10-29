@@ -617,6 +617,10 @@ class ZoomEngine:
         except Exception:
             return
         self._ticks_since_persist = 0
+        # "changed" fires on nearly every poll tick during a meeting and
+        # drowns the log; the other reasons mark real state transitions.
+        if reason == "changed":
+            return
         self._emit_diag(
             "accumulator_persisted",
             count=len(snapshot),
