@@ -283,7 +283,9 @@ class EngineManager: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             log("[Engine] \(raw)", level: .debug)
         } else {
-            log("[Engine] event=\(event.event) value=\(event.value ?? "-")", level: .debug)
+            // error / note_failed carry their text in `message`, not `value`.
+            let detail = event.value ?? event.message ?? "-"
+            log("[Engine] event=\(event.event) value=\(detail)", level: .debug)
         }
         DispatchQueue.main.async {
             self.eventPublisher.send(event)

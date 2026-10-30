@@ -56,6 +56,7 @@ class CalendarService: ObservableObject {
 
     private let store = EKEventStore()
     private var refreshTimer: Timer?
+    private var lastLoggedEventCount: Int?
 
     @Published var authorizationStatus: EKAuthorizationStatus = EKEventStore.authorizationStatus(for: .event)
 
@@ -183,11 +184,18 @@ class CalendarService: ObservableObject {
             guard let self else { return }
             let events = self.fetchTodayEvents()
             guard !events.isEmpty else {
-                log("[CalendarService] No events returned from EventKit", level: .debug)
+                if self.lastLoggedEventCount != 0 {
+                    log("[CalendarService] No events returned from EventKit", level: .debug)
+                    self.lastLoggedEventCount = 0
+                }
                 return
             }
             self.write(events)
-            log("[CalendarService] Wrote \(events.count) events to sidecar", level: .info)
+            // Refreshes run on a timer; only log when the count changes.
+            if events.count != self.lastLoggedEventCount {
+                log("[CalendarService] Wrote \(events.count) events to sidecar", level: .info)
+                self.lastLoggedEventCount = events.count
+            }
         }
     }
 
