@@ -1446,6 +1446,22 @@ def format_transcript(entries: list[dict]) -> str:
 
 # ── LLM Summarization ──────────────────────────────────────────────────────────
 
+def _claude_text(body: dict) -> str:
+    """Join the text blocks of an Anthropic Messages response.
+
+    Newer Claude models can return non-text blocks (for example thinking)
+    before the text, so content[0] is not always the answer.
+    """
+    parts = [b.get("text", "") for b in body.get("content", []) if b.get("type") == "text"]
+    text = "".join(parts).strip()
+    if not text:
+        types = [b.get("type") for b in body.get("content", [])]
+        raise KeyError(
+            f"no text in Claude response (stop_reason={body.get('stop_reason')}, blocks={types})"
+        )
+    return text
+
+
 def summarize_with_claude(
     transcript: str,
     meeting_title: str,
@@ -1483,7 +1499,7 @@ def summarize_with_claude(
         },
         method="POST",
     )
-    return _http_retry(req, lambda body: body["content"][0]["text"], cancel_event=cancel_event)
+    return _http_retry(req, _claude_text, cancel_event=cancel_event)
 
 
 def summarize_with_openai(
@@ -1793,7 +1809,7 @@ def generate_title(transcript: str, cfg: "ZoomNotesConfig | None" = None) -> str
                 },
                 method="POST",
             )
-            raw = _http_retry(req, lambda b: b["content"][0]["text"], retries=1)
+            raw = _http_retry(req, _claude_text, retries=1)
 
         elif provider == "openai":
             api_key = get_api_key("openai")
